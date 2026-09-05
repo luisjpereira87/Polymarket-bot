@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
-import type { BotState, BotConfig, LogEntry, DashboardData } from '../types';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { BotConfig, BotState, DashboardData, LogEntry } from '../types';
 
 interface WebSocketMessage {
   type: 'state' | 'log' | 'config' | 'full';
@@ -7,10 +7,17 @@ interface WebSocketMessage {
 }
 
 // Connect to same host:port when served by bot, or port 3001 for dev
+/** 
 const WS_URL = window.location.port === '5173'
   ? `ws://${window.location.hostname}:3001`
   : `ws://${window.location.host}`;
 const MAX_LOGS = 200;
+**/
+const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+
+const WS_URL = window.location.port === '5173'
+  ? `${protocol}//${window.location.hostname}:3001`
+  : `${protocol}//${window.location.host}`;
 
 export function useWebSocket() {
   const [state, setState] = useState<BotState | null>(null);
