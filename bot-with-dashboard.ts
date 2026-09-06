@@ -444,11 +444,21 @@ function simulateSmartMoneyTrade(trade: SmartMoneyTrade & { id?: string; market?
     return;
   }
 
-  // 4. Chave única de Posição (inclui outcome se existir para evitar juntar YES/NO)
+  // 4. Determinar se o sinal de SELL consegue encontrar a posição mesmo sem outcome
   const outcomeSuffix = trade.outcome ? `-${trade.outcome}` : '';
-  const posKey = `${trade.traderAddress}-${marketSlug}${outcomeSuffix}`;
+  let posKey = `${trade.traderAddress}-${marketSlug}${outcomeSuffix}`;
 
-  // 5. Evitar trades duplicados (Deduplicação feita DEPOIS de validar o mercado)
+  // Se for SELL e não encontrar a posKey exata, procura por qualquer posição aberta deste trader neste mercado
+  if (trade.side === 'SELL' && !simulatedPositions.has(posKey)) {
+    for (const key of simulatedPositions.keys()) {
+      if (key.startsWith(`${trade.traderAddress}-${marketSlug}`)) {
+        posKey = key; // Encontrou a posição correspondente!
+        break;
+      }
+    }
+  }
+
+  // 5. Evitar trades duplicados
   const tradeHash = `${posKey}-${trade.side}-${trade.size}-${trade.price}`;
   if (processedTrades.has(tradeHash)) {
     return;
@@ -465,12 +475,17 @@ function simulateSmartMoneyTrade(trade: SmartMoneyTrade & { id?: string; market?
 
   // EXECUÇÃO DO COPY TRADE SIMULADO
   if (trade.side === 'BUY') {
+    // 🛡️ APLICAR DIMENSIONAMENTO (Não copiar cegamente as shares do trader grande)
+    const maxUsdPerTrade = CONFIG.smartMoney?.maxSizePerTrade || 5;
+    const targetUsd = Math.min(trade.size * trade.price, maxUsdPerTrade);
+    const scaledSize = targetUsd / trade.price; // As Tuas shares reais baseadas na TUA banca
+
     const existing = simulatedPositions.get(posKey);
 
     if (existing) {
       // Recalcular Preço Médio (DCA)
-      const totalSize = existing.size + trade.size;
-      const avgPrice = ((existing.entryPrice * existing.size) + (trade.price * trade.size)) / totalSize;
+      const totalSize = existing.size + scaledSize;
+      const avgPrice = ((existing.entryPrice * existing.size) + (trade.price * scaledSize)) / totalSize;
 
       simulatedPositions.set(posKey, {
         ...existing,
@@ -484,33 +499,36 @@ function simulateSmartMoneyTrade(trade: SmartMoneyTrade & { id?: string; market?
         marketSlug: marketSlug,
         outcome: trade.outcome,
         side: 'BUY',
-        size: trade.size,
+        size: scaledSize, // Usa o tamanho dimensionado!
         entryPrice: trade.price,
         timestamp: Date.now(),
       });
     }
 
-    log('TRADE', `[SIMULATION] Smart Money BUY: ${trade.size.toFixed(1)} shares @ $${trade.price.toFixed(3)} em ${marketSlug} ${outcomeSuffix} | Posição Atualizada`);
+    log('TRADE', `[SIMULATION] Smart Money BUY: ${scaledSize.toFixed(1)} shares @ $${trade.price.toFixed(3)} em ${marketSlug} ${outcomeSuffix} | Posição Atualizada`);
 
   } else if (trade.side === 'SELL') {
     const existingPos = simulatedPositions.get(posKey);
 
-    if (!existingPos) {
-      log('INFO', `[SIMULATION] Venda ignorada (${marketSlug}): sem posição de compra no histórico local.`);
+    if (!existingPos || existingPos.size <= 0) {
+      log('INFO', `[SIMULATION] Venda ignorada (${marketSlug}): sem posição de compra correspondente.`);
       return;
     }
 
-    const closedShares = Math.min(trade.size, existingPos.size);
-    const profit = (trade.price - existingPos.entryPrice) * closedShares;
+    // 🛡️ PROTEÇÃO: Vende no MÁXIMO o número de shares que TU tens guardadas na memória
+    const closedShares = Math.min(existingPos.size, existingPos.size * (trade.size / (trade.size || 1)));
+    const actualClosedShares = Math.min(closedShares, existingPos.size);
+    
+    const profit = (trade.price - existingPos.entryPrice) * actualClosedShares;
 
-    if (existingPos.size - closedShares > 0.01) {
-      existingPos.size -= closedShares;
+    if (existingPos.size - actualClosedShares > 0.01) {
+      existingPos.size -= actualClosedShares;
       simulatedPositions.set(posKey, existingPos);
     } else {
-      simulatedPositions.delete(posKey);
+      simulatedPositions.delete(posKey); // Elimina a posição se foi toda vendida
     }
 
-    log('TRADE', `[SIMULATION] Smart Money SELL: ${closedShares.toFixed(1)} shares @ $${trade.price.toFixed(3)} | PnL: $${profit.toFixed(2)}`);
+    log('TRADE', `[SIMULATION] Smart Money SELL: ${actualClosedShares.toFixed(1)} shares @ $${trade.price.toFixed(3)} | PnL: $${profit.toFixed(2)}`);
     recordTrade(profit, 'smartMoney');
   }
 }
