@@ -26,200 +26,103 @@
 
 import 'dotenv/config';
 import {
+  PolymarketSDK,
   ArbitrageService,
-  BridgeClient,
   OnchainService,
-  PolymarketSDK
+  BridgeClient,
+  type SmartMoneyTrade,
+  type SmartMoneyLeaderboardEntry,
+  type BinanceKLine,
 } from './src/index.js';
 
 // ============================================================================
-// CONFIGURATION TYPES
+// CONFIGURATION
 // ============================================================================
 
-export interface CapitalConfig {
-  totalUsd: number;
-  maxPerTradePct: number;
-  maxPerMarketPct: number;
-  maxTotalExposurePct: number;
-  minOrderUsd: number;
-  strategyAllocation: {
-    smartMoney: number;
-    arbitrage: number;
-    dipArb: number;
-    directTrades: number;
-  };
-}
-
-export interface RiskConfig {
-  dailyMaxLossPct: number;
-  maxConsecutiveLosses: number;
-  pauseOnBreachMinutes: number;
-  monthlyMaxLossPct: number;
-  maxDrawdownFromPeak: number;
-  totalMaxLossPct: number;
-  enableDynamicSizing: boolean;
-  minPositionPct: number;
-  maxPositionPct: number;
-  lossSizingReduction: number;
-  winSizingIncrease: number;
-}
-
-export interface SmartMoneyConfig {
-  enabled: boolean;
-  topN: number;
-  minWinRate: number;
-  minPnl: number;
-  minTrades: number;
-  minProfitFactor: number;
-  minConsistencyScore: number;
-  maxSingleTradeExposure: number;
-  checkLastNTrades: number;
-  sizeScale: number;
-  maxSizePerTrade: number;
-  maxSlippage: number;
-  minTradeSize: number;
-  delay: number;
-  customWallets: string[];
-}
-
-export interface ArbitrageConfig {
-  enabled: boolean;
-  profitThreshold: number;
-  minTradeSize: number;
-  maxTradeSize: number;
-  minVolume24h: number;
-  autoExecute: boolean;
-  enableRebalancer: boolean;
-  estimatedGasCostUSD: number;
-  minNetProfit: number;
-}
-
-export interface DipArbConfig {
-  enabled: boolean;
-  coins: readonly ('BTC' | 'ETH' | 'SOL')[];
-  shares: number;
-  sumTarget: number;
-  autoRotate: boolean;
-  minTradeValueUSD: number;
-}
-
-export interface OnchainConfig {
-  enabled: boolean;
-  autoApprove: boolean;
-  minMatic: number;
-}
-
-export interface BinanceConfig {
-  enabled: boolean;
-  symbols: readonly string[];
-  interval: string;
-  trendThreshold: number;
-}
-
-export interface DirectTradingConfig {
-  enabled: boolean;
-  trendFollowing: boolean;
-  minTrendStrength: number;
-  stopLossPct: number;
-  takeProfitPct: number;
-  trailingStopPct: number;
-  maxHoldDays: number;
-  minRiskReward: number;
-}
-
-export interface BotConfig {
-  capital: CapitalConfig;
-  risk: RiskConfig;
-  smartMoney: SmartMoneyConfig;
-  arbitrage: ArbitrageConfig;
-  dipArb: DipArbConfig;
-  onchain: OnchainConfig;
-  binance: BinanceConfig;
-  directTrading: DirectTradingConfig;
-  dryRun: boolean;
-}
-
-// ============================================================================
-// CONFIGURATION OBJECT (EXPORTED FOR RUNNER COMPATIBILITY)
-// ============================================================================
-
-export const CONFIG: BotConfig = {
+const CONFIG = {
   capital: {
     totalUsd: parseFloat(process.env.CAPITAL_USD || '250'),
-    maxPerTradePct: 0.048, // 4.8% de $250 = $12.00 de risco máximo por operação
-    maxPerMarketPct: 0.15,  // Máximo $37.50 expostos num único mercado
-    maxTotalExposurePct: 0.40, // Máximo $100 expostos no total do mercado em simultâneo
-    minOrderUsd: 2,
+    maxPerTradePct: 0.02,  // Reduced from 3% to 2% for safety
+    maxPerMarketPct: 0.10,
+    maxTotalExposurePct: 0.30,
+    minOrderUsd: 5,
     strategyAllocation: {
-      smartMoney: 0.50,
-      arbitrage: 0.30,
+      smartMoney: 0.60,
+      arbitrage: 0.20,
       dipArb: 0.10,
       directTrades: 0.10,
     },
   },
 
   risk: {
-    // Limites Diários
-    dailyMaxLossPct: 0.10,  // Máximo 10% de perda num dia ($25) antes de pausar
-    maxConsecutiveLosses: 4, // Pausa após 4 perdas seguidas
+    // Daily limits
+    dailyMaxLossPct: 0.05,  // Reduced from 8% to 5%
+    maxConsecutiveLosses: 6,
     pauseOnBreachMinutes: 60,
 
-    // Limites de Proteção da Conta
-    monthlyMaxLossPct: 0.20, 
-    maxDrawdownFromPeak: 0.15, // Reduzido para 15% para parar o bot antes de perdas graves
-    totalMaxLossPct: 0.30, 
+    // 🔴 NEW: Monthly and cumulative limits
+    monthlyMaxLossPct: 0.15,  // 15% monthly limit
+    maxDrawdownFromPeak: 0.25,  // 25% drawdown from peak
+    totalMaxLossPct: 0.40,  // 40% total loss - stop trading entirely
 
-    // Dimensionamento Dinâmico
+    // 🔴 NEW: Dynamic position sizing
     enableDynamicSizing: true,
-    minPositionPct: 0.02,  
-    maxPositionPct: 0.05,  // Limita o tamanho de qualquer posição a 5% da conta
-    lossSizingReduction: 0.20, 
-    winSizingIncrease: 0.10, 
+    minPositionPct: 0.01,  // 1% minimum
+    maxPositionPct: 0.05,  // 5% maximum
+    lossSizingReduction: 0.20,  // Reduce 20% per consecutive loss
+    winSizingIncrease: 0.10,  // Increase 10% per consecutive win
   },
 
   smartMoney: {
     enabled: true,
     topN: 20,
-    minWinRate: 0.60,
-    minPnl: 500,
-    minTrades: 30,
+    // 🔴 FIXED: Stricter criteria
+    minWinRate: 0.60,  // Up from 0.50 to 60%
+    minPnl: 500,       // Up from 100 to $500
+    minTrades: 30,     // Up from 20 to 30
 
-    minProfitFactor: 1.5,
-    minConsistencyScore: 0.7,
-    maxSingleTradeExposure: 0.2,
-    checkLastNTrades: 10,
+    // 🔴 NEW: Quality filters
+    minProfitFactor: 1.5,  // Total wins / total losses >= 1.5x
+    minConsistencyScore: 0.7,  // Recent performance score
+    maxSingleTradeExposure: 0.3,  // Max 30% of PnL from one trade
+    checkLastNTrades: 10,  // Analyze last 10 trades for consistency
 
-    sizeScale: 0.05,
-    maxSizePerTrade: 12, // Teto máximo de $12 por ordem em Smart Money
+    sizeScale: 0.1,
+    maxSizePerTrade: 15,
     maxSlippage: 0.03,
-    minTradeSize: 2,
+    minTradeSize: 10,
     delay: 500,
+    // ADD YOUR CUSTOM WALLETS HERE (will be followed in addition to leaderboard)
     customWallets: [
-      '0xc2e7800b5af46e6093872b177b7a5e7f0563be51',
-      '0x58c3f5d66c95d4c41b093fbdd2520e46b6c9de74',
-    ],
+      '0xc2e7800b5af46e6093872b177b7a5e7f0563be51',  // Top Polymarket trader
+      '0x58c3f5d66c95d4c41b093fbdd2520e46b6c9de74',  // simonbanza
+      // Add more wallet addresses here...
+    ] as string[],
   },
 
   arbitrage: {
     enabled: true,
-    profitThreshold: 0.01,
-    minTradeSize: 5,   // Reduzido para ser compatível com a banca
-    maxTradeSize: 15,  // CORRIGIDO: Reduzido de 100 para 15 para evitar alocação excessiva
+    // 🔴 FIXED: Higher profit threshold to account for gas fees
+    profitThreshold: 0.01,  // Up from 0.5% to 1%
+    minTradeSize: 20,  // Up from 5 to reduce gas impact
+    maxTradeSize: 100,  // Up from 50
     minVolume24h: 5000,
     autoExecute: true,
     enableRebalancer: true,
 
-    estimatedGasCostUSD: 0.10,
-    minNetProfit: 0.20,
+    // 🔴 NEW: Gas fee accounting
+    estimatedGasCostUSD: 0.10,  // Estimated gas per arb cycle
+    minNetProfit: 0.50,  // Minimum $0.50 profit after gas
   },
 
   dipArb: {
     enabled: true,
-    coins: ['BTC', 'ETH', 'SOL'],
-    shares: 2, // Reduzido de 10 para ajustar a quantidade
+    coins: ['BTC', 'ETH', 'SOL'] as const,
+    shares: 10,
     sumTarget: 0.92,
     autoRotate: true,
-    minTradeValueUSD: 1.5,
+    // 🔴 NEW: Minimum trade value enforcement
+    minTradeValueUSD: 1.5,  // $1.50 minimum (buffer above $1)
   },
 
   onchain: {
@@ -230,8 +133,8 @@ export const CONFIG: BotConfig = {
 
   binance: {
     enabled: true,
-    symbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
-    interval: '15m',
+    symbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'] as const,
+    interval: '15m' as const,
     trendThreshold: 2,
   },
 
@@ -239,66 +142,70 @@ export const CONFIG: BotConfig = {
     enabled: true,
     trendFollowing: true,
     minTrendStrength: 0.02,
-    stopLossPct: 0.05,   // Reduzido o Stop Loss técnico para 5%
-    takeProfitPct: 0.10,  
-    trailingStopPct: 0.03,
-    maxHoldDays: 3,
-    minRiskReward: 1.5,
+    // 🔴 NEW: Stop-loss and take-profit
+    stopLossPct: 0.15,  // 15% stop loss
+    takeProfitPct: 0.25,  // 25% take profit
+    trailingStopPct: 0.10,  // 10% trailing stop
+    maxHoldDays: 7,  // Exit after 7 days
+    minRiskReward: 1.5,  // Minimum 1.5:1 risk/reward ratio
   },
 
   dryRun: process.env.DRY_RUN !== 'false',
 };
 
-// Default Config Constant Alias for backwards compatibility
-export const DEFAULT_BOT_CONFIG = CONFIG;
-
 // ============================================================================
 // STATE
 // ============================================================================
 
-export interface BotState {
+interface BotState {
   startTime: number;
   dailyPnL: number;
   totalPnL: number;
   consecutiveLosses: number;
-  consecutiveWins: number;
+  consecutiveWins: number;  // NEW
   tradesExecuted: number;
   isPaused: boolean;
   pauseUntil: number;
 
+  // 🔴 NEW: Enhanced risk tracking
   monthlyPnL: number;
   monthStartTime: number;
   peakCapital: number;
   currentCapital: number;
   currentDrawdown: number;
-  permanentlyHalted: boolean;
+  permanentlyHalted: boolean;  // When total loss limit hit
   lastDailyReset: number;
 
+  // Strategy stats
   smartMoneyTrades: number;
   arbTrades: number;
   dipArbTrades: number;
   directTrades: number;
   arbProfit: number;
 
+  // Tracked data
   followedWallets: string[];
   activeArbMarket: string | null;
   activeDipArbMarket: string | null;
 
+  // On-chain stats
   splits: number;
   merges: number;
   redeems: number;
   swaps: number;
 
+  // Balances
   usdcBalance: number;
   usdcEBalance: number;
   maticBalance: number;
 
+  // Analysis
   btcTrend: 'up' | 'down' | 'neutral';
   ethTrend: 'up' | 'down' | 'neutral';
   solTrend: 'up' | 'down' | 'neutral';
 }
 
-export const state: BotState = {
+const state: BotState = {
   startTime: Date.now(),
   dailyPnL: 0,
   totalPnL: 0,
@@ -308,6 +215,7 @@ export const state: BotState = {
   isPaused: false,
   pauseUntil: 0,
 
+  // Risk tracking
   monthlyPnL: 0,
   monthStartTime: Date.now(),
   peakCapital: CONFIG.capital.totalUsd,
@@ -351,12 +259,15 @@ function log(level: string, message: string, data?: unknown) {
   if (data) console.log(JSON.stringify(data, null, 2));
 }
 
+// 🔴 FIXED: Comprehensive risk management with multiple layers
 function canTrade(): boolean {
+  // Check if permanently halted
   if (state.permanentlyHalted) {
     log('ERROR', '🛑 Trading permanently halted - total loss limit reached');
     return false;
   }
 
+  // Reset daily PnL if new day
   const daysSinceReset = (Date.now() - state.lastDailyReset) / (1000 * 60 * 60 * 24);
   if (daysSinceReset >= 1) {
     log('INFO', `Daily PnL reset. Previous day: $${state.dailyPnL.toFixed(2)}`);
@@ -364,6 +275,7 @@ function canTrade(): boolean {
     state.lastDailyReset = Date.now();
   }
 
+  // Reset monthly PnL if new month
   const daysSinceMonthStart = (Date.now() - state.monthStartTime) / (1000 * 60 * 60 * 24);
   if (daysSinceMonthStart >= 30) {
     log('INFO', `Monthly PnL reset. Previous month: $${state.monthlyPnL.toFixed(2)}`);
@@ -371,21 +283,21 @@ function canTrade(): boolean {
     state.monthStartTime = Date.now();
   }
 
+  // Update current capital and drawdown
   state.currentCapital = CONFIG.capital.totalUsd + state.totalPnL;
   if (state.currentCapital > state.peakCapital) {
     state.peakCapital = state.currentCapital;
   }
-  
-  state.currentDrawdown = state.peakCapital > 0 
-    ? (state.peakCapital - state.currentCapital) / state.peakCapital 
-    : 0;
+  state.currentDrawdown = (state.peakCapital - state.currentCapital) / state.peakCapital;
 
+  // Check temporary pause
   if (state.isPaused && Date.now() < state.pauseUntil) return false;
   if (state.isPaused && Date.now() >= state.pauseUntil) {
     state.isPaused = false;
     log('INFO', 'Bot resumed after cooldown');
   }
 
+  // 🔴 Layer 1: Daily loss limit
   const dailyLossLimit = CONFIG.capital.totalUsd * CONFIG.risk.dailyMaxLossPct;
   if (state.dailyPnL <= -dailyLossLimit) {
     state.isPaused = true;
@@ -395,23 +307,26 @@ function canTrade(): boolean {
     return false;
   }
 
+  // 🔴 Layer 2: Monthly loss limit (NEW)
   const monthlyLossLimit = CONFIG.capital.totalUsd * CONFIG.risk.monthlyMaxLossPct;
   if (state.monthlyPnL <= -monthlyLossLimit) {
     log('ERROR', `🛑 Monthly loss limit breached: -$${Math.abs(state.monthlyPnL).toFixed(2)} (limit: $${monthlyLossLimit.toFixed(2)})`);
     log('ERROR', 'Trading paused until next month');
     state.isPaused = true;
-    state.pauseUntil = Date.now() + (30 * 24 * 60 * 60 * 1000);
+    state.pauseUntil = Date.now() + (30 * 24 * 60 * 60 * 1000);  // Pause for 30 days
     return false;
   }
 
+  // 🔴 Layer 3: Drawdown from peak (NEW)
   if (state.currentDrawdown >= CONFIG.risk.maxDrawdownFromPeak) {
     log('ERROR', `🛑 Maximum drawdown reached: ${(state.currentDrawdown * 100).toFixed(1)}% (limit: ${(CONFIG.risk.maxDrawdownFromPeak * 100).toFixed(1)}%)`);
     log('ERROR', `Peak: $${state.peakCapital.toFixed(2)} → Current: $${state.currentCapital.toFixed(2)}`);
     state.isPaused = true;
-    state.pauseUntil = Date.now() + (7 * 24 * 60 * 60 * 1000);
+    state.pauseUntil = Date.now() + (7 * 24 * 60 * 60 * 1000);  // Pause for 7 days
     return false;
   }
 
+  // 🔴 Layer 4: Total loss limit - PERMANENT HALT (NEW)
   const totalLossLimit = CONFIG.capital.totalUsd * CONFIG.risk.totalMaxLossPct;
   if (state.totalPnL <= -totalLossLimit) {
     state.permanentlyHalted = true;
@@ -424,12 +339,14 @@ function canTrade(): boolean {
   return true;
 }
 
+// 🔴 FIXED: Enhanced trade recording with win tracking
 function recordTrade(profit: number, strategy: string) {
   state.tradesExecuted++;
   state.dailyPnL += profit;
-  state.monthlyPnL += profit;
+  state.monthlyPnL += profit;  // NEW
   state.totalPnL += profit;
 
+  // Track consecutive wins/losses
   if (profit < 0) {
     state.consecutiveLosses++;
     state.consecutiveWins = 0;
@@ -444,11 +361,13 @@ function recordTrade(profit: number, strategy: string) {
   else if (strategy === 'direct') state.directTrades++;
 }
 
+// 🔴 NEW: Dynamic position sizing based on performance
 function calculatePositionSize(baseSize: number): number {
   if (!CONFIG.risk.enableDynamicSizing) return baseSize;
 
   let size = baseSize;
 
+  // Reduce during losing streaks
   if (state.consecutiveLosses > 2) {
     const reduction = Math.pow(1 - CONFIG.risk.lossSizingReduction, state.consecutiveLosses - 2);
     size *= reduction;
@@ -457,11 +376,13 @@ function calculatePositionSize(baseSize: number): number {
     }
   }
 
+  // Increase slightly during winning streaks (capped)
   if (state.consecutiveWins > 3) {
     const increase = 1 + (Math.min(state.consecutiveWins - 3, 5) * CONFIG.risk.winSizingIncrease);
     size *= increase;
   }
 
+  // Apply floor and ceiling
   size = Math.max(CONFIG.risk.minPositionPct || 0.01, size);
   size = Math.min(CONFIG.risk.maxPositionPct || 0.05, size);
 
@@ -478,6 +399,7 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
 
   const qualified: string[] = [];
 
+  // 1. Add custom wallets first (always included, no filtering)
   if (CONFIG.smartMoney.customWallets && CONFIG.smartMoney.customWallets.length > 0) {
     for (const wallet of CONFIG.smartMoney.customWallets) {
       qualified.push(wallet);
@@ -485,66 +407,69 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
     }
   }
 
-  try {
-    const leaderboard = await sdk.smartMoney.getLeaderboard({ limit: CONFIG.smartMoney.topN * 2 });
+  // 2. Add wallets from leaderboard (with STRICT filtering)
+  const leaderboard = await sdk.smartMoney.getLeaderboard({ limit: CONFIG.smartMoney.topN * 2 });
 
-    for (const entry of leaderboard.entries) {
-      try {
-        const positions = await sdk.dataApi.getPositions(entry.address);
+  for (const entry of leaderboard.entries) {
+    try {
+      const positions = await sdk.dataApi.getPositions(entry.address);
 
-        if (!positions || positions.length < CONFIG.smartMoney.minTrades) {
-          continue;
+      if (positions.length < CONFIG.smartMoney.minTrades) {
+        continue;  // Skip if not enough trades
+      }
+
+      // Calculate basic stats
+      const wins = positions.filter(p => (p.cashPnl ?? 0) > 0);
+      const losses = positions.filter(p => (p.cashPnl ?? 0) < 0);
+      const winRate = positions.length > 0 ? wins.length / positions.length : 0;
+
+      // 🔴 NEW: Profit Factor (total wins / total losses)
+      const totalWins = wins.reduce((sum, p) => sum + Math.abs(p.cashPnl ?? 0), 0);
+      const totalLosses = losses.reduce((sum, p) => sum + Math.abs(p.cashPnl ?? 0), 0);
+      const profitFactor = totalLosses > 0 ? totalWins / totalLosses : (totalWins > 0 ? 999 : 0);
+
+      // 🔴 NEW: Check for whale trades (single trade dominance)
+      const sortedPnl = positions.map(p => Math.abs(p.cashPnl ?? 0)).sort((a, b) => b - a);
+      const biggestTrade = sortedPnl[0] ?? 0;
+      const totalAbsPnl = sortedPnl.reduce((s, v) => s + v, 0);
+      const singleTradeExposure = totalAbsPnl > 0 ? biggestTrade / totalAbsPnl : 0;
+
+      // 🔴 NEW: Consistency score (last N trades performance)
+      const lastNTrades = positions.slice(0, CONFIG.smartMoney.checkLastNTrades);
+      const recentWins = lastNTrades.filter(p => (p.cashPnl ?? 0) > 0).length;
+      const consistencyScore = lastNTrades.length > 0 ? recentWins / lastNTrades.length : 0;
+
+      // Apply ALL filters
+      const passesWinRate = winRate >= CONFIG.smartMoney.minWinRate;
+      const passesPnl = entry.pnl >= CONFIG.smartMoney.minPnl;
+      const passesTrades = (entry.tradeCount || 0) >= CONFIG.smartMoney.minTrades;
+      const passesProfitFactor = profitFactor >= CONFIG.smartMoney.minProfitFactor;
+      const passesConsistency = consistencyScore >= CONFIG.smartMoney.minConsistencyScore;
+      const passesWhaleCheck = singleTradeExposure <= CONFIG.smartMoney.maxSingleTradeExposure;
+
+      if (passesWinRate && passesPnl && passesTrades && passesProfitFactor && passesConsistency && passesWhaleCheck) {
+        if (!qualified.includes(entry.address)) {
+          qualified.push(entry.address);
+          log('WALLET', `✅ ${entry.address.slice(0, 10)}... WR:${(winRate * 100).toFixed(0)}% PF:${profitFactor.toFixed(2)}x Consistency:${(consistencyScore * 100).toFixed(0)}% PnL:$${entry.pnl}`);
         }
-
-        const wins = positions.filter(p => (p.cashPnl ?? 0) > 0);
-        const losses = positions.filter(p => (p.cashPnl ?? 0) < 0);
-        const winRate = positions.length > 0 ? wins.length / positions.length : 0;
-
-        const totalWins = wins.reduce((sum, p) => sum + Math.abs(p.cashPnl ?? 0), 0);
-        const totalLosses = losses.reduce((sum, p) => sum + Math.abs(p.cashPnl ?? 0), 0);
-        const profitFactor = totalLosses > 0 ? totalWins / totalLosses : (totalWins > 0 ? 999 : 0);
-
-        const sortedPnl = positions.map(p => Math.abs(p.cashPnl ?? 0)).sort((a, b) => b - a);
-        const biggestTrade = sortedPnl[0] ?? 0;
-        const totalAbsPnl = sortedPnl.reduce((s, v) => s + v, 0);
-        const singleTradeExposure = totalAbsPnl > 0 ? biggestTrade / totalAbsPnl : 0;
-
-        const lastNTrades = positions.slice(0, CONFIG.smartMoney.checkLastNTrades);
-        const recentWins = lastNTrades.filter(p => (p.cashPnl ?? 0) > 0).length;
-        const consistencyScore = lastNTrades.length > 0 ? recentWins / lastNTrades.length : 0;
-
-        const passesWinRate = winRate >= CONFIG.smartMoney.minWinRate;
-        const passesPnl = entry.pnl >= CONFIG.smartMoney.minPnl;
-        const passesTrades = (entry.tradeCount || 0) >= CONFIG.smartMoney.minTrades;
-        const passesProfitFactor = profitFactor >= CONFIG.smartMoney.minProfitFactor;
-        const passesConsistency = consistencyScore >= CONFIG.smartMoney.minConsistencyScore;
-        const passesWhaleCheck = singleTradeExposure <= CONFIG.smartMoney.maxSingleTradeExposure;
-
-        if (passesWinRate && passesPnl && passesTrades && passesProfitFactor && passesConsistency && passesWhaleCheck) {
-          if (!qualified.includes(entry.address)) {
-            qualified.push(entry.address);
-            log('WALLET', `✅ ${entry.address.slice(0, 10)}... WR:${(winRate * 100).toFixed(0)}% PF:${profitFactor.toFixed(2)}x Consistency:${(consistencyScore * 100).toFixed(0)}% PnL:$${entry.pnl}`);
-          }
-        } else {
-          const failures = [];
-          if (!passesWinRate) failures.push(`WR:${(winRate * 100).toFixed(0)}%<${(CONFIG.smartMoney.minWinRate * 100).toFixed(0)}%`);
-          if (!passesProfitFactor) failures.push(`PF:${profitFactor.toFixed(2)}<${CONFIG.smartMoney.minProfitFactor}`);
-          if (!passesConsistency) failures.push(`Cons:${(consistencyScore * 100).toFixed(0)}%<${(CONFIG.smartMoney.minConsistencyScore * 100).toFixed(0)}%`);
-          if (!passesWhaleCheck) failures.push(`Whale:${(singleTradeExposure * 100).toFixed(0)}%>${(CONFIG.smartMoney.maxSingleTradeExposure * 100).toFixed(0)}%`);
-          if (CONFIG.dryRun && failures.length > 0) {
-            log('WALLET', `❌ ${entry.address.slice(0, 10)}... REJECTED: ${failures.join(', ')}`);
-          }
+      } else {
+        // Log why wallet was rejected (in debug mode)
+        const failures = [];
+        if (!passesWinRate) failures.push(`WR:${(winRate * 100).toFixed(0)}%<${(CONFIG.smartMoney.minWinRate * 100).toFixed(0)}%`);
+        if (!passesProfitFactor) failures.push(`PF:${profitFactor.toFixed(2)}<${CONFIG.smartMoney.minProfitFactor}`);
+        if (!passesConsistency) failures.push(`Cons:${(consistencyScore * 100).toFixed(0)}%<${(CONFIG.smartMoney.minConsistencyScore * 100).toFixed(0)}%`);
+        if (!passesWhaleCheck) failures.push(`Whale:${(singleTradeExposure * 100).toFixed(0)}%>${(CONFIG.smartMoney.maxSingleTradeExposure * 100).toFixed(0)}%`);
+        if (CONFIG.dryRun && failures.length > 0) {
+          log('WALLET', `❌ ${entry.address.slice(0, 10)}... REJECTED: ${failures.join(', ')}`);
         }
+      }
 
-        await new Promise(r => setTimeout(r, 200));
-      } catch { /* skip individual wallet failure */ }
-    }
-  } catch (err) {
-    log('WARN', `Could not fetch leaderboard: ${(err as Error).message}`);
+      await new Promise(r => setTimeout(r, 200));
+    } catch { /* skip */ }
   }
 
   if (qualified.length === 0) {
-    log('WARN', 'No qualified wallets found');
+    log('WARN', 'No qualified wallets');
     return;
   }
 
@@ -657,7 +582,7 @@ async function setupDipArb(sdk: PolymarketSDK) {
 }
 
 // ============================================================================
-// 4. ON-CHAIN SERVICE
+// 4. ON-CHAIN SERVICE (Split/Merge/Redeem)
 // ============================================================================
 
 let onchainService: OnchainService | null = null;
@@ -697,7 +622,7 @@ async function setupOnchain() {
 }
 
 // ============================================================================
-// 5. SWAP SERVICE
+// 5. SWAP SERVICE (DEX Swaps)
 // ============================================================================
 
 async function setupSwap(sdk: PolymarketSDK) {
@@ -709,15 +634,20 @@ async function setupSwap(sdk: PolymarketSDK) {
   log('SWAP', 'Checking token balances...');
 
   try {
+    // Use SDK's trading service to get wallet info
     const address = sdk.tradingService.getAddress();
     log('SWAP', `Wallet address: ${address}`);
+
+    // Note: For full SwapService, you need ethers.Wallet instance
+    // This is a simplified balance check using the SDK
+    log('SWAP', 'SwapService requires ethers.Wallet - use OnchainService for balances');
   } catch (err) {
     log('WARN', `Swap setup: ${(err as Error).message}`);
   }
 }
 
 // ============================================================================
-// 6. BRIDGE CLIENT
+// 6. BRIDGE CLIENT (Cross-chain deposits)
 // ============================================================================
 
 async function setupBridge(sdk: PolymarketSDK) {
@@ -744,7 +674,7 @@ async function setupBridge(sdk: PolymarketSDK) {
 }
 
 // ============================================================================
-// 7. BINANCE SERVICE
+// 7. BINANCE SERVICE (K-line Analysis)
 // ============================================================================
 
 async function setupBinanceAnalysis(sdk: PolymarketSDK) {
@@ -784,7 +714,7 @@ async function setupBinanceAnalysis(sdk: PolymarketSDK) {
 }
 
 // ============================================================================
-// 8. WALLET SERVICE
+// 8. WALLET SERVICE (Smart Scores)
 // ============================================================================
 
 async function analyzeTopWallets(sdk: PolymarketSDK) {
@@ -810,7 +740,7 @@ async function analyzeTopWallets(sdk: PolymarketSDK) {
 }
 
 // ============================================================================
-// 9. SUBGRAPH
+// 9. SUBGRAPH (On-chain queries)
 // ============================================================================
 
 async function queryOnchainData(sdk: PolymarketSDK) {
@@ -829,7 +759,7 @@ async function queryOnchainData(sdk: PolymarketSDK) {
 }
 
 // ============================================================================
-// 10. DIRECT TRADING
+// 10. DIRECT TRADING (Limit/Market Orders)
 // ============================================================================
 
 async function setupDirectTrading(sdk: PolymarketSDK) {
@@ -865,6 +795,7 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
 
           if (trend !== 'neutral') {
             const side = trend === 'up' ? 'BUY' : 'SELL';
+            const tokenId = trend === 'up' ? yesToken.tokenId : noToken.tokenId;
             const price = trend === 'up' ? yesToken.price : noToken.price;
 
             log('SIGNAL', `Trend signal: ${market.question?.slice(0, 40)}... → ${side} @ ${price.toFixed(2)}`);
@@ -881,7 +812,7 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
 // STATUS DISPLAY
 // ============================================================================
 
-export function displayStatus() {
+function displayStatus() {
   const runtime = Math.round((Date.now() - state.startTime) / 1000 / 60);
 
   console.log('\n' + '═'.repeat(80));
@@ -907,6 +838,7 @@ export function displayStatus() {
   console.log('  RISK STATUS:');
   const dailyPct = (Math.abs(state.dailyPnL) / CONFIG.capital.totalUsd * 100).toFixed(1);
   const monthlyPct = (Math.abs(state.monthlyPnL) / CONFIG.capital.totalUsd * 100).toFixed(1);
+  const totalPct = (Math.abs(state.totalPnL) / CONFIG.capital.totalUsd * 100).toFixed(1);
   const dailyStatus = state.dailyPnL <= -(CONFIG.capital.totalUsd * CONFIG.risk.dailyMaxLossPct) ? '🔴 BREACHED' : '✅ OK';
   const monthlyStatus = state.monthlyPnL <= -(CONFIG.capital.totalUsd * CONFIG.risk.monthlyMaxLossPct) ? '🔴 BREACHED' : '✅ OK';
   const drawdownStatus = state.currentDrawdown >= CONFIG.risk.maxDrawdownFromPeak ? '🔴 BREACHED' : '✅ OK';
@@ -931,7 +863,7 @@ export function displayStatus() {
 }
 
 // ============================================================================
-// MAIN EXECUTION
+// MAIN
 // ============================================================================
 
 async function main() {
@@ -965,6 +897,7 @@ async function main() {
 
   log('INFO', `Wallet: ${sdk.tradingService.getAddress()}`);
 
+  // Setup all services
   await setupSwap(sdk);
   await setupOnchain();
   await setupBridge(sdk);
@@ -991,11 +924,8 @@ async function main() {
   log('INFO', '🚀 Bot v3.0 running! Press Ctrl+C to stop.\n');
 }
 
-// Only execute directly if run via CLI (npx tsx bot-config.ts)
-if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch((err) => {
-    log('ERROR', `Fatal: ${err.message}`);
-    console.error(err);
-    process.exit(1);
-  });
-}
+main().catch((err) => {
+  log('ERROR', `Fatal: ${err.message}`);
+  console.error(err);
+  process.exit(1);
+});

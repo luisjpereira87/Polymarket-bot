@@ -11,8 +11,9 @@ interface WebSocketMessage {
 const WS_URL = window.location.port === '5173'
   ? `ws://${window.location.hostname}:3001`
   : `ws://${window.location.host}`;
-const MAX_LOGS = 200;
 **/
+const MAX_LOGS = 200;
+
 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 
 const WS_URL = window.location.port === '5173'
