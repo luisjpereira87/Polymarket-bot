@@ -57,6 +57,20 @@ let CONFIG = {
   smartMoney: {
     enabled: process.env.SMARTMONEY_ENABLED !== 'false',
     topN: 20,
+
+    minWinRate: 0.80,          // Subido de 0.60 para 0.80 (Exige 80% de vitórias)
+    minPnl: 2000,              // Subido de 500 para 2000 (Exige lucro histórico relevante)
+    minTrades: 50,             // Subido de 30 para 50 (Garante amostra estatística sólida)
+    minProfitFactor: 2.0,      // Subido de 1.5 para 2.0 (Ganha no mínimo o dobro do que perde)
+    minConsistencyScore: 0.8,  // Subido de 0.7 para 0.8 (Operações consistentes no tempo)
+    
+    maxSingleTradeExposure: 0.3,
+    checkLastNTrades: 20,      // Aumentado de 10 para 20 (Analisa um histórico recente maior)
+
+    sizeScale: 0.05,
+    maxSizePerTrade: 5,
+
+    /**
     minWinRate: 0.60,
     minPnl: 500,
     minTrades: 30,
@@ -68,6 +82,7 @@ let CONFIG = {
 
     sizeScale: 0.1,
     maxSizePerTrade: 15,
+    **/
     maxSlippage: 0.03,
     minTradeSize: 10,
     delay: 500,
@@ -231,7 +246,7 @@ function updateDashboard() {
   dashboardEmitter.updateState(state);
 }
 
-function canTrade(): boolean {
+function canTrade__(): boolean {
   if (state.permanentlyHalted) {
     log('ERROR', '🛑 Trading permanentemente interrompido - limite total de perda atingido');
     return false;
@@ -295,6 +310,89 @@ function canTrade(): boolean {
     state.permanentlyHalted = true;
     log('ERROR', '💀 LIMITE DE PERDA TOTAL ATINGIDO - BOT PARADO PERMANENTEMENTE');
     log('ERROR', `Perda total: -$${Math.abs(state.totalPnL).toFixed(2)} (limite: $${totalLossLimit.toFixed(2)})`);
+    updateDashboard();
+    return false;
+  }
+
+  return true;
+}
+
+function canTrade(): boolean {
+  if (state.permanentlyHalted) {
+    log('ERROR', '🛑 Trading permanentemente interrompido - limite total de perda atingido');
+    return false;
+  }
+
+  // 1. Resets de tempo diário e mensal
+  const daysSinceReset = (Date.now() - state.lastDailyReset) / (1000 * 60 * 60 * 24);
+  if (daysSinceReset >= 1) {
+    log('INFO', `Reset do PnL diário. Dia anterior: $${state.dailyPnL.toFixed(2)}`);
+    state.dailyPnL = 0;
+    state.lastDailyReset = Date.now();
+  }
+
+  const daysSinceMonthStart = (Date.now() - state.monthStartTime) / (1000 * 60 * 60 * 24);
+  if (daysSinceMonthStart >= 30) {
+    log('INFO', `Reset do PnL mensal. Mês anterior: $${state.monthlyPnL.toFixed(2)}`);
+    state.monthlyPnL = 0;
+    state.monthStartTime = Date.now();
+  }
+
+  // 2. Métricas de Capital e Drawdown
+  state.currentCapital = CONFIG.capital.totalUsd + state.totalPnL;
+  if (state.currentCapital > state.peakCapital) {
+    state.peakCapital = state.currentCapital;
+  }
+  state.currentDrawdown = (state.peakCapital - state.currentCapital) / state.peakCapital;
+
+  // 3. Verificação de Pausa Ativa
+  if (state.isPaused && Date.now() < state.pauseUntil) {
+    return false; // Ainda está dentro do tempo de penalização
+  }
+
+  // Se a pausa expirou, retoma a execução
+  if (state.isPaused && Date.now() >= state.pauseUntil) {
+    state.isPaused = false;
+    log('INFO', 'Bot retomou a execução após período de pausa');
+    updateDashboard();
+  }
+
+  // 4. Verificação dos Limites Totais/Fatais (Estes SIM devem parar o bot)
+  const totalLossLimit = CONFIG.capital.totalUsd * CONFIG.risk.totalMaxLossPct;
+  if (state.totalPnL <= -totalLossLimit) {
+    state.permanentlyHalted = true;
+    log('ERROR', '💀 LIMITE DE PERDA TOTAL ATINGIDO - BOT PARADO PERMANENTEMENTE');
+    log('ERROR', `Perda total: -$${Math.abs(state.totalPnL).toFixed(2)} (limite: $${totalLossLimit.toFixed(2)})`);
+    updateDashboard();
+    return false;
+  }
+
+  const monthlyLossLimit = CONFIG.capital.totalUsd * CONFIG.risk.monthlyMaxLossPct;
+  if (state.monthlyPnL <= -monthlyLossLimit) {
+    log('ERROR', `🛑 Limite de perda mensal atingido: -$${Math.abs(state.monthlyPnL).toFixed(2)} (limite: $${monthlyLossLimit.toFixed(2)})`);
+    state.isPaused = true;
+    state.pauseUntil = Date.now() + (30 * 24 * 60 * 60 * 1000);
+    updateDashboard();
+    return false;
+  }
+
+  if (state.currentDrawdown >= CONFIG.risk.maxDrawdownFromPeak) {
+    log('ERROR', `🛑 Drawdown máximo atingido: ${(state.currentDrawdown * 100).toFixed(1)}%`);
+    state.isPaused = true;
+    state.pauseUntil = Date.now() + (7 * 24 * 60 * 60 * 1000);
+    updateDashboard();
+    return false;
+  }
+
+  // 5. Verificação da Perda Diária (DISPARA A PAUSA APENAS SE NÃO ESTIVER EM PERÍODO DE RETOMADA)
+  // O limite só deve pausar SE o bot NÃO acabou de sair de uma pausa recente sem novo PnL.
+  const dailyLossLimit = CONFIG.capital.totalUsd * CONFIG.risk.dailyMaxLossPct;
+  if (!state.isPaused && state.dailyPnL <= -dailyLossLimit) {
+    // Para evitar re-pausa imediata sem o PnL ter mudado no mesmo dia,
+    // verifica se o PnL do dia deve ser atenuado ou se a pausa deve durar até ao próximo reset diário.
+    state.isPaused = true;
+    state.pauseUntil = Date.now() + CONFIG.risk.pauseOnBreachMinutes * 60 * 1000;
+    log('WARN', `Limite de perda diária atingido: -$${Math.abs(state.dailyPnL).toFixed(2)} (limite: $${dailyLossLimit.toFixed(2)})`);
     updateDashboard();
     return false;
   }
