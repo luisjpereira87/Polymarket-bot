@@ -138,6 +138,7 @@ interface SimulatedPosition {
   size: number;
   entryPrice: number;
   timestamp: number;
+  outcome?: string;
 }
 
 // Guarda posições de compra simuladas para cálculo real de PnL na venda
@@ -205,6 +206,8 @@ const state: BotState = {
 
   smartMoneySignals: [],
 };
+
+const processedTrades = new Set<string>();
 
 // ============================================================================
 // UTILITÁRIOS E GESTÃO DE RISCO
@@ -327,7 +330,94 @@ function recordTrade(profit: number, strategy: string) {
   updateDashboard();
 }
 
-function simulateSmartMoneyTrade(trade: SmartMoneyTrade) {
+function simulateSmartMoneyTrade(trade: SmartMoneyTrade & { id?: string; market?: string }) {
+  // 1. Resolver fallback de campos (garantir que pega 'marketSlug' ou 'market')
+  const marketSlug = trade.marketSlug || trade.market;
+
+  // 2. Ignorar IMEDIATAMENTE se o mercado for inválido/vazio
+  if (!marketSlug || marketSlug.trim() === '') {
+    log('INFO', `[SIMULATION] Sinal ignorado: mercado inválido/vazio.`);
+    return;
+  }
+
+  // 3. Garantir o traderAddress
+  if (!trade.traderAddress) {
+    log('INFO', `[SIMULATION] Sinal ignorado: traderAddress ausente.`);
+    return;
+  }
+
+  // 4. Chave única de Posição (inclui outcome se existir para evitar juntar YES/NO)
+  const outcomeSuffix = trade.outcome ? `-${trade.outcome}` : '';
+  const posKey = `${trade.traderAddress}-${marketSlug}${outcomeSuffix}`;
+
+  // 5. Evitar trades duplicados (Deduplicação feita DEPOIS de validar o mercado)
+  const tradeHash = `${posKey}-${trade.side}-${trade.size}-${trade.price}`;
+  if (processedTrades.has(tradeHash)) {
+    return;
+  }
+  processedTrades.add(tradeHash);
+  
+  if (processedTrades.size > 5000) processedTrades.clear();
+
+  // 6. Filtro de preço mínimo
+  if (trade.price < 0.10) {
+    log('INFO', `[SIMULATION] Sinal ignorado: preço muito baixo ($${trade.price.toFixed(3)})`);
+    return;
+  }
+
+  // EXECUÇÃO DO COPY TRADE SIMULADO
+  if (trade.side === 'BUY') {
+    const existing = simulatedPositions.get(posKey);
+
+    if (existing) {
+      // Recalcular Preço Médio (DCA)
+      const totalSize = existing.size + trade.size;
+      const avgPrice = ((existing.entryPrice * existing.size) + (trade.price * trade.size)) / totalSize;
+
+      simulatedPositions.set(posKey, {
+        ...existing,
+        size: totalSize,
+        entryPrice: avgPrice,
+        timestamp: Date.now(),
+      });
+    } else {
+      simulatedPositions.set(posKey, {
+        traderAddress: trade.traderAddress,
+        marketSlug: marketSlug,
+        outcome: trade.outcome,
+        side: 'BUY',
+        size: trade.size,
+        entryPrice: trade.price,
+        timestamp: Date.now(),
+      });
+    }
+
+    log('TRADE', `[SIMULATION] Smart Money BUY: ${trade.size.toFixed(1)} shares @ $${trade.price.toFixed(3)} em ${marketSlug} ${outcomeSuffix} | Posição Atualizada`);
+
+  } else if (trade.side === 'SELL') {
+    const existingPos = simulatedPositions.get(posKey);
+
+    if (!existingPos) {
+      log('INFO', `[SIMULATION] Venda ignorada (${marketSlug}): sem posição de compra no histórico local.`);
+      return;
+    }
+
+    const closedShares = Math.min(trade.size, existingPos.size);
+    const profit = (trade.price - existingPos.entryPrice) * closedShares;
+
+    if (existingPos.size - closedShares > 0.01) {
+      existingPos.size -= closedShares;
+      simulatedPositions.set(posKey, existingPos);
+    } else {
+      simulatedPositions.delete(posKey);
+    }
+
+    log('TRADE', `[SIMULATION] Smart Money SELL: ${closedShares.toFixed(1)} shares @ $${trade.price.toFixed(3)} | PnL: $${profit.toFixed(2)}`);
+    recordTrade(profit, 'smartMoney');
+  }
+}
+
+function simulateSmartMoneyTrade__(trade: SmartMoneyTrade) {
   const posKey = `${trade.traderAddress}-${trade.marketSlug || 'market'}`;
 
   if (trade.side === 'BUY') {
