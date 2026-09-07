@@ -577,15 +577,15 @@ function simulateTrade(profit: number, strategy: string, description: string) {
 let arbService: ArbitrageService | null = null;
 let isSmartMoneyInitialized = false;
 let isSmartMoneyInitializing = false;
+//let currentSmartMoneySub: any = null;
+let currentSmartMoneySub: { id: string; unsubscribe: () => void } | null = null;
+let activeTradesProcessing = 0;
 
 async function setupSmartMoney(sdk: PolymarketSDK) {
   if (CONFIG.smartMoney.enabled) {
     initializeSmartMoney(sdk);
   }
 }
-
-let currentSmartMoneySub: { id: string; unsubscribe: () => void } | null = null;
-let activeTradesProcessing = 0;
 
 async function initializeSmartMoney__(sdk: PolymarketSDK) {
   //if (isSmartMoneyInitializing) return;
