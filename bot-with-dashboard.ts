@@ -579,6 +579,7 @@ let isSmartMoneyInitialized = false;
 let isSmartMoneyInitializing = false;
 //let currentSmartMoneySub: any = null;
 let currentSmartMoneySub: { id: string; unsubscribe: () => void } | null = null;
+let activeTradesProcessing = 0;
 
 async function setupSmartMoney(sdk: PolymarketSDK) {
   if (CONFIG.smartMoney.enabled) {
@@ -586,113 +587,19 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
   }
 }
 
-async function initializeSmartMoney__(sdk: PolymarketSDK) {
-  if (isSmartMoneyInitializing) return;
-  isSmartMoneyInitializing = true;
 
-  log('WALLET', 'Configurando Smart Money com filtros completos de qualidade...');
 
-  const qualified: string[] = [];
-
-  if (CONFIG.smartMoney.customWallets?.length > 0) {
-    for (const wallet of CONFIG.smartMoney.customWallets) {
-      qualified.push(wallet);
-      log('WALLET', `⭐ Carteira personalizada adicionada: ${wallet.slice(0, 10)}...`);
-    }
-  }
-
-  try {
-    const leaderboard = await sdk.wallets.getLeaderboardByPeriod('week', CONFIG.smartMoney.topN * 2, 'pnl');
-
-    for (const entry of leaderboard) {
-      if (!CONFIG.smartMoney.enabled && qualified.length === 0) break;
-      if (qualified.length >= 10) break;
-      if (qualified.includes(entry.address)) continue;
-
-      const profile = await sdk.wallets.getWalletProfile(entry.address);
-      if (!profile) continue;
-
-      const winRate = (profile as any).winRate ?? 0;
-      const pnl = entry.pnl ?? 0;
-      const trades = profile.tradeCount ?? 0;
-      const profitFactor = (profile as any).profitFactor ?? 2.0;
-
-      if (
-        winRate >= CONFIG.smartMoney.minWinRate &&
-        pnl >= CONFIG.smartMoney.minPnl &&
-        trades >= CONFIG.smartMoney.minTrades &&
-        profitFactor >= CONFIG.smartMoney.minProfitFactor
-      ) {
-        qualified.push(entry.address);
-        log('WALLET', `✅ Carteira Qualificada: ${entry.address.slice(0, 10)}... (WR:${(winRate * 100).toFixed(0)}% PnL:$${pnl.toFixed(0)} T:${trades})`);
-      }
-
-      await new Promise(r => setTimeout(r, 300));
-    }
-  } catch (err) {
-    log('WARN', `Erro ao carregar Leaderboard: ${(err as Error).message}`);
-  }
-
-  state.followedWallets = qualified;
-  log('WALLET', `A seguir ${qualified.length} carteiras qualificadas`);
-  updateDashboard();
-
-  // 1. CANCELA A SUBSCRIÇÃO ANTERIOR (Limpa o handler e fecha o activeSubscription no SDK)
-  if (currentSmartMoneySub) {
-    log('WALLET', '🔄 A cancelar subscrição antiga para aplicar os novos filtros de carteira...');
-    currentSmartMoneySub.unsubscribe();
-    currentSmartMoneySub = null;
-  }
-
-  // 2. CRIA A NOVA SUBSCRIÇÃO PASSANDO AS NOVAS CARTEIRAS NOS OPTIONS
-  if (qualified.length > 0) {
-    currentSmartMoneySub = sdk.smartMoney.subscribeSmartMoneyTrades(
-      async (trade: SmartMoneyTrade) => {
-        if (!CONFIG.smartMoney.enabled) return;
-        if (!canTrade()) return;
-
-        const signal: SmartMoneySignal = {
-          id: `sm-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-          timestamp: new Date().toISOString(),
-          wallet: trade.traderAddress,
-          market: trade.marketSlug || 'Unknown',
-          side: trade.side as 'BUY' | 'SELL',
-          size: trade.size,
-          price: trade.price,
-        };
-
-        state.smartMoneySignals.unshift(signal);
-        if (state.smartMoneySignals.length > 50) {
-          state.smartMoneySignals = state.smartMoneySignals.slice(0, 50);
-        }
-
-        log('SIGNAL', `Sinal de Copy Trade recebido de ${trade.traderAddress.slice(0, 10)}...`, {
-          market: trade.marketSlug?.slice(0, 50),
-          side: trade.side,
-          size: trade.size,
-          price: trade.price,
-        });
-        updateDashboard();
-
-        if (CONFIG.dryRun) {
-          simulateSmartMoneyTrade(trade);
-        } else {
-          // Lógica de execução LIVE
-        }
-      },
-      {
-        filterAddresses: qualified, // Passa explicitamente a nova lista de carteiras
-        smartMoneyOnly: true,
-      }
-    );
-  }
-
-  isSmartMoneyInitialized = true;
-  isSmartMoneyInitializing = false;
-}
 
 async function initializeSmartMoney(sdk: PolymarketSDK) {
-  if (isSmartMoneyInitialized || isSmartMoneyInitializing) return;
+  //if (isSmartMoneyInitialized || isSmartMoneyInitializing) return;
+
+  /**
+  if (isSmartMoneyInitializing) {
+    log('WARN', '⚠️ Inicialização do Smart Money já está em andamento. Chamada ignorada.');
+    return;
+  }
+    **/
+
   isSmartMoneyInitializing = true;
 
   log('WALLET', 'Configurando Smart Money com filtros completos de qualidade...');
@@ -744,37 +651,42 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
   updateDashboard();
 
   if (qualified.length > 0) {
-    sdk.smartMoney.subscribeSmartMoneyTrades(
+    currentSmartMoneySub = sdk.smartMoney.subscribeSmartMoneyTrades(
       async (trade: SmartMoneyTrade) => {
-        if (!CONFIG.smartMoney.enabled) return;
-        if (!canTrade()) return; // Fix do Issue: Validação de risco antes de processar
 
-        const signal: SmartMoneySignal = {
-          id: `sm-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-          timestamp: new Date().toISOString(),
-          wallet: trade.traderAddress,
-          market: trade.marketSlug || 'Unknown',
-          side: trade.side as 'BUY' | 'SELL',
-          size: trade.size,
-          price: trade.price,
-        };
-        state.smartMoneySignals.unshift(signal);
-        if (state.smartMoneySignals.length > 50) {
-          state.smartMoneySignals = state.smartMoneySignals.slice(0, 50);
-        }
+        try {
+          if (!CONFIG.smartMoney.enabled) return;
+          if (!canTrade()) return; // Fix do Issue: Validação de risco antes de processar
 
-        log('SIGNAL', `Sinal de Copy Trade recebido de ${trade.traderAddress.slice(0, 10)}...`, {
-          market: trade.marketSlug?.slice(0, 50),
-          side: trade.side,
-          size: trade.size,
-          price: trade.price,
-        });
-        updateDashboard();
+          const signal: SmartMoneySignal = {
+            id: `sm-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+            timestamp: new Date().toISOString(),
+            wallet: trade.traderAddress,
+            market: trade.marketSlug || 'Unknown',
+            side: trade.side as 'BUY' | 'SELL',
+            size: trade.size,
+            price: trade.price,
+          };
+          state.smartMoneySignals.unshift(signal);
+          if (state.smartMoneySignals.length > 50) {
+            state.smartMoneySignals = state.smartMoneySignals.slice(0, 50);
+          }
 
-        if (CONFIG.dryRun) {
-          simulateSmartMoneyTrade(trade); // Fix do Issue: Execução com rastreio de PnL real
-        } else {
-          // Lógica de execução em conta real (Live)
+          log('SIGNAL', `Sinal de Copy Trade recebido de ${trade.traderAddress.slice(0, 10)}...`, {
+            market: trade.marketSlug?.slice(0, 50),
+            side: trade.side,
+            size: trade.size,
+            price: trade.price,
+          });
+          updateDashboard();
+
+          if (CONFIG.dryRun) {
+            simulateSmartMoneyTrade(trade); // Fix do Issue: Execução com rastreio de PnL real
+          } else {
+            // Lógica de execução em conta real (Live)
+          }
+        } finally {
+          activeTradesProcessing--; // 🟢 Ordem concluída: liberta rotação
         }
       });
   }
@@ -1338,15 +1250,46 @@ async function main() {
 
   // 2. Atualiza a lista de carteiras do Smart Money automaticamente a cada 2 horas
   const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
-  const THIRTY_MINUTES_MS = 30 * 60 * 1000;
+  const THIRTY_MINUTES_MS = 30 * 60 * 1000
+  /**
   setInterval(async () => {
     try {
       log('INFO', '🔄 A reanalisar o mercado e a procurar novas carteiras de Smart Money...');
+      currentSmartMoneySub?.unsubscribe()
+      currentSmartMoneySub = null;
       await setupSmartMoney(sdk);
     } catch (err: any) {
       log('WARN', `❌ Erro ao atualizar Smart Money em background: ${err.message}`);
     }
-  }, THIRTY_MINUTES_MS);
+  }, TWO_HOURS_MS);
+  **/
+  setInterval(async () => {
+    log('INFO', '⏰ Rotação de Smart Money acionada (Intervalo: 2h)...');
+
+    // 1. Verifica se há ordens locais a serem processadas no milissegundo
+    if (activeTradesProcessing > 0) {
+      log('WARN', `⏳ Existe(m) ${activeTradesProcessing} trade(s) em processamento. Aguardando 5s para fechar...`);
+      await new Promise(r => setTimeout(r, 5000));
+    }
+
+    // 2. Destrói a subscrição antiga
+    if (currentSmartMoneySub) {
+      try {
+        log('INFO', '🔄 A fechar subscrição WebSocket antiga...');
+        currentSmartMoneySub.unsubscribe();
+        currentSmartMoneySub = null;
+      } catch (err) {
+        log('WARN', `Erro no unsubscribe: ${(err as Error).message}`);
+      }
+
+      // 3. Pausa de segurança de 4 segundos para a Polymarket libertar a sessão no DB
+      await new Promise(resolve => setTimeout(resolve, 4000));
+    }
+
+    // 4. Executa a atualização e abre o novo WebSocket
+    await initializeSmartMoney(sdk);
+
+}, THIRTY_MINUTES_MS);
 
   // 2. Re-verificação de Arbitragem (A cada 10 minutos)
   setInterval(async () => {
