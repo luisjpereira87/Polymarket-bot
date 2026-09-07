@@ -585,7 +585,7 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
   }
 }
 
-async function initializeSmartMoney(sdk: PolymarketSDK) {
+async function initializeSmartMoney__(sdk: PolymarketSDK) {
   // Evita que duas chamadas corram exatamente ao mesmo tempo em paralelo
   if (isSmartMoneyInitializing) return;
   isSmartMoneyInitializing = true;
@@ -697,8 +697,8 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
   isSmartMoneyInitializing = false;
 }
 
-async function initializeSmartMoney_old(sdk: PolymarketSDK) {
-  //if (isSmartMoneyInitialized || isSmartMoneyInitializing) return;
+async function initializeSmartMoney(sdk: PolymarketSDK) {
+  if (isSmartMoneyInitialized || isSmartMoneyInitializing) return;
   isSmartMoneyInitializing = true;
 
   log('WALLET', 'Configurando Smart Money com filtros completos de qualidade...');
