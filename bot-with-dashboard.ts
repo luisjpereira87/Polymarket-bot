@@ -577,7 +577,8 @@ function simulateTrade(profit: number, strategy: string, description: string) {
 let arbService: ArbitrageService | null = null;
 let isSmartMoneyInitialized = false;
 let isSmartMoneyInitializing = false;
-let currentSmartMoneySub: any = null;
+//let currentSmartMoneySub: any = null;
+let currentSmartMoneySub: { id: string; unsubscribe: () => void } | null = null;
 
 async function setupSmartMoney(sdk: PolymarketSDK) {
   if (CONFIG.smartMoney.enabled) {
@@ -586,7 +587,6 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
 }
 
 async function initializeSmartMoney(sdk: PolymarketSDK) {
-  // Evita chamadas simultâneas em paralelo
   if (isSmartMoneyInitializing) return;
   isSmartMoneyInitializing = true;
 
@@ -633,51 +633,58 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
     log('WARN', `Erro ao carregar Leaderboard: ${(err as Error).message}`);
   }
 
-  // Atualiza as carteiras ativas
   state.followedWallets = qualified;
   log('WALLET', `A seguir ${qualified.length} carteiras qualificadas`);
   updateDashboard();
 
-  // APENAS CRIA O OUVINTE NA PRIMEIRA VEZ (Se ainda não tiver sido inicializado)
-  if (!isSmartMoneyInitialized && qualified.length > 0) {
-    sdk.smartMoney.subscribeSmartMoneyTrades(async (trade: SmartMoneyTrade) => {
-      if (!CONFIG.smartMoney.enabled || !canTrade()) return;
+  // 1. CANCELA A SUBSCRIÇÃO ANTERIOR (Limpa o handler e fecha o activeSubscription no SDK)
+  if (currentSmartMoneySub) {
+    log('WALLET', '🔄 A cancelar subscrição antiga para aplicar os novos filtros de carteira...');
+    currentSmartMoneySub.unsubscribe();
+    currentSmartMoneySub = null;
+  }
 
-      // Filtra em tempo real usando a lista atualizada de state.followedWallets
-      const isFollowed = state.followedWallets.some(
-        addr => addr.toLowerCase() === trade.traderAddress.toLowerCase()
-      );
-      if (!isFollowed) return;
+  // 2. CRIA A NOVA SUBSCRIÇÃO PASSANDO AS NOVAS CARTEIRAS NOS OPTIONS
+  if (qualified.length > 0) {
+    currentSmartMoneySub = sdk.smartMoney.subscribeSmartMoneyTrades(
+      async (trade: SmartMoneyTrade) => {
+        if (!CONFIG.smartMoney.enabled) return;
+        if (!canTrade()) return;
 
-      const signal: SmartMoneySignal = {
-        id: `sm-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-        timestamp: new Date().toISOString(),
-        wallet: trade.traderAddress,
-        market: trade.marketSlug || 'Unknown',
-        side: trade.side as 'BUY' | 'SELL',
-        size: trade.size,
-        price: trade.price,
-      };
+        const signal: SmartMoneySignal = {
+          id: `sm-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          timestamp: new Date().toISOString(),
+          wallet: trade.traderAddress,
+          market: trade.marketSlug || 'Unknown',
+          side: trade.side as 'BUY' | 'SELL',
+          size: trade.size,
+          price: trade.price,
+        };
 
-      state.smartMoneySignals.unshift(signal);
-      if (state.smartMoneySignals.length > 50) {
-        state.smartMoneySignals = state.smartMoneySignals.slice(0, 50);
+        state.smartMoneySignals.unshift(signal);
+        if (state.smartMoneySignals.length > 50) {
+          state.smartMoneySignals = state.smartMoneySignals.slice(0, 50);
+        }
+
+        log('SIGNAL', `Sinal de Copy Trade recebido de ${trade.traderAddress.slice(0, 10)}...`, {
+          market: trade.marketSlug?.slice(0, 50),
+          side: trade.side,
+          size: trade.size,
+          price: trade.price,
+        });
+        updateDashboard();
+
+        if (CONFIG.dryRun) {
+          simulateSmartMoneyTrade(trade);
+        } else {
+          // Lógica de execução LIVE
+        }
+      },
+      {
+        filterAddresses: qualified, // Passa explicitamente a nova lista de carteiras
+        smartMoneyOnly: true,
       }
-
-      log('SIGNAL', `Sinal de Copy Trade recebido de ${trade.traderAddress.slice(0, 10)}...`, {
-        market: trade.marketSlug?.slice(0, 50),
-        side: trade.side,
-        size: trade.size,
-        price: trade.price,
-      });
-      updateDashboard();
-
-      if (CONFIG.dryRun) {
-        simulateSmartMoneyTrade(trade);
-      } else {
-        // Lógica LIVE
-      }
-    });
+    );
   }
 
   isSmartMoneyInitialized = true;
