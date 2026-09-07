@@ -586,7 +586,7 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
   }
 }
 
-async function initializeSmartMoney(sdk: PolymarketSDK) {
+async function initializeSmartMoney__(sdk: PolymarketSDK) {
   if (isSmartMoneyInitializing) return;
   isSmartMoneyInitializing = true;
 
@@ -691,7 +691,7 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
   isSmartMoneyInitializing = false;
 }
 
-async function initializeSmartMoney_old(sdk: PolymarketSDK) {
+async function initializeSmartMoney(sdk: PolymarketSDK) {
   if (isSmartMoneyInitialized || isSmartMoneyInitializing) return;
   isSmartMoneyInitializing = true;
 
