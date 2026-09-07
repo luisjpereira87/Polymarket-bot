@@ -585,7 +585,7 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
 }
 
 async function initializeSmartMoney(sdk: PolymarketSDK) {
-  if (isSmartMoneyInitialized || isSmartMoneyInitializing) return;
+  //if (isSmartMoneyInitialized || isSmartMoneyInitializing) return;
   isSmartMoneyInitializing = true;
 
   log('WALLET', 'Configurando Smart Money com filtros completos de qualidade...');
