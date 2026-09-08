@@ -429,6 +429,106 @@ function recordTrade(profit: number, strategy: string) {
 }
 
 function simulateSmartMoneyTrade(trade: SmartMoneyTrade & { id?: string; market?: string }) {
+  // 1. Resolver fallback de campos
+  const marketSlug = trade.marketSlug || trade.market;
+
+  // 2. Ignorar se o mercado ou trader forem inválidos
+  if (!marketSlug || marketSlug.trim() === '' || !trade.traderAddress) {
+    return;
+  }
+
+  // 3. Determinar a chave única da posição (Trader + Mercado + Outcome)
+  const outcomeSuffix = trade.outcome ? `-${trade.outcome}` : '';
+  let posKey = `${trade.traderAddress}-${marketSlug}${outcomeSuffix}`;
+
+  // Se for SELL e não encontrar a posKey exata com outcome, tenta localizar mantendo o outcome coerente
+  if (trade.side === 'SELL' && !simulatedPositions.has(posKey)) {
+    for (const key of simulatedPositions.keys()) {
+      if (key.startsWith(`${trade.traderAddress}-${marketSlug}`) && trade.outcome && key.endsWith(`-${trade.outcome}`)) {
+        posKey = key;
+        break;
+      }
+    }
+  }
+
+  // 4. Evitar trades duplicados
+  const tradeHash = `${posKey}-${trade.side}-${trade.size}-${trade.price}`;
+  if (processedTrades.has(tradeHash)) return;
+  processedTrades.add(tradeHash);
+  
+  if (processedTrades.size > 5000) processedTrades.clear();
+
+  // 5. Filtro de preço mínimo
+  if (trade.price < 0.10) {
+    log('INFO', `[SIMULATION] Sinal ignorado: preço muito baixo ($${trade.price.toFixed(3)})`);
+    return;
+  }
+
+  // EXECUÇÃO DO COPY TRADE SIMULADO
+  if (trade.side === 'BUY') {
+    const maxUsdPerTrade = CONFIG.smartMoney?.maxSizePerTrade || 5;
+    const targetUsd = Math.min(trade.size * trade.price, maxUsdPerTrade);
+    const scaledSize = targetUsd / trade.price;
+
+    const existing = simulatedPositions.get(posKey);
+
+    if (existing) {
+      // Recalcular Preço Médio (DCA)
+      const totalSize = existing.size + scaledSize;
+      const avgPrice = ((existing.entryPrice * existing.size) + (trade.price * scaledSize)) / totalSize;
+
+      simulatedPositions.set(posKey, {
+        ...existing,
+        size: totalSize,
+        entryPrice: avgPrice,
+        timestamp: Date.now(),
+      });
+    } else {
+      simulatedPositions.set(posKey, {
+        traderAddress: trade.traderAddress,
+        marketSlug: marketSlug,
+        outcome: trade.outcome,
+        side: 'BUY',
+        size: scaledSize,
+        entryPrice: trade.price,
+        timestamp: Date.now(),
+      });
+    }
+
+    log('TRADE', `[SIMULATION] Smart Money BUY: ${scaledSize.toFixed(1)} shares @ $${trade.price.toFixed(3)} em ${marketSlug} ${outcomeSuffix}`);
+
+  } else if (trade.side === 'SELL') {
+    const existingPos = simulatedPositions.get(posKey);
+
+    if (!existingPos || existingPos.size <= 0) {
+      return; // Venda ignorada por falta de posição
+    }
+
+    // 🛡️ CORREÇÃO MATEMÁTICA: Vende proporcionalmente à percentagem que a Smart Money fechou
+    // Se não soubermos o tamanho total da carteira deles, fechamos a percentagem da ordem atual
+    let closedShares = existingPos.size; 
+
+    // Se o sinal da Smart Money trouxer o tamanho relativo, reduzimos na mesma proporção:
+    if (trade.size && trade.size > 0) {
+      // Exemplo: fecha no máximo até ao limite das shares que NÓS possuímos
+      closedShares = Math.min(existingPos.size, trade.size); 
+    }
+
+    const profit = (trade.price - existingPos.entryPrice) * closedShares;
+
+    if (existingPos.size - closedShares > 0.01) {
+      existingPos.size -= closedShares;
+      simulatedPositions.set(posKey, existingPos);
+    } else {
+      simulatedPositions.delete(posKey); // Elimina a posição se foi totalmente encerrada
+    }
+
+    log('TRADE', `[SIMULATION] Smart Money SELL: ${closedShares.toFixed(1)} shares @ $${trade.price.toFixed(3)} | PnL: $${profit.toFixed(2)}`);
+    recordTrade(profit, 'smartMoney');
+  }
+}
+
+function simulateSmartMoneyTrade_old(trade: SmartMoneyTrade & { id?: string; market?: string }) {
   // 1. Resolver fallback de campos (garantir que pega 'marketSlug' ou 'market')
   const marketSlug = trade.marketSlug || trade.market;
 
