@@ -29,7 +29,7 @@ let CONFIG = {
     maxPerTradePct: 0.02,
     maxPerMarketPct: 0.10,
     maxTotalExposurePct: 0.30,
-    minOrderUsd: 5,
+    minOrderUsd: 1, // Baixado de 5 para aceitar pequenas frações
     strategyAllocation: {
       smartMoney: 0.60,
       arbitrage: 0.20,
@@ -55,37 +55,25 @@ let CONFIG = {
   },
 
   smartMoney: {
-    enabled: process.env.SMARTMONEY_ENABLED !== 'false',
-    topN: 20,
-
-    minWinRate: 0.80,          // Subido de 0.60 para 0.80 (Exige 80% de vitórias)
-    minPnl: 2000,              // Subido de 500 para 2000 (Exige lucro histórico relevante)
-    minTrades: 50,             // Subido de 30 para 50 (Garante amostra estatística sólida)
-    minProfitFactor: 2.0,      // Subido de 1.5 para 2.0 (Ganha no mínimo o dobro do que perde)
-    minConsistencyScore: 0.8,  // Subido de 0.7 para 0.8 (Operações consistentes no tempo)
+    enabled: true,
+    topN: 50,                  // Subido de 20 para 50 (Procura numa lista muito maior de carteiras)
     
-    maxSingleTradeExposure: 0.3,
-    checkLastNTrades: 20,      // Aumentado de 10 para 20 (Analisa um histórico recente maior)
-
-    sizeScale: 0.05,
-    maxSizePerTrade: 5,
-
-    /**
-    minWinRate: 0.60,
-    minPnl: 500,
-    minTrades: 30,
-
-    minProfitFactor: 1.5,
-    minConsistencyScore: 0.7,
+    minWinRate: 0.55,          // Ligeiramente ajustado de 0.60 para 0.55
+    minPnl: 300,               // Ajustado de 500 para 300
+    minTrades: 20,              // Ajustado de 30 para 20
+    
+    minProfitFactor: 1.2,      // Relaxado de 1.5 para 1.2 (Encontra muito mais carteiras)
+    minConsistencyScore: 0.5,  // Relaxado de 0.7 para 0.5
+    
     maxSingleTradeExposure: 0.3,
     checkLastNTrades: 10,
 
     sizeScale: 0.1,
     maxSizePerTrade: 15,
-    **/
-    maxSlippage: 0.03,
-    minTradeSize: 10,
-    delay: 500,
+   
+    maxSlippage: 0.05,         // Subido de 0.03 para 0.05 (Evita rejeitar trades por ligeira variação de preço)
+    minTradeSize: 1.0,         // 🚨 CRÍTICO: Baixado de 10 para 1.0 (Não descarta ordens pequenas!)
+    delay: 200,                // Reduzido de 500ms para 200ms de latência
     customWallets: [
       '0xc2e7800b5af46e6093872b177b7a5e7f0563be51',
       '0x58c3f5d66c95d4c41b093fbdd2520e46b6c9de74',
@@ -93,26 +81,26 @@ let CONFIG = {
   },
 
   arbitrage: {
-    enabled: process.env.ARBITRAGE_ENABLED === 'true',
-    profitThreshold: 0.01,
-    minTradeSize: 20,
-    maxTradeSize: 100,
-    minVolume24h: 5000,
+    enabled: true,             // Forçado a true (ativa a estratégia automaticamente)
+    profitThreshold: 0.008,    // Baixado de 0.01 para 0.008 (Mais oportunidades de arbitragem)
+    minTradeSize: 5,
+    maxTradeSize: 50,
+    minVolume24h: 2000,
     autoExecute: true,
     enableRebalancer: true,
 
-    estimatedGasCostUSD: 0.10,
-    minNetProfit: 0.50,
+    estimatedGasCostUSD: 0.05,
+    minNetProfit: 0.20,
   },
 
   dipArb: {
-    enabled: process.env.DIPARB_ENABLED === 'true',
+    enabled: false,             // Forçado a true
     coins: ['BTC', 'ETH', 'SOL'] as const,
     shares: 10,
-    sumTarget: 0.92,
+    sumTarget: 0.95,           // Subido de 0.92 para 0.95 (Aumenta bastante os gatilhos)
     autoRotate: true,
     autoExecute: true,
-    minTradeValueUSD: 1.5,
+    minTradeValueUSD: 1.0,
   },
 
   onchain: {
@@ -122,7 +110,7 @@ let CONFIG = {
   },
 
   binance: {
-    enabled: process.env.TREND_ANALYSIS_ENABLED === 'true',
+    enabled: true,
     symbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'] as const,
     interval: '15m' as const,
     trendThreshold: 2,
@@ -141,6 +129,7 @@ let CONFIG = {
 
   dryRun: process.env.DRY_RUN !== 'false',
 };
+
 
 // ============================================================================
 // ESTADO E RASTREIO DE POSIÇÕES SIMULADAS
@@ -419,7 +408,7 @@ function recordTrade(profit: number, strategy: string) {
   else if (strategy === 'dipArb') state.dipArbTrades++;
   else if (strategy === 'direct') state.directTrades++;
 
-  if (CONFIG.dryRun && state.paper) {
+  if (/**CONFIG.dryRun &&**/ state.paper) {
     state.paper.pnl += profit;
     state.paper.balance += profit;
     state.paper.trades++;
@@ -429,106 +418,6 @@ function recordTrade(profit: number, strategy: string) {
 }
 
 function simulateSmartMoneyTrade(trade: SmartMoneyTrade & { id?: string; market?: string }) {
-  // 1. Resolver fallback de campos
-  const marketSlug = trade.marketSlug || trade.market;
-
-  // 2. Ignorar se o mercado ou trader forem inválidos
-  if (!marketSlug || marketSlug.trim() === '' || !trade.traderAddress) {
-    return;
-  }
-
-  // 3. Determinar a chave única da posição (Trader + Mercado + Outcome)
-  const outcomeSuffix = trade.outcome ? `-${trade.outcome}` : '';
-  let posKey = `${trade.traderAddress}-${marketSlug}${outcomeSuffix}`;
-
-  // Se for SELL e não encontrar a posKey exata com outcome, tenta localizar mantendo o outcome coerente
-  if (trade.side === 'SELL' && !simulatedPositions.has(posKey)) {
-    for (const key of simulatedPositions.keys()) {
-      if (key.startsWith(`${trade.traderAddress}-${marketSlug}`) && trade.outcome && key.endsWith(`-${trade.outcome}`)) {
-        posKey = key;
-        break;
-      }
-    }
-  }
-
-  // 4. Evitar trades duplicados
-  const tradeHash = `${posKey}-${trade.side}-${trade.size}-${trade.price}`;
-  if (processedTrades.has(tradeHash)) return;
-  processedTrades.add(tradeHash);
-  
-  if (processedTrades.size > 5000) processedTrades.clear();
-
-  // 5. Filtro de preço mínimo
-  if (trade.price < 0.10) {
-    log('INFO', `[SIMULATION] Sinal ignorado: preço muito baixo ($${trade.price.toFixed(3)})`);
-    return;
-  }
-
-  // EXECUÇÃO DO COPY TRADE SIMULADO
-  if (trade.side === 'BUY') {
-    const maxUsdPerTrade = CONFIG.smartMoney?.maxSizePerTrade || 5;
-    const targetUsd = Math.min(trade.size * trade.price, maxUsdPerTrade);
-    const scaledSize = targetUsd / trade.price;
-
-    const existing = simulatedPositions.get(posKey);
-
-    if (existing) {
-      // Recalcular Preço Médio (DCA)
-      const totalSize = existing.size + scaledSize;
-      const avgPrice = ((existing.entryPrice * existing.size) + (trade.price * scaledSize)) / totalSize;
-
-      simulatedPositions.set(posKey, {
-        ...existing,
-        size: totalSize,
-        entryPrice: avgPrice,
-        timestamp: Date.now(),
-      });
-    } else {
-      simulatedPositions.set(posKey, {
-        traderAddress: trade.traderAddress,
-        marketSlug: marketSlug,
-        outcome: trade.outcome,
-        side: 'BUY',
-        size: scaledSize,
-        entryPrice: trade.price,
-        timestamp: Date.now(),
-      });
-    }
-
-    log('TRADE', `[SIMULATION] Smart Money BUY: ${scaledSize.toFixed(1)} shares @ $${trade.price.toFixed(3)} em ${marketSlug} ${outcomeSuffix}`);
-
-  } else if (trade.side === 'SELL') {
-    const existingPos = simulatedPositions.get(posKey);
-
-    if (!existingPos || existingPos.size <= 0) {
-      return; // Venda ignorada por falta de posição
-    }
-
-    // 🛡️ CORREÇÃO MATEMÁTICA: Vende proporcionalmente à percentagem que a Smart Money fechou
-    // Se não soubermos o tamanho total da carteira deles, fechamos a percentagem da ordem atual
-    let closedShares = existingPos.size; 
-
-    // Se o sinal da Smart Money trouxer o tamanho relativo, reduzimos na mesma proporção:
-    if (trade.size && trade.size > 0) {
-      // Exemplo: fecha no máximo até ao limite das shares que NÓS possuímos
-      closedShares = Math.min(existingPos.size, trade.size); 
-    }
-
-    const profit = (trade.price - existingPos.entryPrice) * closedShares;
-
-    if (existingPos.size - closedShares > 0.01) {
-      existingPos.size -= closedShares;
-      simulatedPositions.set(posKey, existingPos);
-    } else {
-      simulatedPositions.delete(posKey); // Elimina a posição se foi totalmente encerrada
-    }
-
-    log('TRADE', `[SIMULATION] Smart Money SELL: ${closedShares.toFixed(1)} shares @ $${trade.price.toFixed(3)} | PnL: $${profit.toFixed(2)}`);
-    recordTrade(profit, 'smartMoney');
-  }
-}
-
-function simulateSmartMoneyTrade_old(trade: SmartMoneyTrade & { id?: string; market?: string }) {
   // 1. Resolver fallback de campos (garantir que pega 'marketSlug' ou 'market')
   const marketSlug = trade.marketSlug || trade.market;
 
@@ -680,6 +569,7 @@ let isSmartMoneyInitializing = false;
 //let currentSmartMoneySub: any = null;
 let currentSmartMoneySub: { id: string; unsubscribe: () => void } | null = null;
 let activeTradesProcessing = 0;
+const realPositions = new Map<string, { size: number; avgEntryPrice: number }>();
 
 async function setupSmartMoney(sdk: PolymarketSDK) {
   if (CONFIG.smartMoney.enabled) {
@@ -687,83 +577,114 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
   }
 }
 
-async function initializeSmartMoney__(sdk: PolymarketSDK) {
-  //if (isSmartMoneyInitializing) return;
+const recentSmartMoneyTradesCache = new Map<string, number>();
+
+function isDuplicateSmartMoneyTrade(trade: any): boolean {
+  // Gera uma impressão digital baseada no trader, mercado, ação (BUY/SELL), quantidade e preço
+  const signature = `${trade.traderAddress}-${trade.marketSlug || trade.market}-${trade.side}-${trade.size}-${trade.price}`;
+  const now = Date.now();
+
+  // Limpa registos mais antigos que 3 segundos (3000 ms)
+  for (const [key, timestamp] of recentSmartMoneyTradesCache.entries()) {
+    if (now - timestamp > 3000) {
+      recentSmartMoneyTradesCache.delete(key);
+    }
+  }
+
+  // Se o sinal já deu entrada nos últimos 3s, é duplicado!
+  if (recentSmartMoneyTradesCache.has(signature)) {
+    return true;
+  }
+
+  recentSmartMoneyTradesCache.set(signature, now);
+  return false;
+}
+
+async function initializeSmartMoney(sdk: PolymarketSDK) {
   isSmartMoneyInitializing = true;
 
+  log('WALLET', 'Configurando Smart Money com filtros completos de qualidade...');
+
+  const qualified: string[] = [];
+
+  // 1. Carregar carteiras personalizadas da configuração
+  if (CONFIG.smartMoney.customWallets?.length > 0) {
+    for (const wallet of CONFIG.smartMoney.customWallets) {
+      qualified.push(wallet);
+      log('WALLET', `⭐ Carteira personalizada adicionada: ${wallet.slice(0, 10)}...`);
+    }
+  }
+
+  // 2. Filtrar carteiras do Leaderboard
   try {
-    log('WALLET', 'Configurando Smart Money com filtros completos de qualidade...');
+    const leaderboard = await sdk.wallets.getLeaderboardByPeriod('week', CONFIG.smartMoney.topN * 2, 'pnl');
 
-    const qualified: string[] = [];
+    for (const entry of leaderboard) {
+      if (!CONFIG.smartMoney.enabled && qualified.length === 0) break;
+      if (qualified.length >= 10) break;
+      if (qualified.includes(entry.address)) continue;
 
-    if (CONFIG.smartMoney.customWallets?.length > 0) {
-      for (const wallet of CONFIG.smartMoney.customWallets) {
-        // IMPORTANTE: Normalizar sempre para lowercase
-        qualified.push(wallet.toLowerCase());
-        log('WALLET', `⭐ Carteira personalizada adicionada: ${wallet.slice(0, 10)}...`);
+      const profile = await sdk.wallets.getWalletProfile(entry.address);
+      if (!profile) continue;
+
+      const winRate = (profile as any).winRate ?? 0;
+      const pnl = entry.pnl ?? 0;
+      const trades = profile.tradeCount ?? 0;
+      const profitFactor = (profile as any).profitFactor ?? 2.0;
+
+      if (
+        winRate >= CONFIG.smartMoney.minWinRate &&
+        pnl >= CONFIG.smartMoney.minPnl &&
+        trades >= CONFIG.smartMoney.minTrades &&
+        profitFactor >= CONFIG.smartMoney.minProfitFactor
+      ) {
+        qualified.push(entry.address);
+        log('WALLET', `✅ Carteira Qualificada: ${entry.address.slice(0, 10)}... (WR:${(winRate * 100).toFixed(0)}% PnL:$${pnl.toFixed(0)} T:${trades})`);
       }
+
+      await new Promise(r => setTimeout(r, 300));
     }
+  } catch (err) {
+    log('WARN', `Erro ao carregar Leaderboard: ${(err as Error).message}`);
+  }
 
-    try {
-      const leaderboard = await sdk.wallets.getLeaderboardByPeriod('week', CONFIG.smartMoney.topN * 2, 'pnl');
+  state.followedWallets = qualified;
+  log('WALLET', `A seguir ${qualified.length} carteiras qualificadas`);
+  updateDashboard();
 
-      for (const entry of leaderboard) {
-        if (!CONFIG.smartMoney.enabled && qualified.length === 0) break;
-        if (qualified.length >= 10) break;
-        
-        const addrLower = entry.address.toLowerCase();
-        if (qualified.includes(addrLower)) continue;
+  // 3. Inicializar o Copy Trading do SDK (passando a flag dryRun dinamicamente)
+  if (qualified.length > 0) {
+    const isDryRun = CONFIG.dryRun; // passa a flag do teu CONFIG para o SDK
+    const modeTag = isDryRun ? '🧪 [DRY_RUN]' : '🔴 [LIVE]';
 
-        const profile = await sdk.wallets.getWalletProfile(entry.address);
-        if (!profile) continue;
+    log('TRADE', `${modeTag} A iniciar motor de Copy Trading no SDK (dryRun: ${isDryRun})...`);
+    
 
-        const winRate = (profile as any).winRate ?? 0;
-        const pnl = entry.pnl ?? 0;
-        const trades = profile.tradeCount ?? 0;
-        const profitFactor = (profile as any).profitFactor ?? 2.0;
+    await sdk.smartMoney.startAutoCopyTrading({
+      targetAddresses: qualified,
+      sizeScale: CONFIG.smartMoney.sizeScale || 0.25,
+      maxSizePerTrade: CONFIG.smartMoney.maxSizePerTrade || 3.5,
+      maxSlippage: CONFIG.smartMoney.maxSlippage || 0.05,
+      minTradeSize: CONFIG.smartMoney.minTradeSize || 10,
+      delay: CONFIG.smartMoney.delay || 0,
+      dryRun: isDryRun, // 👈 O SDK simula se for true, executa ordens reais se for false
+      onTrade: (trade, result) => {
+        try {
+          // 🛑 DEDUPLICAÇÃO: Bloqueia sinais duplicados do WebSocket (< 3s) antes de registar no Dashboard e executar
+          if (isDuplicateSmartMoneyTrade(trade)) {
+            log('WARN', `⚠️ ${modeTag} Sinal duplicado ignorado de ${trade.traderAddress.slice(0, 8)}... (${trade.side} ${trade.size} @ $${trade.price})`);
+            return;
+          }
 
-        if (
-          winRate >= CONFIG.smartMoney.minWinRate &&
-          pnl >= CONFIG.smartMoney.minPnl &&
-          trades >= CONFIG.smartMoney.minTrades &&
-          profitFactor >= CONFIG.smartMoney.minProfitFactor
-        ) {
-          qualified.push(addrLower); // Garante lowercase
-          log('WALLET', `✅ Carteira Qualificada: ${entry.address.slice(0, 10)}... (WR:${(winRate * 100).toFixed(0)}% PnL:$${pnl.toFixed(0)} T:${trades})`);
-        }
+          // 📡 Log imediato: confirma que o WebSocket do SDK detetou atividade da carteira
+          log('SIGNAL', `📡 [${modeTag}] Sinal recebido da carteira ${trade.traderAddress.slice(0, 8)}... | ${trade.side} ${trade.size} @ $${trade.price}`);
 
-        await new Promise(r => setTimeout(r, 300));
-      }
-    } catch (err) {
-      log('WARN', `Erro ao carregar Leaderboard: ${(err as Error).message}`);
-    }
+          if (!canTrade()) {
+            log('WARN', `⚠️ ${modeTag} Sinal bloqueado pela gestão de risco diária.`);
+            return;
+          }
 
-    state.followedWallets = qualified;
-    log('WALLET', `A seguir ${qualified.length} carteiras qualificadas`);
-    updateDashboard();
-
-    // 1. CANCELA A SUBSCRIÇÃO ANTERIOR
-    if (currentSmartMoneySub) {
-      log('WALLET', '🔄 A cancelar subscrição antiga...');
-      currentSmartMoneySub.unsubscribe();
-      currentSmartMoneySub = null;
-
-      // PASSO CHAVE: Aguarda 1.5 segundos para garantir que o SDK destruiu a ligação WS antiga!
-      log('WALLET', '⏳ A aguardar libertação da conexão no SDK...');
-      await new Promise(r => setTimeout(r, 1500));
-    }
-
-    // 2. CRIA A NOVA SUBSCRIÇÃO
-    if (qualified.length > 0) {
-      log('WALLET', `📡 A abrir nova subscrição WebSocket para ${qualified.length} carteiras...`);
-
-      currentSmartMoneySub = sdk.smartMoney.subscribeSmartMoneyTrades(
-        async (trade: SmartMoneyTrade) => {
-          if (!CONFIG.smartMoney.enabled) return;
-          if (!canTrade()) return;
-
-          log('SIGNAL', `⚡ [TESTE] Trade recebido no callback de: ${trade.traderAddress}`);
-
+          // Registar o sinal no Dashboard
           const signal: SmartMoneySignal = {
             id: `sm-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
             timestamp: new Date().toISOString(),
@@ -779,26 +700,70 @@ async function initializeSmartMoney__(sdk: PolymarketSDK) {
             state.smartMoneySignals = state.smartMoneySignals.slice(0, 50);
           }
 
-          updateDashboard();
+          if (result.success) {
+            state.smartMoneyTrades++;
 
-          if (CONFIG.dryRun) {
-            simulateSmartMoneyTrade(trade);
+            const marketSlug = trade.marketSlug || (trade as any).market;
+            const outcomeSuffix = trade.outcome ? `-${trade.outcome}` : '';
+            const posKey = `${marketSlug}${outcomeSuffix}`;
+
+            const execPrice = trade.price;
+            const execShares = (trade.size * (CONFIG.smartMoney.sizeScale || 0.25));
+
+            if (trade.side === 'BUY') {
+              // 🟢 Registar/Atualizar entrada e Preço Médio (DCA)
+              const existing = realPositions.get(posKey);
+              if (existing) {
+                const totalSize = existing.size + execShares;
+                const avgPrice = ((existing.avgEntryPrice * existing.size) + (execPrice * execShares)) / totalSize;
+                realPositions.set(posKey, { size: totalSize, avgEntryPrice: avgPrice });
+              } else {
+                realPositions.set(posKey, { size: execShares, avgEntryPrice: execPrice });
+              }
+
+              log('TRADE', `✅ ${modeTag} BUY Simulado/Executado: ${execShares.toFixed(1)} shares @ $${execPrice.toFixed(3)} em ${posKey}`);
+
+            } else if (trade.side === 'SELL') {
+              // 🔴 Registar/Calcular PnL na saída
+              const existingPos = realPositions.get(posKey);
+
+              if (existingPos && existingPos.size > 0) {
+                const closedShares = Math.min(existingPos.size, execShares);
+                const profit = (execPrice - existingPos.avgEntryPrice) * closedShares;
+
+                if (existingPos.size - closedShares > 0.01) {
+                  existingPos.size -= closedShares;
+                  realPositions.set(posKey, existingPos);
+                } else {
+                  realPositions.delete(posKey);
+                }
+
+                log('TRADE', `✅ ${modeTag} SELL Simulado/Executado: ${closedShares.toFixed(1)} shares @ $${execPrice.toFixed(3)} | PnL: $${profit.toFixed(2)}`);
+                
+                // Regista o PnL no Dashboard
+                recordTrade(profit, 'smartMoney');
+              } else {
+                log('TRADE', `✅ ${modeTag} SELL processado (sem posição prévia registada em memória).`);
+              }
+            }
           } else {
-            // Execução live
+            log('WARN', `❌ ${modeTag} Falha no processamento da ordem: ${result.errorMsg}`);
           }
-        },
-        {
-          filterAddresses: qualified, // Passa a lista limpa e em lowercase
-          smartMoneyOnly: true,
+
+          updateDashboard();
+        } finally {
+          activeTradesProcessing--;
         }
-      );
-    }
-  } finally {
-    isSmartMoneyInitializing = false;
+      },
+      onError: (err) => log('ERROR', `❌ ${modeTag} Erro no motor de Copy Trading: ${err.message}`),
+    });
   }
+
+  isSmartMoneyInitialized = true;
+  isSmartMoneyInitializing = false;
 }
 
-async function initializeSmartMoney(sdk: PolymarketSDK) {
+async function initializeSmartMoney_old(sdk: PolymarketSDK) {
   //if (isSmartMoneyInitialized || isSmartMoneyInitializing) return;
 
   /**
