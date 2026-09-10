@@ -14,17 +14,37 @@
  */
 
 import { EventEmitter } from 'events';
+import { createModuleLogger } from '../core/logger.js';
+import type { BookUpdate, Orderbook, PriceUpdate } from '../core/types.js';
 import {
-  RealTimeDataClient,
-  type Message,
-  type ClobApiKeyCreds,
   ConnectionStatus,
-} from '@polymarket/real-time-data-client';
-import type { PriceUpdate, BookUpdate, Orderbook, OrderbookLevel } from '../core/types.js';
+  RealTimeDataClient,
+  RealTimeDataClientInterface,
+  WS_ENDPOINTS,
+  type ClobApiKeyCreds,
+  type Message
+} from './realtime/index.js';
+
+const log = createModuleLogger('realtime-v2');
+
+function normalizeUserOrderEventType(value: unknown): 'PLACEMENT' | 'UPDATE' | 'CANCELLATION' {
+  const text = String(value ?? '').toUpperCase();
+  if (text === 'PLACEMENT' || text === 'PLACE') return 'PLACEMENT';
+  if (text === 'CANCELLATION' || text === 'CANCEL' || text === 'CANCELLED') return 'CANCELLATION';
+  return 'UPDATE';
+}
 
 // ============================================================================
 // Types
 // ============================================================================
+
+/** Optional logger interface for structured logging */
+export interface ILogger {
+  debug(msg: string, data?: unknown): void;
+  info(msg: string, data?: unknown): void;
+  warn(msg: string, data?: unknown): void;
+  error(msg: string, data?: unknown): void;
+}
 
 export interface RealtimeServiceConfig {
   /** Auto-reconnect on disconnect (default: true) */
@@ -33,6 +53,8 @@ export interface RealtimeServiceConfig {
   pingInterval?: number;
   /** Enable debug logging (default: false) */
   debug?: boolean;
+  /** Optional structured logger (fallback to console.log if not provided) */
+  logger?: ILogger;
 }
 
 // Market data types
@@ -61,11 +83,19 @@ export interface LastTradeInfo {
   side: 'BUY' | 'SELL';
   size: number;
   timestamp: number;
+  /** Fee rate in basis points (e.g., 200 = 2%) */
+  feeRateBps?: number;
 }
 
 export interface PriceChange {
   assetId: string;
-  changes: Array<{ price: string; size: string }>;
+  changes: Array<{
+    price: string;
+    size: string;
+    side?: string;
+    bestBid?: string;
+    bestAsk?: string;
+  }>;
   timestamp: number;
 }
 
@@ -73,6 +103,15 @@ export interface TickSizeChange {
   assetId: string;
   oldTickSize: string;
   newTickSize: string;
+  timestamp: number;
+}
+
+export interface BestBidAsk {
+  assetId: string;
+  market: string;
+  bestBid: number;
+  bestAsk: number;
+  spread: number;
   timestamp: number;
 }
 
@@ -84,16 +123,34 @@ export interface MarketEvent {
 }
 
 // User data types (requires authentication)
+/**
+ * User order from USER_ORDER WebSocket event
+ * Field names match Polymarket API: https://docs.polymarket.com/developers/CLOB/websocket/user-channel
+ */
 export interface UserOrder {
-  orderId: string;
-  market: string;
-  asset: string;
-  side: 'BUY' | 'SELL';
-  price: number;
-  originalSize: number;
-  matchedSize: number;
-  eventType: 'PLACEMENT' | 'UPDATE' | 'CANCELLATION';
-  timestamp: number;
+  orderId: string;        // API: id
+  market: string;         // API: market
+  asset: string;          // API: asset_id
+  side: 'BUY' | 'SELL';   // API: side
+  price: number;          // API: price
+  originalSize: number;   // API: original_size
+  sizeMatched: number;    // API: size_matched (was incorrectly named matchedSize)
+  eventType: 'PLACEMENT' | 'UPDATE' | 'CANCELLATION';  // API: event_type
+  timestamp: number;      // API: timestamp
+}
+
+/**
+ * Maker order info from USER_TRADE WebSocket event
+ * Field names match Polymarket API: https://docs.polymarket.com/developers/CLOB/websocket/user-channel
+ */
+export interface MakerOrderInfo {
+  orderId: string;        // API: order_id
+  matchedAmount: number;  // API: matched_amount
+  price: number;          // API: price
+  side?: 'BUY' | 'SELL';  // API: side (maker's own side, opposite of taker)
+  assetId?: string;       // API: asset_id
+  outcome?: string;       // API: outcome
+  owner?: string;         // API: owner (maker's address)
 }
 
 export interface UserTrade {
@@ -105,8 +162,17 @@ export interface UserTrade {
   side: 'BUY' | 'SELL';
   status: 'MATCHED' | 'MINED' | 'CONFIRMED' | 'RETRYING' | 'FAILED';
   timestamp: number;
+  /** Server-side match timestamp (ms) — when CLOB engine matched the order */
+  matchTime?: number;
   transactionHash?: string;
+  /** Taker's order ID - use this to link trade to order */
+  takerOrderId?: string;
+  /** Fee rate in basis points (e.g., 100 = 1%). From API: fee_rate_bps */
+  feeRateBps?: number;
+  /** Maker orders involved in this trade */
+  makerOrders?: MakerOrderInfo[];
 }
+
 
 // Activity types
 /**
@@ -154,6 +220,7 @@ export interface ActivityTrade {
     address?: string;
   };
 }
+
 
 // External price types
 export interface CryptoPrice {
@@ -223,6 +290,7 @@ export interface MarketDataHandlers {
   onPriceChange?: (change: PriceChange) => void;
   onLastTrade?: (trade: LastTradeInfo) => void;
   onTickSizeChange?: (change: TickSizeChange) => void;
+  onBestBidAsk?: (bestBidAsk: BestBidAsk) => void;
   onMarketEvent?: (event: MarketEvent) => void;
   onError?: (error: Error) => void;
 }
@@ -254,13 +322,62 @@ export interface EquityPriceHandlers {
 
 export class RealtimeServiceV2 extends EventEmitter {
   private client: RealTimeDataClient | null = null;
+  /** Separate client for user channel (uses USER endpoint) */
+  private userClient: RealTimeDataClient | null = null;
+  /** Separate client for crypto prices (uses LIVE_DATA endpoint) */
+  private cryptoClient: RealTimeDataClient | null = null;
   private config: RealtimeServiceConfig;
+
+  // Store crypto subscriptions for reconnect replay (reference-counted)
+  private cryptoBinanceSymbols: Map<string, number> = new Map();
+  private cryptoChainlinkSymbols: Map<string, number> = new Map();
   private subscriptions: Map<string, Subscription> = new Map();
   private subscriptionIdCounter = 0;
   private connected = false;
+  private userConnected = false;
+  private cryptoConnected = false;
+  private connectResolve?: () => void;
+
+  // Subscription refresh timer: re-sends subscriptions shortly after they're added
+  // This fixes a bug where initial subscriptions on a fresh connection only receive
+  // the snapshot but no updates. Re-sending them "wakes up" the server.
+  private subscriptionRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  // Track subscriptions that need to be refreshed (newly added on this connection)
+  private pendingRefreshSubIds: Set<string> = new Set();
+
+  // Connection generation counter: incremented on each new connection.
+  // Used to avoid sending unsubscribe for stale subscriptions after reconnection.
+  private connectionGeneration = 0;
+  // Tracks which generation each subscription was last (re-)subscribed on
+  private subscriptionGenerations: Map<string, number> = new Map();
 
   // Store subscription messages for reconnection
   private subscriptionMessages: Map<string, { subscriptions: Array<{ topic: string; type: string; filters?: string; clob_auth?: ClobApiKeyCreds }> }> = new Map();
+
+  // Store user credentials for reconnection
+  private userCredentials: ClobApiKeyCreds | null = null;
+
+  // Accumulated market token IDs - we merge all markets into a single subscription
+  // to avoid server overwriting previous subscriptions with same topic+type
+  private accumulatedMarketTokenIds: Set<string> = new Set();
+  // Timer to batch market subscription updates
+  private marketSubscriptionBatchTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // ----- Subscribe-ACK observability (2026-05-06, L13 lesson) ---------------
+  // Polymarket WS does NOT send an explicit subscribe ACK frame. The only
+  // signal that a subscription "took" is the arrival of a `book` / `price_change`
+  // / `last_trade_price` / `best_bid_ask` event for that asset_id. When the
+  // server silently drops a subscribe (e.g. OB never arrives for short-duration
+  // 5m / 15m crypto markets), we used to have NO log layer to detect it.
+  //
+  // We now track per-tokenId "sent timestamp" and confirm ack on first inbound
+  // event. After 60s of silence we emit a CRITICAL warning so the miss is
+  // visible in logs instead of silently swallowed.
+  /** assetId -> sub-sent timestamp (ms) for tokens awaiting first inbound event */
+  private pendingSubAck: Map<string, number> = new Map();
+  /** Timer to fire CRITICAL warning when any pendingSubAck exceeds 60s */
+  private subAckWarnTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly SUB_ACK_TIMEOUT_MS = 60_000;
 
   // Caches
   private priceCache: Map<string, PriceUpdate> = new Map();
@@ -273,6 +390,7 @@ export class RealtimeServiceV2 extends EventEmitter {
       autoReconnect: config.autoReconnect ?? true,
       pingInterval: config.pingInterval ?? 5000,
       debug: config.debug ?? false,
+      logger: config.logger,
     };
   }
 
@@ -283,34 +401,193 @@ export class RealtimeServiceV2 extends EventEmitter {
   /**
    * Connect to WebSocket server
    */
-  connect(): this {
+  async connect(): Promise<void> {
     if (this.client) {
       this.log('Already connected or connecting');
-      return this;
+      return;
     }
 
+    // Promises to track when all clients connect
+    const mainConnectPromise = new Promise<void>((resolve) => {
+      this.connectResolve = resolve;
+    });
+
+    let userConnectResolve: () => void;
+    const userConnectPromise = new Promise<void>((resolve) => {
+      userConnectResolve = resolve;
+    });
+
+    let cryptoConnectResolve: () => void;
+    const cryptoConnectPromise = new Promise<void>((resolve) => {
+      cryptoConnectResolve = resolve;
+    });
+
+    // Main client for MARKET/USER channels.
+    //
+    // Propagate the host-injected logger down to child RealTimeDataClient so
+    // WS-layer diagnostics (`Pong timeout - connection dead`,
+    // `Status changed: DISCONNECTED`, `Handling dead connection`, …) land in
+    // the host's logger instead of the no-op SDK module logger. (Fix-E for
+    // task-fix-market-data-ws-subscribe — without this propagation, hosts that
+    // injected `logger:` into RealtimeServiceV2 still lost child WS events.)
     this.client = new RealTimeDataClient({
       onConnect: this.handleConnect.bind(this),
       onMessage: this.handleMessage.bind(this),
       onStatusChange: this.handleStatusChange.bind(this),
       autoReconnect: this.config.autoReconnect,
       pingInterval: this.config.pingInterval,
+      debug: this.config.debug,
+      logger: this.config.logger,
+    });
+
+    // User client for USER channel (clob_user events)
+    this.userClient = new RealTimeDataClient({
+      url: WS_ENDPOINTS.USER,
+      onConnect: (client) => {
+        this.handleUserConnect(client);
+        userConnectResolve!();
+      },
+      onMessage: this.handleUserChannelMessage.bind(this),
+      onStatusChange: (status: ConnectionStatus) => {
+        this.log(`User client status: ${status}`);
+        this.userConnected = status === ConnectionStatus.CONNECTED;
+      },
+      autoReconnect: this.config.autoReconnect,
+      pingInterval: this.config.pingInterval,
+      debug: this.config.debug,
+      logger: this.config.logger,
+    });
+
+    // Crypto client for LIVE_DATA channel (crypto_prices)
+    this.cryptoClient = new RealTimeDataClient({
+      url: WS_ENDPOINTS.LIVE_DATA,
+      onConnect: (client) => {
+        this.handleCryptoConnect(client);
+        cryptoConnectResolve!();
+      },
+      onMessage: this.handleCryptoMessage.bind(this),
+      onStatusChange: (status: ConnectionStatus) => {
+        this.log(`Crypto client status: ${status}`);
+        this.cryptoConnected = status === ConnectionStatus.CONNECTED;
+      },
+      autoReconnect: this.config.autoReconnect,
+      pingInterval: 5_000, // Polymarket RTDS requires 5s PING interval (https://docs.polymarket.com/market-data/websocket/rtds)
+      debug: this.config.debug,
+      logger: this.config.logger,
     });
 
     this.client.connect();
-    return this;
+    this.userClient.connect();
+    this.cryptoClient.connect();
+
+    // Wait for all clients to connect (with timeout)
+    const timeout = 10_000;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error('WebSocket connection timeout (10s)')), timeout);
+    });
+
+    try {
+      await Promise.race([
+        Promise.all([mainConnectPromise, userConnectPromise, cryptoConnectPromise]),
+        timeoutPromise,
+      ]);
+      this.log('All WebSocket clients connected, ready to subscribe');
+    } catch (error) {
+      // If timeout, check which clients connected
+      const status = {
+        main: this.connected,
+        user: this.userConnected,
+        crypto: this.cryptoConnected,
+      };
+      this.log(`WebSocket connection warning: ${error}. Status: ${JSON.stringify(status)}`);
+      // Continue anyway if main client is connected (minimum required)
+      if (!this.connected) {
+        throw error;
+      }
+    }
+  }
+
+  /**
+   * Force reconnect the market channel WebSocket.
+   * Terminates the current connection and triggers auto-reconnect,
+   * which will re-subscribe to all accumulated market tokens.
+   * Use when data flow stops but the connection appears alive.
+   */
+  reconnectMarketChannel(): void {
+    if (this.client) {
+      this.log('Force reconnecting market channel...');
+      this.client.forceReconnect();
+    }
+  }
+
+  /**
+   * Force reconnect the crypto (LIVE_DATA) channel WebSocket.
+   * Terminates the current connection and triggers auto-reconnect,
+   * which will re-subscribe to all Binance + Chainlink symbols via handleCryptoConnect().
+   *
+   * Use when individual symbol subscriptions stop receiving data
+   * but the TCP connection appears alive (ping/pong still works).
+   * This is the known "subscription-level silent drop" failure mode
+   * of the Polymarket LIVE_DATA WebSocket.
+   */
+  forceReconnectCrypto(): void {
+    if (this.cryptoClient) {
+      this.log('Force reconnecting crypto (LIVE_DATA) channel...');
+      this.cryptoClient.forceReconnect();
+    }
+  }
+
+  /**
+   * Get crypto client connection status.
+   * Returns false if the crypto client is disconnected, reconnecting, or null.
+   */
+  isCryptoConnected(): boolean {
+    return this.cryptoConnected && this.cryptoClient !== null;
   }
 
   /**
    * Disconnect from WebSocket server
    */
   disconnect(): void {
+    this.cancelSubscriptionRefresh();
+    this.cancelMarketSubscriptionBatch();
+
     if (this.client) {
       this.client.disconnect();
       this.client = null;
       this.connected = false;
-      this.subscriptions.clear();
-      this.subscriptionMessages.clear();  // Clear reconnection list
+    }
+
+    if (this.userClient) {
+      this.userClient.disconnect();
+      this.userClient = null;
+      this.userConnected = false;
+    }
+
+    if (this.cryptoClient) {
+      this.cryptoClient.disconnect();
+      this.cryptoClient = null;
+      this.cryptoConnected = false;
+    }
+
+    this.subscriptions.clear();
+    this.subscriptionMessages.clear();
+    this.subscriptionGenerations.clear();
+    this.accumulatedMarketTokenIds.clear();
+    this.cryptoBinanceSymbols.clear();
+    this.cryptoChainlinkSymbols.clear();
+    this.userCredentials = null;
+    this.pendingSubAck.clear();
+    if (this.subAckWarnTimer) {
+      clearTimeout(this.subAckWarnTimer);
+      this.subAckWarnTimer = null;
+    }
+  }
+
+  private cancelMarketSubscriptionBatch(): void {
+    if (this.marketSubscriptionBatchTimer) {
+      clearTimeout(this.marketSubscriptionBatchTimer);
+      this.marketSubscriptionBatchTimer = null;
     }
   }
 
@@ -329,24 +606,25 @@ export class RealtimeServiceV2 extends EventEmitter {
    * Subscribe to market data (orderbook, prices, trades)
    * @param tokenIds - Array of token IDs to subscribe to
    * @param handlers - Event handlers
+   *
+   * IMPORTANT: This method uses an accumulation strategy. Instead of sending
+   * separate subscription messages for each market, we accumulate all token IDs
+   * and send a single merged subscription. This prevents the server from
+   * overwriting previous subscriptions (which happens when multiple messages
+   * have the same topic+type but different filters).
    */
   subscribeMarkets(tokenIds: string[], handlers: MarketDataHandlers = {}): MarketSubscription {
     const subId = `market_${++this.subscriptionIdCounter}`;
-    const filterStr = JSON.stringify(tokenIds);
 
-    // Subscribe to all market data types
-    const subscriptions = [
-      { topic: 'clob_market', type: 'agg_orderbook', filters: filterStr },
-      { topic: 'clob_market', type: 'price_change', filters: filterStr },
-      { topic: 'clob_market', type: 'last_trade_price', filters: filterStr },
-      { topic: 'clob_market', type: 'tick_size_change', filters: filterStr },
-    ];
+    // Add new token IDs to accumulated set
+    for (const tokenId of tokenIds) {
+      this.accumulatedMarketTokenIds.add(tokenId);
+    }
 
-    const subMsg = { subscriptions };
-    this.sendSubscription(subMsg);
-    this.subscriptionMessages.set(subId, subMsg);  // Store for reconnection
+    // Schedule a batched subscription update (debounced)
+    this.scheduleMergedMarketSubscription();
 
-    // Register handlers
+    // Register handlers (filtered by this subscription's tokenIds)
     const orderbookHandler = (book: OrderbookSnapshot) => {
       if (tokenIds.includes(book.assetId)) {
         handlers.onOrderbook?.(book);
@@ -371,10 +649,17 @@ export class RealtimeServiceV2 extends EventEmitter {
       }
     };
 
+    const bestBidAskHandler = (bba: BestBidAsk) => {
+      if (tokenIds.includes(bba.assetId)) {
+        handlers.onBestBidAsk?.(bba);
+      }
+    };
+
     this.on('orderbook', orderbookHandler);
     this.on('priceChange', priceChangeHandler);
     this.on('lastTrade', lastTradeHandler);
     this.on('tickSizeChange', tickSizeHandler);
+    this.on('bestBidAsk', bestBidAskHandler);
 
     const subscription: MarketSubscription = {
       id: subId,
@@ -386,14 +671,180 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('priceChange', priceChangeHandler);
         this.off('lastTrade', lastTradeHandler);
         this.off('tickSizeChange', tickSizeHandler);
-        this.sendUnsubscription({ subscriptions });
+        this.off('bestBidAsk', bestBidAskHandler);
+
+        // Remove these token IDs from accumulated set
+        for (const tokenId of tokenIds) {
+          this.accumulatedMarketTokenIds.delete(tokenId);
+          // Stop awaiting ack for tokens we're explicitly unsubscribing.
+          this.pendingSubAck.delete(tokenId);
+        }
+
+        // H0 fix (2026-05-03): explicit UNSUBSCRIBE to server
+        // Polymarket WS is stateful add/remove (verified via docs.polymarket.com).
+        // Without this call, server accumulates subscriptions → capacity exhausted →
+        // silent drop. Caused 38.5% crypto / 81% cs2 / 1.4% weather miss rate.
+        if (this.client && this.connected && tokenIds.length > 0) {
+          try {
+            this.client.unsubscribeMarket(tokenIds);
+          } catch (err) {
+            this.log(`unsubscribeMarket failed (non-fatal): ${err}`);
+          }
+        }
+
+        // Re-subscribe with remaining tokens (or send empty to clear)
+        this.scheduleMergedMarketSubscription();
+
         this.subscriptions.delete(subId);
-        this.subscriptionMessages.delete(subId);  // Remove from reconnection list
       },
     };
 
     this.subscriptions.set(subId, subscription);
     return subscription;
+  }
+
+  /**
+   * Schedule a merged market subscription update.
+   * Debounces multiple rapid subscription changes into a single WebSocket message.
+   */
+  private scheduleMergedMarketSubscription(): void {
+    // Clear existing timer
+    if (this.marketSubscriptionBatchTimer) {
+      clearTimeout(this.marketSubscriptionBatchTimer);
+    }
+
+    // Schedule subscription send after a short delay (100ms) to batch rapid changes
+    this.marketSubscriptionBatchTimer = setTimeout(() => {
+      this.marketSubscriptionBatchTimer = null;
+      this.sendMergedMarketSubscription();
+    }, 100);
+  }
+
+  /**
+   * Send a single merged subscription containing all accumulated market token IDs.
+   */
+  private sendMergedMarketSubscription(): void {
+    if (!this.client || !this.connected) {
+      this.log('Cannot send merged subscription: not connected');
+      return;
+    }
+
+    const allTokenIds = Array.from(this.accumulatedMarketTokenIds);
+
+    if (allTokenIds.length === 0) {
+      this.log('No market tokens to subscribe to');
+      return;
+    }
+
+    const filterStr = JSON.stringify(allTokenIds);
+
+    const subscriptions = [
+      { topic: 'clob_market', type: 'agg_orderbook', filters: filterStr },
+      { topic: 'clob_market', type: 'price_change', filters: filterStr },
+      { topic: 'clob_market', type: 'last_trade_price', filters: filterStr },
+      { topic: 'clob_market', type: 'tick_size_change', filters: filterStr },
+      { topic: 'clob_market', type: 'best_bid_ask', filters: filterStr },
+    ];
+
+    const subMsg = { subscriptions };
+    this.log(`Sending merged market subscription with ${allTokenIds.length} tokens`);
+
+    // L13 lesson (2026-05-06): track per-token sub-sent timestamp so we can
+    // (a) measure ack latency on first inbound event and
+    // (b) raise CRITICAL warning if NO event ever arrives (silent server drop).
+    const sentAt = Date.now();
+    for (const tokenId of allTokenIds) {
+      // Only record if we don't already have an ack pending for this token.
+      // (Refresh / reconnect re-sends keep the original sentAt to avoid masking
+      // a true silent-drop; if a token previously confirmed and we re-send, we
+      // start a fresh observation window.)
+      if (!this.pendingSubAck.has(tokenId)) {
+        this.pendingSubAck.set(tokenId, sentAt);
+      }
+    }
+    this.logAlways('info',
+      `WS sub sent {topic: clob_market, tokenCount: ${allTokenIds.length}, ` +
+      `sample: [${allTokenIds.slice(0, 3).map(t => t.slice(-8)).join(',')}]}`);
+    this.scheduleSubAckTimeoutCheck();
+
+    this.client.subscribe(subMsg);
+
+    // Store for reconnection (use a fixed key for the merged subscription)
+    this.subscriptionMessages.set('__merged_market__', subMsg);
+    this.subscriptionGenerations.set('__merged_market__', this.connectionGeneration);
+
+    // Schedule refresh to ensure we receive updates (not just snapshot)
+    this.scheduleSubscriptionRefresh('__merged_market__');
+  }
+
+  /**
+   * Record first inbound market event for a tokenId — confirms WS sub ack.
+   * Logs latency once, then removes the token from pendingSubAck so subsequent
+   * events are silent.
+   */
+  private observeMarketAck(assetId: string): void {
+    if (!assetId) return;
+    const sentAt = this.pendingSubAck.get(assetId);
+    if (sentAt === undefined) return;
+    const latencyMs = Date.now() - sentAt;
+    this.pendingSubAck.delete(assetId);
+    this.logAlways('info',
+      `WS sub ack confirmed {tokenId: ${assetId.slice(-12)}, latency_ms: ${latencyMs}}`);
+  }
+
+  /**
+   * Schedule a one-shot check 60s after the most recent sub-send. If any
+   * tokenId is still in pendingSubAck and was sent ≥60s ago, emit CRITICAL.
+   * Reschedules itself if there are still un-acked pending tokens with newer
+   * send timestamps.
+   */
+  private scheduleSubAckTimeoutCheck(): void {
+    if (this.subAckWarnTimer) return; // already scheduled — coalesce
+    this.subAckWarnTimer = setTimeout(() => {
+      this.subAckWarnTimer = null;
+      const now = Date.now();
+      const stale: Array<{ tokenId: string; ageMs: number }> = [];
+      for (const [tokenId, sentAt] of this.pendingSubAck.entries()) {
+        const ageMs = now - sentAt;
+        if (ageMs >= RealtimeServiceV2.SUB_ACK_TIMEOUT_MS) {
+          stale.push({ tokenId, ageMs });
+        }
+      }
+      if (stale.length > 0) {
+        const sample = stale.slice(0, 5)
+          .map(s => `${s.tokenId.slice(-8)}@${s.ageMs}ms`).join(',');
+        this.logAlways('error',
+          `CRITICAL: WS sub appears to have NO ACK ` +
+          `{unacked_tokens: ${stale.length}/${this.pendingSubAck.size}, ` +
+          `sample: [${sample}]}`);
+      }
+      // If there are still un-acked pending tokens (newer than 60s ago),
+      // reschedule so we re-evaluate when they age out.
+      if (this.pendingSubAck.size > 0) {
+        this.scheduleSubAckTimeoutCheck();
+      }
+    }, RealtimeServiceV2.SUB_ACK_TIMEOUT_MS);
+  }
+
+  /**
+   * Log unconditionally (bypasses this.config.debug gate).
+   * Used for observability events that must always be visible: subscribe-sent,
+   * subscribe-ack-confirmed, subscribe-ack-timeout-CRITICAL.
+   */
+  private logAlways(level: 'info' | 'error', message: string): void {
+    const prefixed = `[RealtimeService] ${message}`;
+    if (this.config.logger) {
+      if (level === 'error') {
+        // Fall back to warn if no error level (interface defines error)
+        this.config.logger.error(prefixed);
+      } else {
+        this.config.logger.info(prefixed);
+      }
+    } else if (level === 'error') {
+      log.error(prefixed);
+    } else {
+      log.info(prefixed);
+    }
   }
 
   /**
@@ -519,17 +970,26 @@ export class RealtimeServiceV2 extends EventEmitter {
 
   /**
    * Subscribe to user order and trade events
+   *
+   * User channel requires a separate WebSocket endpoint (USER endpoint).
+   * Subscription format: { type: 'USER', auth: { apiKey, secret, passphrase } }
+   *
    * @param credentials - CLOB API credentials
    * @param handlers - Event handlers
    */
   subscribeUserEvents(credentials: ClobApiKeyCreds, handlers: UserDataHandlers = {}): Subscription {
     const subId = `user_${++this.subscriptionIdCounter}`;
 
-    const subscriptions = [
-      { topic: 'clob_user', type: '*', clob_auth: credentials },
-    ];
+    // Store credentials for reconnection
+    this.userCredentials = credentials;
 
-    this.sendSubscription({ subscriptions });
+    // Send subscription using the user client
+    if (this.userClient && this.userConnected) {
+      this.log('Sending user subscription via user client');
+      this.userClient.subscribeUser(credentials);
+    } else {
+      this.log('User client not connected, will subscribe on connect');
+    }
 
     const orderHandler = (order: UserOrder) => handlers.onOrder?.(order);
     const tradeHandler = (trade: UserTrade) => handlers.onTrade?.(trade);
@@ -544,7 +1004,7 @@ export class RealtimeServiceV2 extends EventEmitter {
       unsubscribe: () => {
         this.off('userOrder', orderHandler);
         this.off('userTrade', tradeHandler);
-        this.sendUnsubscription({ subscriptions });
+        this.userCredentials = null;
         this.subscriptions.delete(subId);
       },
     };
@@ -578,13 +1038,13 @@ export class RealtimeServiceV2 extends EventEmitter {
     // Create subscription objects - only include filters field if we have filters
     const subscriptions = hasFilter
       ? [
-          { topic: 'activity', type: 'trades', filters: JSON.stringify(filterObj) },
-          { topic: 'activity', type: 'orders_matched', filters: JSON.stringify(filterObj) },
-        ]
+        { topic: 'activity', type: 'trades', filters: JSON.stringify(filterObj) },
+        { topic: 'activity', type: 'orders_matched', filters: JSON.stringify(filterObj) },
+      ]
       : [
-          { topic: 'activity', type: 'trades' },
-          { topic: 'activity', type: 'orders_matched' },
-        ];
+        { topic: 'activity', type: 'trades' },
+        { topic: 'activity', type: 'orders_matched' },
+      ];
 
     this.sendSubscription({ subscriptions });
 
@@ -611,8 +1071,111 @@ export class RealtimeServiceV2 extends EventEmitter {
    * This is useful for Copy Trading - monitoring Smart Money across the platform
    * @param handlers - Event handlers
    */
-  subscribeAllActivity(handlers: ActivityHandlers = {}): Subscription {
+  subscribeAllActivity_(handlers: ActivityHandlers = {}): Subscription {
     return this.subscribeActivity({}, handlers);
+  }
+
+  private pollingInterval: NodeJS.Timeout | null = null;
+  private processedHashes = new Set<string>();
+
+  /**
+   * Override do subscribeAllActivity para usar Polling REST da Data API
+   * substituindo o canal WebSocket global de atividade que não existe na V2.
+   */
+  subscribeAllActivity(handlers: ActivityHandlers = {}, targetAddresses: string[] = []): Subscription {
+    console.log('[RealtimeServiceV2] 🔄 Usando Polling REST alternativo para Smart Money Activity...');
+
+    // Se não passares endereços específicos, podemos tentar ir buscar a lista geral
+    const addressesToPoll = targetAddresses.length > 0 ? targetAddresses : [];
+
+    if (addressesToPoll.length === 0) {
+      console.warn('[RealtimeServiceV2] ⚠️ Nenhum endereço fornecido para o polling de atividade.');
+    }
+
+    // Iniciar o ciclo de polling periódico (ex: a cada 10 segundos)
+    if (!this.pollingInterval) {
+      this.pollingInterval = setInterval(async () => {
+        if (addressesToPoll.length === 0) return;
+
+        for (const address of addressesToPoll) {
+          try {
+            const url = `https://data-api.polymarket.com/trades?user=${address.toLowerCase()}&limit=5`;
+            const response = await fetch(url);
+            if (!response.ok) continue;
+
+            const trades = await response.json();
+            if (!Array.isArray(trades)) continue;
+
+            // Processar do mais antigo para o mais recente
+            for (const trade of trades.reverse()) {
+              const txHash = trade.transactionHash;
+              if (!txHash || this.processedHashes.has(txHash)) continue;
+
+              // 🚨 Filtro de Segurança: Ignorar trades com mais de 60 segundos (evita cópia no arranque)
+              const MAX_TRADE_AGE_SECONDS = 60;
+              const currentTimestamp = Math.floor(Date.now() / 1000);
+              const tradeTimestamp = Number(trade.timestamp);
+
+              if (currentTimestamp - tradeTimestamp > MAX_TRADE_AGE_SECONDS) {
+                // Marcar como processado para nunca mais tentar avaliá-lo
+                this.processedHashes.add(txHash);
+                continue;
+              }
+
+              // Guardar hash para evitar duplicados
+              this.processedHashes.add(txHash);
+              if (this.processedHashes.size > 1000) {
+                const first = this.processedHashes.values().next().value;
+                if (first) this.processedHashes.delete(first);
+              }
+
+              // Mapear para o formato de ActivityTrade esperado pelo bot
+              const activityTrade: ActivityTrade = {
+                trader: {
+                  address: trade.proxyWallet || address,
+                  name: trade.name,
+                  //pseudonym: trade.pseudonym,
+                },
+                conditionId: trade.conditionId,
+                eventSlug: trade.slug,
+                marketSlug: trade.slug,
+                side: trade.side,
+                size: Number(trade.size),
+                price: Number(trade.price),
+                asset: trade.asset,
+                outcome: trade.outcome,
+                transactionHash: trade.transactionHash,
+                timestamp: Number(trade.timestamp),
+              };
+
+              if (!activityTrade.marketSlug || activityTrade.marketSlug === 'unknown-market') {
+                console.warn(`[RealtimeServiceV2] ⚠️ Trade ignorado por falta de slug/mercado para o tx: ${txHash}`);
+                continue;
+              }
+
+              // Disparar o handler de trade registado
+              handlers.onTrade?.(activityTrade);
+            }
+          } catch (error) {
+            console.error(`[RealtimeServiceV2] Erro no polling REST para ${address}:`, error);
+          }
+        }
+      }, 10000);
+    }
+
+    // Retorna o objeto de subscrição compatível com o bot
+    return {
+      id: `rtds_polling_${Date.now()}`,
+      topic: 'activity',
+      type: '*',
+      unsubscribe: () => {
+        if (this.pollingInterval) {
+          clearInterval(this.pollingInterval);
+          this.pollingInterval = null;
+          console.log('[RealtimeServiceV2] 🛑 Polling REST parado.');
+        }
+      },
+    };
   }
 
   // ============================================================================
@@ -620,21 +1183,27 @@ export class RealtimeServiceV2 extends EventEmitter {
   // ============================================================================
 
   /**
-   * Subscribe to crypto price updates
-   * @param symbols - Array of symbols (e.g., ['BTCUSDT', 'ETHUSDT'])
+   * Subscribe to crypto price updates (Binance)
+   *
+   * Uses lowercase symbols: 'btcusdt', 'ethusdt', 'solusdt', 'xrpusdt'
+   *
+   * @param symbols - Array of lowercase Binance symbols (e.g., ['btcusdt', 'ethusdt'])
    * @param handlers - Event handlers
    */
   subscribeCryptoPrices(symbols: string[], handlers: CryptoPriceHandlers = {}): Subscription {
     const subId = `crypto_${++this.subscriptionIdCounter}`;
 
-    // Subscribe to each symbol
-    const subscriptions = symbols.map(symbol => ({
-      topic: 'crypto_prices',
-      type: 'update',
-      filters: JSON.stringify({ symbol }),
-    }));
+    // Reference-counted subscribe: only send WebSocket subscribe for NEW symbols
+    const newSymbols: string[] = [];
+    for (const s of symbols) {
+      const count = this.cryptoBinanceSymbols.get(s) ?? 0;
+      if (count === 0) newSymbols.push(s);
+      this.cryptoBinanceSymbols.set(s, count + 1);
+    }
 
-    this.sendSubscription({ subscriptions });
+    if (newSymbols.length > 0 && this.cryptoClient) {
+      this.cryptoClient.subscribeCryptoPrices(newSymbols);
+    }
 
     const handler = (price: CryptoPrice) => {
       if (symbols.includes(price.symbol)) {
@@ -649,7 +1218,20 @@ export class RealtimeServiceV2 extends EventEmitter {
       type: 'update',
       unsubscribe: () => {
         this.off('cryptoPrice', handler);
-        this.sendUnsubscription({ subscriptions });
+        const symbolsToUnsub: string[] = [];
+        for (const s of symbols) {
+          const count = this.cryptoBinanceSymbols.get(s) ?? 0;
+          const newCount = count - 1;
+          if (newCount <= 0) {
+            this.cryptoBinanceSymbols.delete(s);
+            symbolsToUnsub.push(s);
+          } else {
+            this.cryptoBinanceSymbols.set(s, newCount);
+          }
+        }
+        if (symbolsToUnsub.length > 0 && this.cryptoClient) {
+          this.cryptoClient.unsubscribeCryptoPrices(symbolsToUnsub);
+        }
         this.subscriptions.delete(subId);
       },
     };
@@ -660,20 +1242,26 @@ export class RealtimeServiceV2 extends EventEmitter {
 
   /**
    * Subscribe to Chainlink crypto prices
-   * @param symbols - Array of symbols (e.g., ['ETH/USD', 'BTC/USD'])
+   *
+   * Uses lowercase slash-separated symbols: 'btc/usd', 'eth/usd', 'sol/usd', 'xrp/usd'
+   *
+   * @param symbols - Array of lowercase Chainlink symbols (e.g., ['btc/usd', 'eth/usd'])
+   * @param handlers - Event handlers
    */
   subscribeCryptoChainlinkPrices(symbols: string[], handlers: CryptoPriceHandlers = {}): Subscription {
     const subId = `crypto_chainlink_${++this.subscriptionIdCounter}`;
 
-    const subscriptions = symbols.map(symbol => ({
-      topic: 'crypto_prices_chainlink',
-      type: 'update',
-      filters: JSON.stringify({ symbol }),
-    }));
+    // Reference-counted subscribe: only send WebSocket subscribe for NEW symbols
+    const newSymbols: string[] = [];
+    for (const s of symbols) {
+      const count = this.cryptoChainlinkSymbols.get(s) ?? 0;
+      if (count === 0) newSymbols.push(s);
+      this.cryptoChainlinkSymbols.set(s, count + 1);
+    }
 
-    const subMsg = { subscriptions };
-    this.sendSubscription(subMsg);
-    this.subscriptionMessages.set(subId, subMsg);  // Store for reconnection
+    if (newSymbols.length > 0 && this.cryptoClient) {
+      this.cryptoClient.subscribeCryptoChainlinkPrices(newSymbols);
+    }
 
     const handler = (price: CryptoPrice) => {
       if (symbols.includes(price.symbol)) {
@@ -688,9 +1276,21 @@ export class RealtimeServiceV2 extends EventEmitter {
       type: 'update',
       unsubscribe: () => {
         this.off('cryptoChainlinkPrice', handler);
-        this.sendUnsubscription({ subscriptions });
+        const symbolsToUnsub: string[] = [];
+        for (const s of symbols) {
+          const count = this.cryptoChainlinkSymbols.get(s) ?? 0;
+          const newCount = count - 1;
+          if (newCount <= 0) {
+            this.cryptoChainlinkSymbols.delete(s);
+            symbolsToUnsub.push(s);
+          } else {
+            this.cryptoChainlinkSymbols.set(s, newCount);
+          }
+        }
+        if (symbolsToUnsub.length > 0 && this.cryptoClient) {
+          this.cryptoClient.unsubscribeCryptoChainlinkPrices(symbolsToUnsub);
+        }
         this.subscriptions.delete(subId);
-        this.subscriptionMessages.delete(subId);  // Remove from reconnection list
       },
     };
 
@@ -890,24 +1490,101 @@ export class RealtimeServiceV2 extends EventEmitter {
       sub.unsubscribe();
     }
     this.subscriptions.clear();
-    this.subscriptionMessages.clear();  // Clear reconnection list
+    this.subscriptionMessages.clear();
+    this.subscriptionGenerations.clear();
   }
 
   // ============================================================================
   // Private Methods
   // ============================================================================
 
-  private handleConnect(client: RealTimeDataClient): void {
+  /**
+   * Schedule a subscription refresh after a short delay.
+   *
+   * Problem: When subscriptions are sent right after connection, the server sometimes
+   * only sends the initial snapshot but no subsequent updates. This appears to be a
+   * server-side timing issue where the subscription "window" closes before updates flow.
+   *
+   * Solution: Re-send the subscription after 3 seconds. Polymarket's server apparently
+   * accepts duplicate subscriptions and refreshes the stream. Unsubscribe doesn't work
+   * (returns "Invalid request body"), so we just re-subscribe.
+   *
+   * Important: We do NOT cancel existing timers. If multiple subscriptions are added
+   * within the 3-second window, they all get added to pendingRefreshSubIds and will
+   * be refreshed together when the first timer fires. This ensures all markets get
+   * refreshed, not just the last one.
+   */
+  private scheduleSubscriptionRefresh(subId: string): void {
+    this.pendingRefreshSubIds.add(subId);
+
+    // Only create a new timer if one doesn't exist
+    // Don't cancel existing timer - it will refresh all pending subscriptions
+    if (this.subscriptionRefreshTimer) {
+      this.log(`Subscription ${subId} added to pending refresh (timer already scheduled)`);
+      return;
+    }
+
+    // Schedule refresh after 3 seconds (enough time for initial snapshot to arrive)
+    this.subscriptionRefreshTimer = setTimeout(() => {
+      this.subscriptionRefreshTimer = null;
+
+      if (!this.client || !this.connected || this.pendingRefreshSubIds.size === 0) {
+        this.pendingRefreshSubIds.clear();
+        return;
+      }
+
+      this.log(`Refreshing ${this.pendingRefreshSubIds.size} subscriptions (re-send)...`);
+
+      for (const pendingSubId of this.pendingRefreshSubIds) {
+        const msg = this.subscriptionMessages.get(pendingSubId);
+        if (msg) {
+          this.log(`Refresh: ${pendingSubId} - re-subscribe`);
+          this.client.subscribe(msg);
+        }
+      }
+      this.pendingRefreshSubIds.clear();
+    }, 3000);
+  }
+
+  private cancelSubscriptionRefresh(): void {
+    if (this.subscriptionRefreshTimer) {
+      clearTimeout(this.subscriptionRefreshTimer);
+      this.subscriptionRefreshTimer = null;
+    }
+    this.pendingRefreshSubIds.clear();
+  }
+
+  private handleConnect(_client: RealTimeDataClientInterface): void {
     this.connected = true;
-    this.log('Connected to WebSocket server');
+    this.connectionGeneration++;
+    this.log(`Connected to WebSocket server (generation ${this.connectionGeneration})`);
+
+    // Resolve the connect() promise if waiting
+    if (this.connectResolve) {
+      this.connectResolve();
+      this.connectResolve = undefined;
+    }
 
     // Re-subscribe to all active subscriptions on reconnect
+    // Delay subscriptions by 1 second to let the connection stabilize.
+    // This helps avoid the "snapshot only, no updates" bug.
     if (this.subscriptionMessages.size > 0) {
-      this.log(`Re-subscribing to ${this.subscriptionMessages.size} subscriptions...`);
-      for (const [subId, msg] of this.subscriptionMessages) {
-        this.log(`Re-subscribing: ${subId}`);
-        this.client?.subscribe(msg);
-      }
+      this.log(`Re-subscribing to ${this.subscriptionMessages.size} subscriptions (delayed 1s)...`);
+      setTimeout(() => {
+        if (!this.client || !this.connected) return;
+        for (const [subId, msg] of this.subscriptionMessages) {
+          this.log(`Re-subscribing: ${subId}`);
+          this.client?.subscribe(msg);
+          // Update generation so unsubscribe knows it's valid on this connection
+          this.subscriptionGenerations.set(subId, this.connectionGeneration);
+        }
+      }, 1000);
+    } else if (this.accumulatedMarketTokenIds.size > 0) {
+      // Race condition fix: if a disconnect cancelled the 100ms batch timer
+      // before sendMergedMarketSubscription() could run, the subscription was
+      // never stored in subscriptionMessages. Re-schedule it on reconnect.
+      this.log(`Re-scheduling merged market subscription (${this.accumulatedMarketTokenIds.size} tokens, not yet stored)...`);
+      this.scheduleMergedMarketSubscription();
     }
 
     this.emit('connected');
@@ -918,6 +1595,8 @@ export class RealtimeServiceV2 extends EventEmitter {
 
     if (status === ConnectionStatus.DISCONNECTED) {
       this.connected = false;
+      this.cancelSubscriptionRefresh();
+      this.cancelMarketSubscriptionBatch();
       this.emit('disconnected');
     } else if (status === ConnectionStatus.CONNECTED) {
       this.connected = true;
@@ -926,8 +1605,79 @@ export class RealtimeServiceV2 extends EventEmitter {
     this.emit('statusChange', status);
   }
 
-  private handleMessage(client: RealTimeDataClient, message: Message): void {
-    this.log(`Received: ${message.topic}:${message.type}`);
+  private handleUserConnect(_client: RealTimeDataClientInterface): void {
+    this.userConnected = true;
+    this.log('Connected to user channel WebSocket');
+
+    // Re-subscribe with stored credentials if available
+    if (this.userCredentials) {
+      this.log('Re-subscribing to user events with stored credentials');
+      setTimeout(() => {
+        if (this.userClient && this.userConnected && this.userCredentials) {
+          this.userClient.subscribeUser(this.userCredentials);
+        }
+      }, 1000);
+    }
+
+    this.emit('userConnected');
+  }
+
+  private handleUserChannelMessage(_client: RealTimeDataClientInterface, message: Message): void {
+    this.log(`User channel received: ${message.topic}:${message.type}`);
+
+    const payload = message.payload as Record<string, unknown>;
+
+    if (message.topic === 'clob_user') {
+      this.handleUserMessage(message.type, payload, message.timestamp);
+    } else {
+      this.log(`Unexpected topic on user channel: ${message.topic}`);
+    }
+  }
+
+  private handleCryptoConnect(_client: RealTimeDataClientInterface): void {
+    this.cryptoConnected = true;
+    this.log('Connected to crypto prices WebSocket');
+
+    // Re-subscribe to stored crypto subscriptions on reconnect
+    if (this.cryptoBinanceSymbols.size > 0 || this.cryptoChainlinkSymbols.size > 0) {
+      this.log(`Re-subscribing to crypto prices (${this.cryptoBinanceSymbols.size} Binance, ${this.cryptoChainlinkSymbols.size} Chainlink symbols)...`);
+      setTimeout(() => {
+        if (!this.cryptoClient || !this.cryptoConnected) return;
+        if (this.cryptoBinanceSymbols.size > 0) {
+          this.cryptoClient.subscribeCryptoPrices([...this.cryptoBinanceSymbols.keys()]);
+        }
+        if (this.cryptoChainlinkSymbols.size > 0) {
+          this.cryptoClient.subscribeCryptoChainlinkPrices([...this.cryptoChainlinkSymbols.keys()]);
+        }
+      }, 1000);
+    }
+
+    this.emit('cryptoConnected');
+  }
+
+  private handleCryptoMessage(_client: RealTimeDataClientInterface, message: Message): void {
+    this.log(`Crypto received: ${message.topic}:${message.type}`);
+
+    const payload = message.payload as Record<string, unknown>;
+
+    switch (message.topic) {
+      case 'crypto_prices':
+        this.handleCryptoPriceMessage(payload, message.timestamp);
+        break;
+
+      case 'crypto_prices_chainlink':
+        this.handleCryptoChainlinkPriceMessage(payload, message.timestamp);
+        break;
+
+      default:
+        this.log(`Unknown crypto topic: ${message.topic}`);
+    }
+  }
+
+  private handleMessage(_client: RealTimeDataClientInterface, message: Message): void {
+    // Use debug level for frequent price_change events, info for others
+    const level = message.type === 'price_change' ? 'debug' : 'info';
+    this.log(`Received: ${message.topic}:${message.type}`, level);
 
     const payload = message.payload as Record<string, unknown>;
 
@@ -938,10 +1688,6 @@ export class RealtimeServiceV2 extends EventEmitter {
 
       case 'clob_user':
         this.handleUserMessage(message.type, payload, message.timestamp);
-        break;
-
-      case 'activity':
-        this.handleActivityMessage(message.type, payload, message.timestamp);
         break;
 
       case 'crypto_prices':
@@ -969,39 +1715,107 @@ export class RealtimeServiceV2 extends EventEmitter {
     }
   }
 
+  /**
+   * Handle market channel messages
+   * @see https://docs.polymarket.com/developers/CLOB/websocket/market-channel
+   *
+   * Market channel events:
+   * - book: Orderbook snapshot - triggered on subscribe or when trades affect orderbook
+   * - price_change: Price level change - triggered when order placed or cancelled
+   * - last_trade_price: Trade execution - triggered when maker/taker orders match
+   * - tick_size_change: Tick size adjustment - triggered when price > 0.96 or < 0.04
+   * - best_bid_ask: Best prices update (feature-flagged) - triggered on best price change
+   * - new_market: Market created (feature-flagged) - triggered on market creation
+   * - market_resolved: Market resolved (feature-flagged) - triggered on market resolution
+   */
   private handleMarketMessage(type: string, payload: Record<string, unknown>, timestamp: number): void {
     switch (type) {
+      case 'book': // New format from custom RealTimeDataClient
       case 'agg_orderbook': {
-        const book = this.parseOrderbook(payload, timestamp);
-        this.bookCache.set(book.assetId, book);
-        this.emit('orderbook', book);
+        // book event: Orderbook snapshot with bids/asks
+        const items = Array.isArray(payload) ? payload : [payload];
+        for (const item of items) {
+          const book = this.parseOrderbook(item as Record<string, unknown>, timestamp);
+          if (book.assetId) {
+            this.observeMarketAck(book.assetId);
+            this.bookCache.set(book.assetId, book);
+            this.emit('orderbook', book);
+          }
+        }
         break;
       }
 
       case 'price_change': {
-        const change = this.parsePriceChange(payload, timestamp);
-        this.emit('priceChange', change);
+        const items = Array.isArray(payload) ? payload : [payload];
+        for (const item of items) {
+          const change = this.parsePriceChange(item as Record<string, unknown>, timestamp);
+          if (change.assetId) {
+            this.observeMarketAck(change.assetId);
+            this.emit('priceChange', change);
+          }
+        }
         break;
       }
 
       case 'last_trade_price': {
-        const trade = this.parseLastTrade(payload, timestamp);
-        this.lastTradeCache.set(trade.assetId, trade);
-        this.emit('lastTrade', trade);
+        const items = Array.isArray(payload) ? payload : [payload];
+        for (const item of items) {
+          const trade = this.parseLastTrade(item as Record<string, unknown>, timestamp);
+          if (trade.assetId) {
+            this.observeMarketAck(trade.assetId);
+            this.lastTradeCache.set(trade.assetId, trade);
+            this.emit('lastTrade', trade);
+          }
+        }
         break;
       }
 
       case 'tick_size_change': {
+        // tick_size_change event: Tick size adjustment (price > 0.96 or < 0.04)
+        // @see https://docs.polymarket.com/developers/CLOB/websocket/market-channel
         const change = this.parseTickSizeChange(payload, timestamp);
         this.emit('tickSizeChange', change);
         break;
       }
 
-      case 'market_created':
-      case 'market_resolved': {
+      case 'best_bid_ask': {
+        // best_bid_ask event: Best prices changed (feature-flagged)
+        // @see https://docs.polymarket.com/developers/CLOB/websocket/market-channel
+        const bestPrices: BestBidAsk = {
+          assetId: payload.asset_id as string || '',
+          market: payload.market as string || '',
+          bestBid: Number(payload.best_bid) || 0,
+          bestAsk: Number(payload.best_ask) || 0,
+          spread: Number(payload.spread) || 0,
+          timestamp,
+        };
+        if (bestPrices.assetId) {
+          this.observeMarketAck(bestPrices.assetId);
+        }
+        this.emit('bestBidAsk', bestPrices);
+        break;
+      }
+
+      case 'new_market':
+      case 'market_created': {
+        // new_market event: Market creation (feature-flagged)
+        // @see https://docs.polymarket.com/developers/CLOB/websocket/market-channel
         const event: MarketEvent = {
-          conditionId: payload.condition_id as string || '',
-          type: type === 'market_created' ? 'created' : 'resolved',
+          conditionId: payload.market as string || payload.condition_id as string || '',
+          type: 'created',
+          data: payload,
+          timestamp,
+        };
+        this.emit('marketEvent', event);
+        break;
+      }
+
+      case 'market_resolved': {
+        // market_resolved event: Market resolution (feature-flagged)
+        // @see https://docs.polymarket.com/developers/CLOB/websocket/market-channel
+        const event: MarketEvent = {
+          conditionId: payload.market as string || payload.condition_id as string || '',
+          type: 'resolved',
           data: payload,
           timestamp,
         };
@@ -1011,23 +1825,60 @@ export class RealtimeServiceV2 extends EventEmitter {
     }
   }
 
+  /**
+   * Handle user channel messages
+   * @see https://docs.polymarket.com/developers/CLOB/websocket/user-channel
+   *
+   * User channel events:
+   * - order: Emitted when order placed (PLACEMENT), partially matched (UPDATE), or cancelled (CANCELLATION)
+   * - trade: Emitted when market order matches, limit order included in trade, or status changes
+   *          Status values: MATCHED, MINED, CONFIRMED, RETRYING, FAILED
+   */
   private handleUserMessage(type: string, payload: Record<string, unknown>, timestamp: number): void {
     if (type === 'order') {
+      // order event: Order placed (PLACEMENT), updated (UPDATE), or cancelled (CANCELLATION)
       const order: UserOrder = {
-        orderId: payload.order_id as string || '',
+        orderId: payload.order_id as string || payload.id as string || '',
         market: payload.market as string || '',
-        asset: payload.asset as string || '',
+        asset: payload.asset_id as string || payload.asset as string || '',
         side: payload.side as 'BUY' | 'SELL',
         price: Number(payload.price) || 0,
         originalSize: Number(payload.original_size) || 0,
-        matchedSize: Number(payload.matched_size) || 0,
-        eventType: payload.event_type as 'PLACEMENT' | 'UPDATE' | 'CANCELLATION',
+        sizeMatched: Number(payload.size_matched) || 0,  // API field: size_matched
+        eventType: normalizeUserOrderEventType(payload.event_type),
         timestamp,
       };
       this.emit('userOrder', order);
     } else if (type === 'trade') {
+      // trade event: Trade status updates (MATCHED, MINED, CONFIRMED, RETRYING, FAILED)
+      // Parse maker_orders array if present
+      let makerOrders: MakerOrderInfo[] | undefined;
+      if (Array.isArray(payload.maker_orders)) {
+        makerOrders = (payload.maker_orders as Array<Record<string, unknown>>).map(m => ({
+          orderId: m.order_id as string || '',
+          matchedAmount: Number(m.matched_amount) || 0,
+          price: Number(m.price) || 0,
+          side: m.side as 'BUY' | 'SELL' | undefined,
+          assetId: m.asset_id as string | undefined,
+          outcome: m.outcome as string | undefined,
+          owner: m.owner as string | undefined,
+        }));
+      }
+
+      // Extract match_time — CLOB server-side match timestamp (more accurate than payload.timestamp)
+      // API field is "match_time" (with underscore), value is Unix seconds (string)
+      // Must use normalizeTimestamp() to convert seconds → ms
+      const matchTimeRaw = payload.match_time ?? payload.matchtime;
+      const matchTime = matchTimeRaw != null
+        ? this.normalizeTimestamp(matchTimeRaw)
+        : undefined;
+
+      // Parse fee_rate_bps — basis points (e.g. "100" = 1%)
+      const rawFeeRateBps = payload.fee_rate_bps;
+      const feeRateBps = rawFeeRateBps != null ? Number(rawFeeRateBps) : undefined;
+
       const trade: UserTrade = {
-        tradeId: payload.trade_id as string || '',
+        tradeId: (payload.id ?? payload.trade_id) as string || '',
         market: payload.market as string || '',
         outcome: payload.outcome as string || '',
         price: Number(payload.price) || 0,
@@ -1035,45 +1886,36 @@ export class RealtimeServiceV2 extends EventEmitter {
         side: payload.side as 'BUY' | 'SELL',
         status: payload.status as 'MATCHED' | 'MINED' | 'CONFIRMED' | 'RETRYING' | 'FAILED',
         timestamp,
+        matchTime,
         transactionHash: payload.transaction_hash as string | undefined,
+        // New fields for order-trade linking
+        takerOrderId: payload.taker_order_id as string | undefined,
+        feeRateBps: feeRateBps != null && !isNaN(feeRateBps) ? feeRateBps : undefined,
+        makerOrders,
       };
       this.emit('userTrade', trade);
     }
   }
 
-  private handleActivityMessage(type: string, payload: Record<string, unknown>, timestamp: number): void {
-    const trade: ActivityTrade = {
-      asset: payload.asset as string || '',
-      conditionId: payload.conditionId as string || '',
-      eventSlug: payload.eventSlug as string || '',
-      marketSlug: payload.slug as string || '',
-      outcome: payload.outcome as string || '',
-      price: Number(payload.price) || 0,
-      side: payload.side as 'BUY' | 'SELL',
-      size: Number(payload.size) || 0,
-      timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
-      transactionHash: payload.transactionHash as string || '',
-      trader: {
-        name: payload.name as string | undefined,
-        address: payload.proxyWallet as string | undefined,
-      },
-    };
-    this.emit('activityTrade', trade);
-  }
-
   private handleCryptoPriceMessage(payload: Record<string, unknown>, timestamp: number): void {
+    const value = Number(payload.value);
+    if (!payload.symbol || !isFinite(value) || value <= 0) return;
+
     const price: CryptoPrice = {
-      symbol: payload.symbol as string || '',
-      price: Number(payload.value) || 0,
+      symbol: payload.symbol as string,
+      price: value,
       timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
     };
     this.emit('cryptoPrice', price);
   }
 
   private handleCryptoChainlinkPriceMessage(payload: Record<string, unknown>, timestamp: number): void {
+    const value = Number(payload.value);
+    if (!payload.symbol || !isFinite(value) || value <= 0) return;
+
     const price: CryptoPrice = {
-      symbol: payload.symbol as string || '',
-      price: Number(payload.value) || 0,
+      symbol: payload.symbol as string,
+      price: value,
       timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
     };
     this.emit('cryptoChainlinkPrice', price);
@@ -1167,21 +2009,32 @@ export class RealtimeServiceV2 extends EventEmitter {
   }
 
   private parsePriceChange(payload: Record<string, unknown>, timestamp: number): PriceChange {
-    const changes = payload.price_changes as Array<{ price: string; size: string }> || [];
+    const rawChanges = Array.isArray(payload.price_changes)
+      ? payload.price_changes as Array<Record<string, unknown>>
+      : ('price' in payload && 'size' in payload ? [payload] : []);
+    const changes = rawChanges.map((change) => ({
+      price: String(change.price ?? ''),
+      size: String(change.size ?? ''),
+      side: change.side !== undefined ? String(change.side) : undefined,
+      bestBid: change.best_bid !== undefined ? String(change.best_bid) : undefined,
+      bestAsk: change.best_ask !== undefined ? String(change.best_ask) : undefined,
+    }));
     return {
-      assetId: payload.asset_id as string || '',
+      assetId: payload.asset_id as string || rawChanges.find((c) => c.asset_id)?.asset_id as string || '',
       changes,
       timestamp,
     };
   }
 
   private parseLastTrade(payload: Record<string, unknown>, timestamp: number): LastTradeInfo {
+    const feeRateBps = payload.fee_rate_bps !== undefined ? Number(payload.fee_rate_bps) : undefined;
     return {
       assetId: payload.asset_id as string || '',
       price: parseFloat(payload.price as string) || 0,
       side: payload.side as 'BUY' | 'SELL' || 'BUY',
       size: parseFloat(payload.size as string) || 0,
       timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
+      feeRateBps: feeRateBps !== undefined && !isNaN(feeRateBps) ? feeRateBps : undefined,
     };
   }
 
@@ -1226,21 +2079,54 @@ export class RealtimeServiceV2 extends EventEmitter {
 
   private sendSubscription(msg: { subscriptions: Array<{ topic: string; type: string; filters?: string; clob_auth?: ClobApiKeyCreds }> }): void {
     if (this.client && this.connected) {
+      // Log subscription details (redact credentials)
+      const loggableSubs = msg.subscriptions.map(s => ({
+        topic: s.topic,
+        type: s.type,
+        filters: s.filters,
+        hasAuth: !!s.clob_auth,
+      }));
+      this.log(`Sending subscription: ${JSON.stringify(loggableSubs)}`);
       this.client.subscribe(msg);
     } else {
       this.log('Cannot subscribe: not connected');
     }
   }
 
-  private sendUnsubscription(msg: { subscriptions: Array<{ topic: string; type: string; filters?: string }> }): void {
-    if (this.client && this.connected) {
-      this.client.unsubscribe(msg);
+  private sendUnsubscription(msg: { subscriptions: Array<{ topic: string; type: string; filters?: string }> }, subId?: string): void {
+    if (!this.client || !this.connected) return;
+
+    // If subId is provided, only send unsubscribe if subscription is on current connection.
+    // After reconnect, stale subscriptions may not exist on the server (expired markets),
+    // so sending unsubscribe would trigger "Invalid request body" errors.
+    if (subId) {
+      const subGeneration = this.subscriptionGenerations.get(subId);
+      if (subGeneration !== undefined && subGeneration !== this.connectionGeneration) {
+        this.log(`Skipping unsubscribe for ${subId}: stale (gen ${subGeneration} vs current ${this.connectionGeneration})`);
+        this.subscriptionGenerations.delete(subId);
+        return;
+      }
+      this.subscriptionGenerations.delete(subId);
     }
+
+    this.client.unsubscribe(msg);
   }
 
-  private log(message: string): void {
-    if (this.config.debug) {
-      console.log(`[RealtimeService] ${message}`);
+  /**
+   * Log with level support (debug/info)
+   * - price_change events: debug level (too frequent)
+   * - orderbook updates: info level
+   * - connection events: info level
+   */
+  private log(message: string, level: 'debug' | 'info' = 'info'): void {
+    if (!this.config.debug) return;
+
+    if (this.config.logger) {
+      // Use structured logger if provided
+      this.config.logger[level](message);
+    } else {
+      // Fallback to structured logger
+      log.info(`[RealtimeService] ${message}`);
     }
   }
 

@@ -55,22 +55,22 @@ let CONFIG = {
   },
 
   smartMoney: {
-    enabled: true,
+    enabled: process.env.SMARTMONEY_ENABLED === 'true',
     topN: 50,                  // Subido de 20 para 50 (Procura numa lista muito maior de carteiras)
-    
+
     minWinRate: 0.55,          // Ligeiramente ajustado de 0.60 para 0.55
     minPnl: 300,               // Ajustado de 500 para 300
     minTrades: 20,              // Ajustado de 30 para 20
-    
+
     minProfitFactor: 1.2,      // Relaxado de 1.5 para 1.2 (Encontra muito mais carteiras)
     minConsistencyScore: 0.5,  // Relaxado de 0.7 para 0.5
-    
+
     maxSingleTradeExposure: 0.3,
     checkLastNTrades: 10,
 
     sizeScale: 0.1,
     maxSizePerTrade: 15,
-   
+
     maxSlippage: 0.05,         // Subido de 0.03 para 0.05 (Evita rejeitar trades por ligeira variação de preço)
     minTradeSize: 1.0,         // 🚨 CRÍTICO: Baixado de 10 para 1.0 (Não descarta ordens pequenas!)
     delay: 200,                // Reduzido de 500ms para 200ms de latência
@@ -81,7 +81,7 @@ let CONFIG = {
   },
 
   arbitrage: {
-    enabled: true,             // Forçado a true (ativa a estratégia automaticamente)
+    enabled: process.env.ARBITRAGE_ENABLED === 'true',             // Forçado a true (ativa a estratégia automaticamente)
     profitThreshold: 0.008,    // Baixado de 0.01 para 0.008 (Mais oportunidades de arbitragem)
     minTradeSize: 5,
     maxTradeSize: 50,
@@ -94,7 +94,7 @@ let CONFIG = {
   },
 
   dipArb: {
-    enabled: false,             // Forçado a true
+    enabled: process.env.DIPARB_ENABLED === 'true',             // Forçado a true
     coins: ['BTC', 'ETH', 'SOL'] as const,
     shares: 10,
     sumTarget: 0.95,           // Subido de 0.92 para 0.95 (Aumenta bastante os gatilhos)
@@ -110,14 +110,14 @@ let CONFIG = {
   },
 
   binance: {
-    enabled: true,
+    enabled: process.env.TREND_ANALYSIS_ENABLED === 'true',
     symbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'] as const,
     interval: '15m' as const,
     trendThreshold: 2,
   },
 
   directTrading: {
-    enabled: false,
+    enabled: process.env.DIRECT_TRADING === 'true',
     trendFollowing: true,
     minTrendStrength: 0.02,
     stopLossPct: 0.15,
@@ -235,77 +235,6 @@ function updateDashboard() {
   dashboardEmitter.updateState(state);
 }
 
-function canTrade__(): boolean {
-  if (state.permanentlyHalted) {
-    log('ERROR', '🛑 Trading permanentemente interrompido - limite total de perda atingido');
-    return false;
-  }
-
-  const daysSinceReset = (Date.now() - state.lastDailyReset) / (1000 * 60 * 60 * 24);
-  if (daysSinceReset >= 1) {
-    log('INFO', `Reset do PnL diário. Dia anterior: $${state.dailyPnL.toFixed(2)}`);
-    state.dailyPnL = 0;
-    state.lastDailyReset = Date.now();
-  }
-
-  const daysSinceMonthStart = (Date.now() - state.monthStartTime) / (1000 * 60 * 60 * 24);
-  if (daysSinceMonthStart >= 30) {
-    log('INFO', `Reset do PnL mensal. Mês anterior: $${state.monthlyPnL.toFixed(2)}`);
-    state.monthlyPnL = 0;
-    state.monthStartTime = Date.now();
-  }
-
-  state.currentCapital = CONFIG.capital.totalUsd + state.totalPnL;
-  if (state.currentCapital > state.peakCapital) {
-    state.peakCapital = state.currentCapital;
-  }
-  state.currentDrawdown = (state.peakCapital - state.currentCapital) / state.peakCapital;
-
-  if (state.isPaused && Date.now() < state.pauseUntil) return false;
-  if (state.isPaused && Date.now() >= state.pauseUntil) {
-    state.isPaused = false;
-    log('INFO', 'Bot retomou a execução após período de pausa');
-    updateDashboard();
-  }
-
-  const dailyLossLimit = CONFIG.capital.totalUsd * CONFIG.risk.dailyMaxLossPct;
-  if (state.dailyPnL <= -dailyLossLimit) {
-    state.isPaused = true;
-    state.pauseUntil = Date.now() + CONFIG.risk.pauseOnBreachMinutes * 60 * 1000;
-    log('WARN', `Limite de perda diária atingido: -$${Math.abs(state.dailyPnL).toFixed(2)} (limite: $${dailyLossLimit.toFixed(2)})`);
-    updateDashboard();
-    return false;
-  }
-
-  const monthlyLossLimit = CONFIG.capital.totalUsd * CONFIG.risk.monthlyMaxLossPct;
-  if (state.monthlyPnL <= -monthlyLossLimit) {
-    log('ERROR', `🛑 Limite de perda mensal atingido: -$${Math.abs(state.monthlyPnL).toFixed(2)} (limite: $${monthlyLossLimit.toFixed(2)})`);
-    state.isPaused = true;
-    state.pauseUntil = Date.now() + (30 * 24 * 60 * 60 * 1000);
-    updateDashboard();
-    return false;
-  }
-
-  if (state.currentDrawdown >= CONFIG.risk.maxDrawdownFromPeak) {
-    log('ERROR', `🛑 Drawdown máximo atingido: ${(state.currentDrawdown * 100).toFixed(1)}%`);
-    state.isPaused = true;
-    state.pauseUntil = Date.now() + (7 * 24 * 60 * 60 * 1000);
-    updateDashboard();
-    return false;
-  }
-
-  const totalLossLimit = CONFIG.capital.totalUsd * CONFIG.risk.totalMaxLossPct;
-  if (state.totalPnL <= -totalLossLimit) {
-    state.permanentlyHalted = true;
-    log('ERROR', '💀 LIMITE DE PERDA TOTAL ATINGIDO - BOT PARADO PERMANENTEMENTE');
-    log('ERROR', `Perda total: -$${Math.abs(state.totalPnL).toFixed(2)} (limite: $${totalLossLimit.toFixed(2)})`);
-    updateDashboard();
-    return false;
-  }
-
-  return true;
-}
-
 function canTrade(): boolean {
   if (state.permanentlyHalted) {
     log('ERROR', '🛑 Trading permanentemente interrompido - limite total de perda atingido');
@@ -408,7 +337,7 @@ function recordTrade(profit: number, strategy: string) {
   else if (strategy === 'dipArb') state.dipArbTrades++;
   else if (strategy === 'direct') state.directTrades++;
 
-  if (/**CONFIG.dryRun &&**/ state.paper) {
+  if (CONFIG.dryRun && state.paper) {
     state.paper.pnl += profit;
     state.paper.balance += profit;
     state.paper.trades++;
@@ -453,7 +382,7 @@ function simulateSmartMoneyTrade(trade: SmartMoneyTrade & { id?: string; market?
     return;
   }
   processedTrades.add(tradeHash);
-  
+
   if (processedTrades.size > 5000) processedTrades.clear();
 
   // 6. Filtro de preço mínimo
@@ -507,7 +436,7 @@ function simulateSmartMoneyTrade(trade: SmartMoneyTrade & { id?: string; market?
     // 🛡️ PROTEÇÃO: Vende no MÁXIMO o número de shares que TU tens guardadas na memória
     const closedShares = Math.min(existingPos.size, existingPos.size * (trade.size / (trade.size || 1)));
     const actualClosedShares = Math.min(closedShares, existingPos.size);
-    
+
     const profit = (trade.price - existingPos.entryPrice) * actualClosedShares;
 
     if (existingPos.size - actualClosedShares > 0.01) {
@@ -519,36 +448,6 @@ function simulateSmartMoneyTrade(trade: SmartMoneyTrade & { id?: string; market?
 
     log('TRADE', `[SIMULATION] Smart Money SELL: ${actualClosedShares.toFixed(1)} shares @ $${trade.price.toFixed(3)} | PnL: $${profit.toFixed(2)}`);
     recordTrade(profit, 'smartMoney');
-  }
-}
-
-function simulateSmartMoneyTrade__(trade: SmartMoneyTrade) {
-  const posKey = `${trade.traderAddress}-${trade.marketSlug || 'market'}`;
-
-  if (trade.side === 'BUY') {
-    simulatedPositions.set(posKey, {
-      traderAddress: trade.traderAddress,
-      marketSlug: trade.marketSlug || 'Unknown',
-      side: 'BUY',
-      size: trade.size,
-      entryPrice: trade.price,
-      timestamp: Date.now(),
-    });
-
-    log('TRADE', `[SIMULATION] Smart Money BUY: ${trade.size.toFixed(1)} shares @ $${trade.price.toFixed(3)} | Acompanhando Posição`);
-  } else if (trade.side === 'SELL') {
-    const existingPos = simulatedPositions.get(posKey);
-
-    if (existingPos) {
-      const closedShares = Math.min(trade.size, existingPos.size);
-      const profit = (trade.price - existingPos.entryPrice) * closedShares;
-      simulatedPositions.delete(posKey);
-
-      log('TRADE', `[SIMULATION] Smart Money SELL: ${closedShares.toFixed(1)} shares @ $${trade.price.toFixed(3)} | PnL Realizado: $${profit.toFixed(2)}`);
-      recordTrade(profit, 'smartMoney');
-    } else {
-      log('INFO', `[SIMULATION] Smart Money SELL detetado sem compra prévia registada.`);
-    }
   }
 }
 
@@ -568,6 +467,10 @@ let isSmartMoneyInitialized = false;
 let isSmartMoneyInitializing = false;
 //let currentSmartMoneySub: any = null;
 let currentSmartMoneySub: { id: string; unsubscribe: () => void } | null = null;
+let autoCopyTradingSubscription: { id: string; stop: () => void } | null = null;
+let qualifiedCache: string[] = [];
+
+
 let activeTradesProcessing = 0;
 const realPositions = new Map<string, { size: number; avgEntryPrice: number }>();
 
@@ -606,6 +509,10 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
   log('WALLET', 'Configurando Smart Money com filtros completos de qualidade...');
 
   const qualified: string[] = [];
+  if (qualifiedCache && qualifiedCache.length > 0) {
+    qualified.push(...qualifiedCache);
+    log('WALLET', `📦 Cache recuperada: ${qualifiedCache.length} carteiras carregadas da cache anterior.`);
+  }
 
   // 1. Carregar carteiras personalizadas da configuração
   if (CONFIG.smartMoney.customWallets?.length > 0) {
@@ -639,7 +546,7 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
         profitFactor >= CONFIG.smartMoney.minProfitFactor
       ) {
         qualified.push(entry.address);
-        log('WALLET', `✅ Carteira Qualificada: ${entry.address.slice(0, 10)}... (WR:${(winRate * 100).toFixed(0)}% PnL:$${pnl.toFixed(0)} T:${trades})`);
+        log('WALLET', `✅ Carteira Qualificada: ${entry.address}... (WR:${(winRate * 100).toFixed(0)}% PnL:$${pnl.toFixed(0)} T:${trades})`);
       }
 
       await new Promise(r => setTimeout(r, 300));
@@ -647,6 +554,9 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
   } catch (err) {
     log('WARN', `Erro ao carregar Leaderboard: ${(err as Error).message}`);
   }
+
+  // Atualizar a cache global com a nova lista qualificada
+  qualifiedCache = [...qualified];
 
   state.followedWallets = qualified;
   log('WALLET', `A seguir ${qualified.length} carteiras qualificadas`);
@@ -658,9 +568,9 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
     const modeTag = isDryRun ? '🧪 [DRY_RUN]' : '🔴 [LIVE]';
 
     log('TRADE', `${modeTag} A iniciar motor de Copy Trading no SDK (dryRun: ${isDryRun})...`);
-    
 
-    await sdk.smartMoney.startAutoCopyTrading({
+
+    autoCopyTradingSubscription = await sdk.smartMoney.startAutoCopyTrading({
       targetAddresses: qualified,
       sizeScale: CONFIG.smartMoney.sizeScale || 0.25,
       maxSizePerTrade: CONFIG.smartMoney.maxSizePerTrade || 3.5,
@@ -739,7 +649,7 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
                 }
 
                 log('TRADE', `✅ ${modeTag} SELL Simulado/Executado: ${closedShares.toFixed(1)} shares @ $${execPrice.toFixed(3)} | PnL: $${profit.toFixed(2)}`);
-                
+
                 // Regista o PnL no Dashboard
                 recordTrade(profit, 'smartMoney');
               } else {
@@ -763,7 +673,7 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
   isSmartMoneyInitializing = false;
 }
 
-async function initializeSmartMoney_old(sdk: PolymarketSDK) {
+async function initializeSmartMoney__(sdk: PolymarketSDK) {
   //if (isSmartMoneyInitialized || isSmartMoneyInitializing) return;
 
   /**
@@ -861,7 +771,9 @@ async function initializeSmartMoney_old(sdk: PolymarketSDK) {
         } finally {
           activeTradesProcessing--; // 🟢 Ordem concluída: liberta rotação
         }
-      });
+      }, {
+      filterAddresses: qualified
+    });
   }
   isSmartMoneyInitialized = true;
   isSmartMoneyInitializing = false;
@@ -1437,7 +1349,7 @@ async function main() {
     }
   }, TEN_MINUTES);
   **/
- setInterval(async () => {
+  setInterval(async () => {
     log('INFO', '⏰ A verificar rotação de carteiras de Smart Money...');
 
     // Se houver alguma ordem a ser copiada NESTE instante, aguarda uns segundos
@@ -1447,18 +1359,19 @@ async function main() {
     }
 
     // Faz a rotação limpa: cancela a antiga e inicia a nova lista
-    if (currentSmartMoneySub) {
+    if (autoCopyTradingSubscription) {
       log('INFO', '🔄 A fechar subscrição antiga...');
-      currentSmartMoneySub.unsubscribe();
-      currentSmartMoneySub = null;
+      autoCopyTradingSubscription.stop();
+      autoCopyTradingSubscription = null;
       await new Promise(r => setTimeout(r, 4000)); // Pausa para fecho do WS no SDK
     }
 
     // Carrega as novas carteiras e subscreve de novo
     await initializeSmartMoney(sdk);
 
-  }, THIRTY_MINUTES);
+  }, TWO_HOURS_MS);
   // 2. Re-verificação de Arbitragem (A cada 10 minutos)
+  /** 
   setInterval(async () => {
     try {
       if (CONFIG.arbitrage.enabled) {
@@ -1468,7 +1381,7 @@ async function main() {
       log('WARN', `❌ Erro na reciclagem de Arbitragem: ${err.message}`);
     }
   }, 10 * 60 * 1000);
-
+  **/
   setInterval(() => {
     updateDashboard();
   }, 5000);

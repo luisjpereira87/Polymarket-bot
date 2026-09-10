@@ -10,37 +10,39 @@
  */
 
 import {
+  Chain,
   ClobClient,
   Side as ClobSide,
-  Chain,
   PriceHistoryInterval,
   type OrderBookSummary,
-} from '@polymarket/clob-client';
-import { Wallet } from 'ethers';
+} from '@polymarket/clob-client-v2';
+import { createWalletClient, http } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+import { polygon } from 'viem/chains';
 import { DataApiClient, Trade } from '../clients/data-api.js';
 import { GammaApiClient, GammaMarket } from '../clients/gamma-api.js';
-import type { UnifiedCache } from '../core/unified-cache.js';
-import { CACHE_TTL } from '../core/unified-cache.js';
-import { RateLimiter, ApiType } from '../core/rate-limiter.js';
-import { PolymarketError, ErrorCode } from '../core/errors.js';
+import { ErrorCode, PolymarketError } from '../core/errors.js';
+import { ApiType, RateLimiter } from '../core/rate-limiter.js';
 import type {
-  UnifiedMarket,
-  MarketToken as UnifiedMarketToken,
-  ProcessedOrderbook,
-  EffectivePrices,
   ArbitrageOpportunity,
-  KLineInterval,
-  KLineCandle,
   DualKLineData,
-  SpreadDataPoint,
+  EffectivePrices,
+  KLineCandle,
+  KLineInterval,
+  Orderbook,
+  ProcessedOrderbook,
   RealtimeSpreadAnalysis,
   Side,
-  Orderbook,
-  UnderlyingAsset,
+  SpreadDataPoint,
   TokenUnderlyingCorrelation,
   TokenUnderlyingDataPoint,
+  UnderlyingAsset,
+  UnifiedMarket,
+  MarketToken as UnifiedMarketToken,
 } from '../core/types.js';
-import type { BinanceService, BinanceInterval } from './binance-service.js';
+import type { UnifiedCache } from '../core/unified-cache.js';
+import { CACHE_TTL } from '../core/unified-cache.js';
+import type { BinanceInterval, BinanceService } from './binance-service.js';
 
 // CLOB Host
 const CLOB_HOST = 'https://clob.polymarket.com';
@@ -81,7 +83,7 @@ const KLINE_TO_BINANCE_INTERVAL: Partial<Record<KLineInterval, BinanceInterval>>
 
 // Side and Orderbook are imported from core/types.ts
 // Re-export for backward compatibility
-export type { Side, Orderbook } from '../core/types.js';
+export type { Orderbook, Side } from '../core/types.js';
 
 export type PriceHistoryIntervalString = '1h' | '6h' | '1d' | '1w' | 'max';
 
@@ -198,23 +200,36 @@ export class MarketService {
     private cache: UnifiedCache,
     private config?: MarketServiceConfig,
     private binanceService?: BinanceService
-  ) {}
+  ) { }
 
   // ============================================================================
   // Initialization
   // ============================================================================
-
   private async ensureInitialized(): Promise<ClobClient> {
     if (!this.initialized || !this.clobClient) {
-      const chainId = (this.config?.chainId || POLYGON_MAINNET) as Chain;
+      const chainId = (this.config?.chainId || 137) as Chain;
+      const host = 'https://clob.polymarket.com';
 
       if (this.config?.privateKey) {
-        // Authenticated client
-        const wallet = new Wallet(this.config.privateKey);
-        this.clobClient = new ClobClient(CLOB_HOST, chainId, wallet);
+        // Cliente autenticado com Viem para V2
+        const account = privateKeyToAccount(this.config.privateKey as `0x${string}`);
+        const walletClient = createWalletClient({
+          account,
+          chain: polygon,
+          transport: http(),
+        });
+
+        this.clobClient = new ClobClient({
+          host,
+          chain: chainId,
+          signer: walletClient,
+        });
       } else {
-        // Read-only client (no auth needed for market data)
-        this.clobClient = new ClobClient(CLOB_HOST, chainId);
+        // Cliente apenas de leitura (sem signer)
+        this.clobClient = new ClobClient({
+          host,
+          chain: chainId,
+        });
       }
       this.initialized = true;
     }

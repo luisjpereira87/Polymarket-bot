@@ -13,21 +13,24 @@
  */
 
 import {
-  ClobClient,
-  Side as ClobSide,
-  OrderType as ClobOrderType,
   Chain,
-  type OpenOrder,
+  ClobClient,
+  OrderType as ClobOrderType,
+  Side as ClobSide,
   type Trade as ClobTrade,
+  type OpenOrder,
   type TickSize,
-} from '@polymarket/clob-client';
+} from '@polymarket/clob-client-v2';
 
 import { Wallet } from 'ethers';
-import { RateLimiter, ApiType } from '../core/rate-limiter.js';
+import { createWalletClient } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+import { polygon } from 'viem/chains';
+import { http } from 'viem/tempo';
+import { ErrorCode, PolymarketError } from '../core/errors.js';
+import { ApiType, RateLimiter } from '../core/rate-limiter.js';
+import type { Side } from '../core/types.js';
 import type { UnifiedCache } from '../core/unified-cache.js';
-import { CACHE_TTL } from '../core/unified-cache.js';
-import { PolymarketError, ErrorCode } from '../core/errors.js';
-import type { Side, OrderType } from '../core/types.js';
 
 // Chain IDs
 export const POLYGON_MAINNET = 137;
@@ -59,7 +62,7 @@ export const MIN_ORDER_SIZE_SHARES = 5;
 
 // Side and OrderType are imported from core/types.ts
 // Re-export for backward compatibility
-export type { Side, OrderType } from '../core/types.js';
+export type { OrderType, Side } from '../core/types.js';
 
 export interface ApiCredentials {
   key: string;
@@ -178,18 +181,34 @@ export class TradingService {
   // ============================================================================
   // Initialization
   // ============================================================================
-
   async initialize(): Promise<void> {
     if (this.initialized) return;
 
-    // Create CLOB client with L1 auth (wallet)
-    this.clobClient = new ClobClient(CLOB_HOST, this.chainId, this.wallet);
+    const host = 'https://clob.polymarket.com';
+    const chainId = 137;
 
-    // Get or create API credentials
-    // We use derive-first strategy (opposite of official createOrDeriveApiKey)
-    // because most users already have a key, avoiding unnecessary 400 error logs.
+    // Configurar a conta e o signatário com Viem
+    const privateKey = this.config?.privateKey || process.env.PRIVATE_KEY;
+    if (!privateKey) {
+      throw new Error('❌ Chave privada não encontrada na configuração ou variáveis de ambiente.');
+    }
+    const account = privateKeyToAccount(privateKey as `0x${string}`);
+    const walletClient = createWalletClient({
+      account,
+      chain: polygon,
+      transport: http(),
+    });
+
+    // 1. Cliente L1 apenas com o signer para derivar/criar as credenciais da API
+    const tempClient = new ClobClient({
+      host,
+      chain: chainId,
+      signer: walletClient,
+    });
+
     if (!this.credentials) {
-      const creds = await this.deriveOrCreateApiKey();
+      // Deriva ou cria as credenciais oficiais da V2
+      const creds = await tempClient.createOrDeriveApiKey();
       this.credentials = {
         key: creds.key,
         secret: creds.secret,
@@ -197,17 +216,17 @@ export class TradingService {
       };
     }
 
-    // Re-initialize with L2 auth (credentials)
-    this.clobClient = new ClobClient(
-      CLOB_HOST,
-      this.chainId,
-      this.wallet,
-      {
+    // 2. Instancia o cliente definitivo com autenticação L1 (signer) e L2 (creds)
+    this.clobClient = new ClobClient({
+      host,
+      chain: chainId,
+      signer: walletClient,
+      creds: {
         key: this.credentials.key,
         secret: this.credentials.secret,
         passphrase: this.credentials.passphrase,
-      }
-    );
+      },
+    });
 
     this.initialized = true;
   }
@@ -288,7 +307,6 @@ export class TradingService {
    * Orders below these limits will be rejected by the API.
    */
   async createLimitOrder(params: LimitOrderParams): Promise<OrderResult> {
-    // Validate minimum order requirements before sending to API
     if (params.size < MIN_ORDER_SIZE_SHARES) {
       return {
         success: false,
@@ -329,15 +347,13 @@ export class TradingService {
 
         const success = result.success === true ||
           (result.success !== false &&
-            ((result.orderID !== undefined && result.orderID !== '') ||
-              (result.transactionsHashes !== undefined && result.transactionsHashes.length > 0)));
+            (result.orderID !== undefined && result.orderID !== ''));
 
         return {
           success,
           orderId: result.orderID,
-          orderIds: result.orderIDs,
           errorMsg: result.errorMsg,
-          transactionHashes: result.transactionsHashes,
+          transactionHashes: result.transactionsHashes || [],
         };
       } catch (error) {
         return {
@@ -357,7 +373,6 @@ export class TradingService {
    * Market orders below this limit will be rejected by the API.
    */
   async createMarketOrder(params: MarketOrderParams): Promise<OrderResult> {
-    // Validate minimum order value before sending to API
     if (params.amount < MIN_ORDER_VALUE_USDC) {
       return {
         success: false,
@@ -389,15 +404,13 @@ export class TradingService {
 
         const success = result.success === true ||
           (result.success !== false &&
-            ((result.orderID !== undefined && result.orderID !== '') ||
-              (result.transactionsHashes !== undefined && result.transactionsHashes.length > 0)));
+            (result.orderID !== undefined && result.orderID !== ''));
 
         return {
           success,
           orderId: result.orderID,
-          orderIds: result.orderIDs,
           errorMsg: result.errorMsg,
-          transactionHashes: result.transactionsHashes,
+          transactionHashes: result.transactionsHashes || [],
         };
       } catch (error) {
         return {
@@ -569,18 +582,22 @@ export class TradingService {
   // ============================================================================
 
   async getBalanceAllowance(
-    assetType: 'COLLATERAL' | 'CONDITIONAL',
+    assetType?: 'COLLATERAL' | 'CONDITIONAL',
     tokenId?: string
-  ): Promise<{ balance: string; allowance: string }> {
+  ): Promise<{ balance: string; allowances: any }> {
     const client = await this.ensureInitialized();
     return this.rateLimiter.execute(ApiType.CLOB_API, async () => {
       const result = await client.getBalanceAllowance({
         asset_type: assetType as any,
         token_id: tokenId,
       });
-      return { balance: result.balance, allowance: result.allowance };
+      return {
+        balance: result?.balance || '0',
+        allowances: result?.allowances || {}
+      };
     });
   }
+
 
   async updateBalanceAllowance(
     assetType: 'COLLATERAL' | 'CONDITIONAL',

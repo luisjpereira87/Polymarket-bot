@@ -26,10 +26,10 @@
  * 验证跟单结果请使用 TradingService.getTrades()
  */
 
-import type { WalletService, TimePeriod, PeriodLeaderboardEntry } from './wallet-service.js';
-import type { RealtimeServiceV2, ActivityTrade } from './realtime-service-v2.js';
-import type { TradingService, OrderResult } from './trading-service.js';
-import type { Position, ClosedPosition, ClosedPositionsParams, DataApiClient } from '../clients/data-api.js';
+import type { ClosedPosition, DataApiClient, Position } from '../clients/data-api.js';
+import { ActivityTrade, RealtimeServiceV2 } from './realtime-service-v2.js';
+import type { OrderResult, TradingService } from './trading-service.js';
+import type { PeriodLeaderboardEntry, TimePeriod, WalletService } from './wallet-service.js';
 
 // ============================================================================
 // Market Categorization (exported utilities)
@@ -808,10 +808,11 @@ export class SmartMoneyService {
       smartMoneyOnly?: boolean;
     } = {}
   ): { id: string; unsubscribe: () => void } {
+
     this.tradeHandlers.add(onTrade);
 
     // Ensure cache is populated
-    this.getSmartMoneyList().catch(() => {});
+    this.getSmartMoneyList().catch(() => { });
 
     // Start subscription if not active
     if (!this.activeSubscription) {
@@ -822,7 +823,7 @@ export class SmartMoneyService {
         onError: (error) => {
           console.error('[SmartMoneyService] Subscription error:', error);
         },
-      });
+      }, options.filterAddresses);
     }
 
     return {
@@ -841,8 +842,14 @@ export class SmartMoneyService {
     trade: ActivityTrade,
     options: { filterAddresses?: string[]; minSize?: number; smartMoneyOnly?: boolean }
   ): Promise<void> {
-    const rawAddress = trade.trader?.address;
-    if (!rawAddress) return;
+    // 🚨 Adiciona isto para ver o objeto exato que o SDK está a enviar
+    console.log('[DEBUG] Objeto Activity Trade bruto recebido:', JSON.stringify(trade, null, 2));
+
+    const rawAddress = trade.trader?.address; // ou trade.maker / trade.proxyWallet
+    if (!rawAddress) {
+      console.log('[DEBUG] Trade rejeitado: campo de endereço do trader não encontrado neste formato.');
+      return;
+    }
 
     const traderAddress = rawAddress.toLowerCase();
 
@@ -956,7 +963,7 @@ export class SmartMoneyService {
     const subscription = this.subscribeSmartMoneyTrades(
       async (trade: SmartMoneyTrade) => {
         stats.tradesDetected++;
-
+        console.log('EVENTO BRUTO RECEBIDO:', trade)
         try {
           // Check target
           if (!targetAddresses.includes(trade.traderAddress.toLowerCase())) {
@@ -1383,10 +1390,10 @@ export class SmartMoneyService {
     // Fetch closed positions for the day
     const closedPositions = this.dataApi
       ? await this.dataApi.getClosedPositions(address, {
-          sortBy: 'TIMESTAMP',
-          sortDirection: 'DESC',
-          limit: 50,
-        })
+        sortBy: 'TIMESTAMP',
+        sortDirection: 'DESC',
+        limit: 50,
+      })
       : [];
 
     // Filter closed positions for today
