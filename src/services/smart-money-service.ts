@@ -27,6 +27,8 @@
  */
 
 import type { ClosedPosition, DataApiClient, Position } from '../clients/data-api.js';
+import { TradePositions } from '../core/types.js';
+import { createUnifiedCache, GammaApiClient, GammaMarket, RateLimiter } from '../index.js';
 import { ActivityTrade, RealtimeServiceV2 } from './realtime-service-v2.js';
 import type { OrderResult, TradingService } from './trading-service.js';
 import type { PeriodLeaderboardEntry, TimePeriod, WalletService } from './wallet-service.js';
@@ -152,6 +154,8 @@ export interface AutoCopyTradingOptions {
 
   /** Dry run mode */
   dryRun?: boolean;
+
+  isCanTrade: () => boolean;
 
   /** Callbacks */
   onTrade?: (trade: SmartMoneyTrade, result: OrderResult) => void;
@@ -683,6 +687,9 @@ export class SmartMoneyService {
   private tradingService: TradingService;
   private dataApi: DataApiClient | null;
   private config: Required<SmartMoneyServiceConfig>;
+  private rateLimiter: RateLimiter;
+  private gammaApiClient: GammaApiClient;
+
 
   private smartMoneyCache: Map<string, SmartMoneyWallet> = new Map();
   private smartMoneySet: Set<string> = new Set();
@@ -696,17 +703,22 @@ export class SmartMoneyService {
     realtimeService: RealtimeServiceV2,
     tradingService: TradingService,
     config: SmartMoneyServiceConfig = {},
+    gammaApiClient: GammaApiClient,
     dataApi?: DataApiClient
   ) {
     this.walletService = walletService;
     this.realtimeService = realtimeService;
     this.tradingService = tradingService;
     this.dataApi = dataApi ?? null;
+    this.rateLimiter = new RateLimiter();
 
     this.config = {
       minPnl: config.minPnl ?? 1000,
       cacheTtl: config.cacheTtl ?? 300000,
     };
+
+    const cache = createUnifiedCache();
+    this.gammaApiClient = gammaApiClient;
   }
 
   /**
@@ -838,12 +850,151 @@ export class SmartMoneyService {
     };
   }
 
+  private priceHandlers = new Set<(slug: string, currentPrice: number, pnlPercent: number) => void>();
+  private priceSubscription: { id: string; unsubscribe: () => void } | null = null;
+
+  subscribePositionPrices(
+    realPositions: Map<string, TradePositions>,
+    onPriceUpdate: (slug: string, currentPrice: number, pnlPercent: number) => void
+  ): { id: string; unsubscribe: () => void } {
+    this.priceHandlers.add(onPriceUpdate);
+
+    if (!this.priceSubscription) {
+      // Passa o mapa realPositions para o serviço de polling em background
+      this.priceSubscription = this.realtimeService.subscribePositionPricePolling(realPositions, {
+        onPriceUpdate: (slug, currentPrice, pnlPercent) => {
+          for (const handler of this.priceHandlers) {
+            handler(slug, currentPrice, pnlPercent);
+          }
+        }
+      });
+    }
+
+    return {
+      id: `price_monitor_${Date.now()}`,
+      unsubscribe: () => {
+        this.priceHandlers.delete(onPriceUpdate);
+        if (this.priceHandlers.size === 0 && this.priceSubscription) {
+          this.priceSubscription.unsubscribe();
+          this.priceSubscription = null;
+        }
+      },
+    };
+  }
+
+  async subscribePositionPricesWithExecution(
+    realPositions: Map<string, TradePositions>,
+    options: {
+      takeProfitPercent?: number;
+      stopLossPercent?: number;
+      dryRun?: boolean;
+      onPositionClosed?: (trade: SmartMoneyTrade, result: OrderResult, pnlPercent: number) => void;
+      onPriceUpdate?: (posKey: string, currentPrice: number, pnlPercent: number) => void;
+      // 1. Adicionar o callback na assinatura das opções
+      executeTradeHandler?: (trade: SmartMoneyTrade, result: OrderResult) => void;
+    } = {}
+  ): Promise<{ id: string; unsubscribe: () => void }> {
+    const takeProfit = options.takeProfitPercent ?? 15.0;
+    const stopLoss = options.stopLossPercent ?? -10.0;
+    const dryRun = options.dryRun ?? false;
+
+    const internalHandler = async (posKey: string, currentPrice: number, pnlPercent: number) => {
+      options.onPriceUpdate?.(posKey, currentPrice, pnlPercent);
+
+      const position = realPositions.get(posKey);
+      if (!position) return;
+
+      if (pnlPercent >= takeProfit || pnlPercent <= stopLoss) {
+        const actionType = pnlPercent >= takeProfit ? '🎯 Take-Profit' : '🛑 Stop-Loss';
+        console.log(`💰 ${actionType} de ${pnlPercent.toFixed(1)}% atingido em ${posKey}! A fechar posição...`);
+
+        const exitShares = position.size;
+        const exitValue = exitShares * currentPrice;
+        let result: OrderResult;
+
+        if (dryRun) {
+          result = { success: true, orderId: `dry_run_exit_${Date.now()}` };
+          console.log('[DRY RUN EXIT]', {
+            posKey,
+            side: 'SELL',
+            shares: exitShares.toFixed(2),
+            price: currentPrice.toFixed(3),
+            pnlPercent: pnlPercent.toFixed(2) + '%',
+          });
+        } else {
+          const tokenId = (position as any).tokenId;
+          if (!tokenId) {
+            console.warn(`[SmartMoneyService] ⚠️ Falha ao fechar ${posKey}: TokenId em falta.`);
+            return;
+          }
+
+          result = await this.tradingService.createMarketOrder({
+            tokenId,
+            side: 'SELL',
+            amount: exitValue,
+            price: currentPrice * 0.98,
+            orderType: 'FOK',
+          });
+        }
+
+        if (result.success) {
+          const exitTrade: SmartMoneyTrade = {
+            traderAddress: position.traderAddress || 'SYSTEM_AUTO_EXIT',
+            marketSlug: position.marketSlug,
+            outcome: position.outcome,
+            side: 'SELL',
+            size: position.size,
+            price: currentPrice,
+            timestamp: Date.now(),
+            isSmartMoney: true
+          };
+
+          // 2. Chamar o handler injetado em vez de chamar diretamente uma função global
+          if (options.executeTradeHandler) {
+            options.executeTradeHandler(exitTrade, result);
+          } else {
+            console.warn(`[SmartMoneyService] ⚠️ AVISO: 'executeTradeHandler' não definido para o fecho de ${posKey}`);
+          }
+
+          options.onPositionClosed?.(exitTrade, result, pnlPercent);
+        } else {
+          console.error(`[SmartMoneyService] ❌ Erro ao fechar posição ${posKey}:`, result.errorMsg);
+        }
+      }
+    };
+
+    this.priceHandlers.add(internalHandler);
+
+    if (!this.priceSubscription) {
+      this.priceSubscription = this.realtimeService.subscribePositionPricePolling(realPositions, {
+        onPriceUpdate: (posKey, currentPrice, pnlPercent) => {
+          for (const handler of this.priceHandlers) {
+            handler(posKey, currentPrice, pnlPercent);
+          }
+        }
+      });
+    }
+
+    return {
+      id: `price_monitor_exec_${Date.now()}`,
+      unsubscribe: () => {
+        this.priceHandlers.delete(internalHandler);
+        if (this.priceHandlers.size === 0 && this.priceSubscription) {
+          this.priceSubscription.unsubscribe();
+          this.priceSubscription = null;
+        }
+      },
+    };
+  }
+
+
+
   private async handleActivityTrade(
     trade: ActivityTrade,
     options: { filterAddresses?: string[]; minSize?: number; smartMoneyOnly?: boolean }
   ): Promise<void> {
     // 🚨 Adiciona isto para ver o objeto exato que o SDK está a enviar
-    console.log('[DEBUG] Objeto Activity Trade bruto recebido:', JSON.stringify(trade, null, 2));
+    //console.log('[DEBUG] Objeto Activity Trade bruto recebido:', JSON.stringify(trade, null, 2));
 
     const rawAddress = trade.trader?.address; // ou trade.maker / trade.proxyWallet
     if (!rawAddress) {
@@ -958,15 +1109,22 @@ export class SmartMoneyService {
     const sideFilter = options.sideFilter;
     const delay = options.delay ?? 0;
     const dryRun = options.dryRun ?? false;
+    const isCanTrade = options.isCanTrade ?? false;
 
     // Subscribe
     const subscription = this.subscribeSmartMoneyTrades(
       async (trade: SmartMoneyTrade) => {
         stats.tradesDetected++;
-        console.log('EVENTO BRUTO RECEBIDO:', trade)
+        //console.log('EVENTO BRUTO RECEBIDO:', trade)
         try {
           // Check target
           if (!targetAddresses.includes(trade.traderAddress.toLowerCase())) {
+            return;
+          }
+
+          if (options.isCanTrade && !options.isCanTrade()) {
+            stats.tradesSkipped++;
+            console.warn(`[SmartMoneyService] ⚠️ Sinal ignorado: canTrade() retornou falso.`);
             return;
           }
 
@@ -1664,6 +1822,10 @@ export class SmartMoneyService {
     };
   }
 
+  async getMarketBySlug(slug: string): Promise<GammaMarket | null> {
+    return await this.gammaApiClient.getMarketBySlug(slug);
+  }
+
   /**
    * Build markdown text report from data
    */
@@ -2281,4 +2443,6 @@ export class SmartMoneyService {
     this.smartMoneyCache.clear();
     this.smartMoneySet.clear();
   }
+
+
 }

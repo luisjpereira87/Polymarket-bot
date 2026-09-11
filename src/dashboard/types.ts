@@ -170,7 +170,8 @@ export type LogLevel =
   | 'SWAP'
   | 'BRIDGE'
   | 'KLINE'
-  | 'TREND';
+  | 'TREND'
+  | 'RISK';
 
 export interface LogEntry {
   id: string;
@@ -189,4 +190,14 @@ export interface DashboardData {
 export interface WebSocketMessage {
   type: 'state' | 'log' | 'config' | 'full';
   payload: unknown;
+}
+
+export interface TradePositions {
+  marketSlug: string;
+  outcome?: string;
+  side: 'BUY' | 'SELL';
+  size: number;
+  avgEntryPrice: number;
+  timestamp: number;
+  traderAddress?: string;
 }

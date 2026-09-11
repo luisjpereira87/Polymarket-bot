@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import type { LogEntry, LogLevel } from '../types';
 
 interface ActivityLogProps {
@@ -18,6 +18,7 @@ const LOG_ICONS: Record<LogLevel, string> = {
   BRIDGE: '🌉',
   KLINE: '📊',
   TREND: '📈',
+  RISK: '🛡️'
 };
 
 const LOG_STYLES: Record<LogLevel, { text: string; bg: string; border: string }> = {
@@ -33,6 +34,7 @@ const LOG_STYLES: Record<LogLevel, { text: string; bg: string; border: string }>
   BRIDGE: { text: 'text-indigo-400', bg: 'bg-indigo-500/10', border: 'border-indigo-500/20' },
   KLINE: { text: 'text-teal-400', bg: 'bg-teal-500/10', border: 'border-teal-500/20' },
   TREND: { text: 'text-emerald-400', bg: 'bg-emerald-500/10', border: 'border-emerald-500/20' },
+  RISK: { text: 'text-amber-400', bg: 'bg-amber-500/10', border: 'border-amber-500/20' }
 };
 
 const FILTER_OPTIONS: (LogLevel | 'ALL')[] = [
@@ -83,11 +85,10 @@ export function ActivityLog({ logs }: ActivityLogProps) {
             <button
               key={opt}
               onClick={() => setFilter(opt)}
-              className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
-                filter === opt
+              className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${filter === opt
                   ? 'bg-gradient-to-r from-poly-purple to-poly-blue text-white shadow-glow-purple'
                   : 'bg-poly-dark text-gray-400 hover:bg-poly-border hover:text-white'
-              }`}
+                }`}
             >
               {opt}
             </button>

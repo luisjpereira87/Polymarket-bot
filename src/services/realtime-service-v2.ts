@@ -15,7 +15,7 @@
 
 import { EventEmitter } from 'events';
 import { createModuleLogger } from '../core/logger.js';
-import type { BookUpdate, Orderbook, PriceUpdate } from '../core/types.js';
+import type { BookUpdate, Orderbook, PriceUpdate, TradePositions } from '../core/types.js';
 import {
   ConnectionStatus,
   RealTimeDataClient,
@@ -1077,6 +1077,7 @@ export class RealtimeServiceV2 extends EventEmitter {
 
   private pollingInterval: NodeJS.Timeout | null = null;
   private processedHashes = new Set<string>();
+  private pricePollingInterval: NodeJS.Timeout | null = null;
 
   /**
    * Override do subscribeAllActivity para usar Polling REST da Data API
@@ -1173,6 +1174,94 @@ export class RealtimeServiceV2 extends EventEmitter {
           clearInterval(this.pollingInterval);
           this.pollingInterval = null;
           console.log('[RealtimeServiceV2] 🛑 Polling REST parado.');
+        }
+      },
+    };
+  }
+
+  subscribePositionPricePolling(realPositions: Map<string, TradePositions>, handlers: { onPriceUpdate?: (posKey: string, currentPrice: number, pnlPercent: number) => void } = {}): Subscription {
+    console.log('[RealtimeServiceV2] 🔄 A iniciar polling REST para monitorização de PnL das posições...');
+
+    if (this.pricePollingInterval) {
+      clearInterval(this.pricePollingInterval);
+    }
+
+    this.pricePollingInterval = setInterval(async () => {
+      console.log(`[DEBUG_POLL] Posições no mapa: ${realPositions.size}`, Array.from(realPositions.keys()));
+      if (realPositions.size === 0) return;
+
+      // Extrair apenas os marketSlugs únicos para a query da Gamma API
+      const activeMarketSlugs = Array.from(new Set(
+        Array.from(realPositions.values()).map(pos => pos.marketSlug)
+      ));
+
+      const chunkSize = 25; // Lotes seguros para a Gamma API
+
+      for (let i = 0; i < activeMarketSlugs.length; i += chunkSize) {
+        const chunk = activeMarketSlugs.slice(i, i + chunkSize);
+        const queryParams = chunk.map(slug => `slug=${slug}`).join('&');
+
+        try {
+          const url = `https://gamma-api.polymarket.com/markets?${queryParams}`;
+          const response = await fetch(url);
+          if (!response.ok) continue;
+
+          const markets = await response.json();
+          if (!Array.isArray(markets)) continue;
+
+          for (const market of markets) {
+            const slug = market.slug;
+            if (!slug) continue;
+
+            // Correlacionar o mercado retornado com todas as posições ativas que partilham este marketSlug
+            for (const [posKey, position] of realPositions.entries()) {
+              if (position.marketSlug !== slug) continue;
+
+              // 🛡️ Extração rigorosa do preço do outcome específico
+              let currentPrice: number | null = null;
+
+              if (market.outcomePrices && Array.isArray(market.outcomePrices) && market.outcomes && Array.isArray(market.outcomes)) {
+                // Tenta encontrar o índice exato do outcome (ex: "Leonardo Rossi")
+                const outcomeIndex = market.outcomes.findIndex((o: string) => o.toLowerCase() === position.outcome?.toLowerCase());
+                if (outcomeIndex !== -1 && market.outcomePrices[outcomeIndex] !== undefined) {
+                  currentPrice = Number(market.outcomePrices[outcomeIndex]);
+                }
+              }
+
+              // Fallback se não encontrar o outcome pelo nome exato
+              if (currentPrice === null || isNaN(currentPrice)) {
+                const fallbackStr = market.lastTradePrice ?? market.outcomePrices?.[0];
+                currentPrice = fallbackStr !== undefined ? Number(fallbackStr) : NaN;
+              }
+
+              if (isNaN(currentPrice)) continue;
+
+              // Calcular PnL percentual
+              const diff = currentPrice - position.avgEntryPrice;
+              const pnlPercent = (diff / position.avgEntryPrice) * 100;
+
+              // Disparar handler passando a chave exata da posição (`posKey`)
+              handlers.onPriceUpdate?.(posKey, currentPrice, pnlPercent);
+            }
+          }
+        } catch (error) {
+          console.error('[RealtimeServiceV2] Erro no polling REST de preços:', error);
+        }
+
+        // Pequena pausa entre lotes para evitar rate limits
+        await new Promise(r => setTimeout(r, 100));
+      }
+    }, 15000); // Roda a cada 15 segundos
+
+    return {
+      id: `rtds_price_polling_${Date.now()}`,
+      topic: 'positions-price',
+      type: '*',
+      unsubscribe: () => {
+        if (this.pricePollingInterval) {
+          clearInterval(this.pricePollingInterval);
+          this.pricePollingInterval = null;
+          console.log('[RealtimeServiceV2] 🛑 Polling REST de preços parado.');
         }
       },
     };

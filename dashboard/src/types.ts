@@ -139,7 +139,8 @@ export type LogLevel =
   | 'SWAP'
   | 'BRIDGE'
   | 'KLINE'
-  | 'TREND';
+  | 'TREND'
+  | 'RISK';
 
 export interface LogEntry {
   id: string;

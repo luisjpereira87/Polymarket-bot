@@ -9,120 +9,74 @@
  */
 
 // Core infrastructure
-export { RateLimiter, ApiType } from './core/rate-limiter.js';
 export { Cache, CACHE_TTL } from './core/cache.js';
-export { PolymarketError, ErrorCode, withRetry } from './core/errors.js';
+export { ErrorCode, PolymarketError, withRetry } from './core/errors.js';
+export { ApiType, RateLimiter } from './core/rate-limiter.js';
 export * from './core/types.js';
 
 // Cache integration (new)
-export type { UnifiedCache } from './core/unified-cache.js';
 export { createUnifiedCache } from './core/unified-cache.js';
+export type { UnifiedCache } from './core/unified-cache.js';
 
 // API Clients
 export { DataApiClient } from './clients/data-api.js';
 export type {
-  Position,
-  Activity,
-  Trade,
-  LeaderboardEntry,
-  LeaderboardResult,
-  // Leaderboard parameters (supports time period filtering)
-  LeaderboardParams,
-  LeaderboardTimePeriod,
-  LeaderboardOrderBy,
-  LeaderboardCategory,
+  AccountValue, Activity,
   // P0/P1/P2 Gap Analysis types
   ActivityParams,
-  PositionsParams,
-  TradesParams,
-  HoldersParams,
-  AccountValue,
-  MarketHolder,
   // Closed positions
   ClosedPosition,
-  ClosedPositionsParams,
+  ClosedPositionsParams, HoldersParams, LeaderboardCategory, LeaderboardEntry, LeaderboardOrderBy,
+  // Leaderboard parameters (supports time period filtering)
+  LeaderboardParams, LeaderboardResult, LeaderboardTimePeriod, MarketHolder, Position, PositionsParams, Trade, TradesParams
 } from './clients/data-api.js';
 
 export { GammaApiClient } from './clients/gamma-api.js';
 export type {
-  GammaMarket,
-  GammaEvent,
-  MarketSearchParams,
+  GammaEvent, GammaMarket, MarketSearchParams
 } from './clients/gamma-api.js';
 
 // ClobApiClient has been removed - use TradingService instead
 // TradingService provides getMarket(), getProcessedOrderbook(), etc.
 
 // Subgraph Client (on-chain data via Goldsky)
-export { SubgraphClient, SUBGRAPH_ENDPOINTS } from './clients/subgraph.js';
+export { SUBGRAPH_ENDPOINTS, SubgraphClient } from './clients/subgraph.js';
 export type {
-  SubgraphName,
+  Condition, GlobalOpenInterest, MarketData,
+  // OI Subgraph
+  MarketOpenInterest, Merge, NetUserBalance,
+  // Orderbook Subgraph
+  OrderFilledEvent, Redemption,
+  // Activity Subgraph
+  Split, SubgraphName,
   SubgraphQueryParams,
   // Positions Subgraph
   UserBalance,
-  NetUserBalance,
   // PnL Subgraph
-  UserPosition,
-  Condition,
-  // Activity Subgraph
-  Split,
-  Merge,
-  Redemption,
-  // OI Subgraph
-  MarketOpenInterest,
-  GlobalOpenInterest,
-  // Orderbook Subgraph
-  OrderFilledEvent,
-  MarketData,
+  UserPosition
 } from './clients/subgraph.js';
 
 // Services
 export { WalletService } from './services/wallet-service.js';
 export type {
-  WalletProfile,
-  WalletActivityOptions,
-  WalletActivitySummary,
-  SellActivityResult,
-  // Time-based leaderboard types
-  TimePeriod,
   LeaderboardSortBy,
-  PeriodLeaderboardEntry,
-  PeriodLeaderboardResult,
-  WalletPeriodStats,
   // PnL calculation types
-  ParsedTrade,
-  TokenPosition,
-  UserPeriodStats,
+  ParsedTrade, PeriodLeaderboardEntry,
+  PeriodLeaderboardResult, SellActivityResult,
+  // Time-based leaderboard types
+  TimePeriod, TokenPosition,
+  UserPeriodStats, WalletActivityOptions,
+  WalletActivitySummary, WalletPeriodStats, WalletProfile
 } from './services/wallet-service.js';
 
-export { MarketService, getIntervalMs as getIntervalMsService } from './services/market-service.js';
+export { getIntervalMs as getIntervalMsService, MarketService } from './services/market-service.js';
 export type { ResolvedMarketTokens } from './services/market-service.js';
 
 // Real-time (V2 - using official @polymarket/real-time-data-client)
 export { RealtimeServiceV2 } from './services/realtime-service-v2.js';
 export type {
-  RealtimeServiceConfig,
-  OrderbookSnapshot,
-  LastTradeInfo,
-  PriceChange,
-  TickSizeChange,
-  MarketEvent,
-  UserOrder,
-  UserTrade,
-  ActivityTrade,
-  CryptoPrice,
-  EquityPrice,
-  Comment,
-  Reaction,
-  RFQRequest,
-  RFQQuote,
-  Subscription,
-  MarketSubscription,
-  MarketDataHandlers,
-  UserDataHandlers,
-  ActivityHandlers,
-  CryptoPriceHandlers,
-  EquityPriceHandlers,
+  ActivityHandlers, ActivityTrade, Comment, CryptoPrice, CryptoPriceHandlers, EquityPrice, EquityPriceHandlers, LastTradeInfo, MarketDataHandlers, MarketEvent, MarketSubscription, OrderbookSnapshot, PriceChange, Reaction, RealtimeServiceConfig, RFQQuote, RFQRequest, Subscription, TickSizeChange, UserDataHandlers, UserOrder,
+  UserTrade
 } from './services/realtime-service-v2.js';
 
 // RealtimeService (legacy) has been removed - use RealtimeServiceV2 instead
@@ -130,140 +84,75 @@ export type {
 // ArbitrageService (Real-time arbitrage detection, execution, rebalancing, and settlement)
 export { ArbitrageService } from './services/arbitrage-service.js';
 export type {
-  ArbitrageMarketConfig,
-  ArbitrageServiceConfig,
-  ArbitrageOpportunity as ArbitrageServiceOpportunity,
-  ArbitrageExecutionResult,
-  ArbitrageServiceEvents,
-  OrderbookState,
-  BalanceState,
+  ArbitrageExecutionResult, ArbitrageMarketConfig,
+  ArbitrageServiceConfig, ArbitrageServiceEvents, ArbitrageOpportunity as ArbitrageServiceOpportunity, BalanceState, ClearAction,
+  // Clear position types (smart settle)
+  ClearPositionResult, OrderbookState,
   // Rebalancer types
   RebalanceAction,
   RebalanceResult,
-  // Settle types
-  SettleResult,
-  // Clear position types (smart settle)
-  ClearPositionResult,
-  ClearAction,
   // Scanning types
   ScanCriteria,
   ScanResult,
+  // Settle types
+  SettleResult
 } from './services/arbitrage-service.js';
 
 // SmartMoneyService - Smart Money detection and Copy Trading
 export {
-  SmartMoneyService,
   categorizeMarket,
-  CATEGORY_KEYWORDS,
+  CATEGORY_KEYWORDS, SmartMoneyService
 } from './services/smart-money-service.js';
 export type {
-  SmartMoneyWallet,
-  SmartMoneyTrade,
   AutoCopyTradingOptions,
   AutoCopyTradingStats,
-  AutoCopyTradingSubscription,
-  SmartMoneyServiceConfig,
-  // Leaderboard & Report types
-  LeaderboardOptions,
-  SmartMoneyLeaderboardEntry,
-  SmartMoneyLeaderboardResult,
-  PeriodRanking,
-  WalletReport,
-  WalletComparison,
-  // Report types (02-smart-money)
-  MarketCategory,
-  DailySummary,
-  CategoryStats,
-  TradeRecord,
-  PositionSummary,
-  ClosedMarketSummary,
-  DailyWalletReport,
+  AutoCopyTradingSubscription, BarChartData, BarItem, CategoryStats, ChartMetadata, ClosedMarketSummary, CurrentPositionsSummary, DailySummary, DailyWalletReport,
   DataRange,
-  PerformanceMetrics,
-  MarketStats,
-  TradingPatterns,
-  CurrentPositionsSummary,
-  WalletLifecycleReport,
-  PieSlice,
-  PieChartData,
-  BarItem,
-  BarChartData,
-  MonthlyPnLItem,
-  MonthlyPnLData,
-  ChartMetadata,
-  WalletChartData,
-  ReportProgressCallback,
-  LifecycleReportOptions,
-  TextReport,
+  // Leaderboard & Report types
+  LeaderboardOptions, LifecycleReportOptions,
+  // Report types (02-smart-money)
+  MarketCategory, MarketStats, MonthlyPnLData, MonthlyPnLItem, PerformanceMetrics, PeriodRanking, PieChartData, PieSlice, PositionSummary, ReportProgressCallback, SmartMoneyLeaderboardEntry,
+  SmartMoneyLeaderboardResult, SmartMoneyServiceConfig, SmartMoneyTrade, SmartMoneyWallet, TextReport, TradeRecord, TradingPatterns, WalletChartData, WalletComparison, WalletLifecycleReport, WalletReport
 } from './services/smart-money-service.js';
 
 // DipArbService - Dip Arbitrage for 15m/5m UP/DOWN markets
 export { DipArbService } from './services/dip-arb-service.js';
 export type {
-  DipArbServiceConfig,
-  DipArbMarketConfig,
-  DipArbRoundState,
-  DipArbStats,
-  DipArbSignal,
-  DipArbLeg1Signal,
-  DipArbLeg2Signal,
-  DipArbExecutionResult,
-  DipArbRoundResult,
-  DipArbNewRoundEvent,
-  DipArbPriceUpdateEvent,
-  DipArbScanOptions,
-  DipArbFindAndStartOptions,
-  DipArbAutoRotateConfig,
-  DipArbSettleResult,
-  DipArbRotateEvent,
-  DipArbSide,
-  DipArbUnderlying,
-  DipArbPhase,
-  DipArbLegInfo,
+  DipArbAutoRotateConfig, DipArbExecutionResult, DipArbFindAndStartOptions, DipArbLeg1Signal,
+  DipArbLeg2Signal, DipArbLegInfo, DipArbMarketConfig, DipArbNewRoundEvent, DipArbPhase, DipArbPriceUpdateEvent, DipArbRotateEvent, DipArbRoundResult, DipArbRoundState, DipArbScanOptions, DipArbServiceConfig, DipArbSettleResult, DipArbSide, DipArbSignal, DipArbStats, DipArbUnderlying
 } from './services/dip-arb-types.js';
 
 // BinanceService - BTC/ETH/SOL K-line data from Binance
 export { BinanceService } from './services/binance-service.js';
 export type {
-  BinanceKLine,
-  BinanceSymbol,
-  BinanceInterval,
-  BinanceKLineOptions,
+  BinanceInterval, BinanceKLine, BinanceKLineOptions, BinanceSymbol
 } from './services/binance-service.js';
 
 // TradingService - Unified trading and market data
 export {
-  TradingService,
-  POLYGON_MAINNET,
-  POLYGON_AMOY,
-  // Polymarket order minimum requirements
-  MIN_ORDER_VALUE_USDC,
   MIN_ORDER_SIZE_SHARES,
+  // Polymarket order minimum requirements
+  MIN_ORDER_VALUE_USDC, POLYGON_AMOY, POLYGON_MAINNET, TradingService
 } from './services/trading-service.js';
 export type {
-  TradingServiceConfig,
   // Order types - Side and OrderType are re-exported from core/types.ts via trading-service.ts
   // They are also exported via `export * from './core/types.js'` above
   ApiCredentials,
   LimitOrderParams,
-  MarketOrderParams,
+  MarketOrderParams, MarketReward,
   // Results
   Order,
   OrderResult,
-  TradeInfo,
+  TradeInfo, TradingServiceConfig,
   // Rewards
-  UserEarning,
-  MarketReward,
+  UserEarning
 } from './services/trading-service.js';
 
 // Market types from MarketService
 // Note: Side and Orderbook are now in core/types.ts (exported via `export * from './core/types.js'` above)
 export type {
   Market,
-  MarketToken,
-  PricePoint,
-  PriceHistoryParams,
-  PriceHistoryIntervalString,
+  MarketToken, PriceHistoryIntervalString, PriceHistoryParams, PricePoint
 } from './services/market-service.js';
 
 // TradingClient (legacy) has been removed - use TradingService instead
@@ -273,76 +162,41 @@ export type {
 // NOTE: USDC_CONTRACT is USDC.e (bridged), required for Polymarket CTF
 // NATIVE_USDC_CONTRACT is native USDC, NOT compatible with CTF
 export {
-  CTFClient,
-  CTF_CONTRACT,
-  USDC_CONTRACT,           // USDC.e (0x2791...) - Required for CTF
-  NATIVE_USDC_CONTRACT,    // Native USDC (0x3c49...) - NOT for CTF
-  NEG_RISK_CTF_EXCHANGE,
-  NEG_RISK_ADAPTER,
-  USDC_DECIMALS,
-  calculateConditionId,
-  parseUsdc,
-  formatUsdc,
+  calculateConditionId, CTF_CONTRACT, CTFClient, formatUsdc, // USDC.e (0x2791...) - Required for CTF
+  NATIVE_USDC_CONTRACT, NEG_RISK_ADAPTER, // Native USDC (0x3c49...) - NOT for CTF
+  NEG_RISK_CTF_EXCHANGE, parseUsdc, RevertReason, USDC_CONTRACT, USDC_DECIMALS
 } from './clients/ctf-client.js';
 export type {
-  CTFConfig,
-  SplitResult,
-  MergeResult,
-  RedeemResult,
-  PositionBalance,
-  MarketResolution,
-  GasEstimate,
-  TransactionStatus,
-  TokenIds,
+  CTFConfig, GasEstimate, MarketResolution, MergeResult, PositionBalance, RedeemResult, SplitResult, TokenIds, TransactionStatus
 } from './clients/ctf-client.js';
-export { RevertReason } from './clients/ctf-client.js';
 
 // Bridge (Cross-chain Deposits)
 export {
-  BridgeClient,
-  SUPPORTED_CHAINS,
-  BRIDGE_TOKENS,
-  estimateBridgeOutput,
-  getExplorerUrl,
-  depositUsdc,
-  swapAndDeposit,
-  getSupportedDepositTokens,
+  BRIDGE_TOKENS, BridgeClient, depositUsdc, estimateBridgeOutput,
+  getExplorerUrl, getSupportedDepositTokens, SUPPORTED_CHAINS, swapAndDeposit
 } from './clients/bridge-client.js';
 export type {
-  BridgeSupportedAsset,
-  DepositAddress,
-  CreateDepositResponse,
-  DepositStatus,
-  BridgeConfig,
-  DepositResult,
-  DepositOptions,
-  SwapAndDepositOptions,
-  SwapAndDepositResult,
+  BridgeConfig, BridgeSupportedAsset, CreateDepositResponse, DepositAddress, DepositOptions, DepositResult, DepositStatus, SwapAndDepositOptions,
+  SwapAndDepositResult
 } from './clients/bridge-client.js';
 
 // Swap Service (DEX swaps on Polygon)
 export {
-  SwapService,
-  QUICKSWAP_ROUTER,
-  POLYGON_TOKENS,
-  TOKEN_DECIMALS,
+  POLYGON_TOKENS, QUICKSWAP_ROUTER, SwapService, TOKEN_DECIMALS
 } from './services/swap-service.js';
 export type {
   SupportedToken,
   SwapQuote,
   SwapResult,
   TokenBalance,
-  TransferResult,
+  TransferResult
 } from './services/swap-service.js';
 
 // Authorization (ERC20/ERC1155 Approvals)
 export { AuthorizationService } from './services/authorization-service.js';
 export type {
   AllowanceInfo,
-  AllowancesResult,
-  ApprovalTxResult,
-  ApprovalsResult,
-  AuthorizationServiceConfig,
+  AllowancesResult, ApprovalsResult, ApprovalTxResult, AuthorizationServiceConfig
 } from './services/authorization-service.js';
 
 // OnchainService (Unified on-chain operations: CTF + Authorization + Swaps)
@@ -350,26 +204,19 @@ export { OnchainService } from './services/onchain-service.js';
 export type {
   OnchainServiceConfig,
   ReadyStatus,
-  TokenBalances,
+  TokenBalances
 } from './services/onchain-service.js';
 
 // Price Utilities
 export {
-  roundPrice,
+  calculateBuyAmount, calculateMidpoint, calculatePnL, calculateSellPayout,
+  calculateSharesForAmount,
+  calculateSpread, checkArbitrage, formatPrice,
+  formatUSDC, getEffectivePrices,
+  ROUNDING_CONFIG, roundPrice,
   roundSize,
   validatePrice,
-  validateSize,
-  calculateBuyAmount,
-  calculateSellPayout,
-  calculateSharesForAmount,
-  calculateSpread,
-  calculateMidpoint,
-  formatPrice,
-  formatUSDC,
-  calculatePnL,
-  checkArbitrage,
-  getEffectivePrices,
-  ROUNDING_CONFIG,
+  validateSize
 } from './utils/price-utils.js';
 export type { TickSize } from './utils/price-utils.js';
 
@@ -378,22 +225,22 @@ export type { TickSize } from './utils/price-utils.js';
 
 // ===== Main SDK Class =====
 
-import { RateLimiter } from './core/rate-limiter.js';
 import { DataApiClient } from './clients/data-api.js';
 import { GammaApiClient } from './clients/gamma-api.js';
 import { SubgraphClient } from './clients/subgraph.js';
-import { WalletService } from './services/wallet-service.js';
-import { MarketService } from './services/market-service.js';
-import { TradingService } from './services/trading-service.js';
-import { RealtimeServiceV2 } from './services/realtime-service-v2.js';
-import { SmartMoneyService } from './services/smart-money-service.js';
+import { RateLimiter } from './core/rate-limiter.js';
+import type { ArbitrageOpportunity, PolySDKOptions, ProcessedOrderbook, UnifiedMarket } from './core/types.js';
+import { createUnifiedCache, type UnifiedCache } from './core/unified-cache.js';
 import { BinanceService } from './services/binance-service.js';
 import { DipArbService } from './services/dip-arb-service.js';
-import type { UnifiedMarket, ProcessedOrderbook, ArbitrageOpportunity, KLineInterval, KLineCandle, DualKLineData, PolySDKOptions } from './core/types.js';
-import { createUnifiedCache, type UnifiedCache } from './core/unified-cache.js';
+import { MarketService } from './services/market-service.js';
+import { RealtimeServiceV2 } from './services/realtime-service-v2.js';
+import { SmartMoneyService } from './services/smart-money-service.js';
+import { TradingService } from './services/trading-service.js';
+import { WalletService } from './services/wallet-service.js';
 
 // Re-export for backward compatibility
-export interface PolymarketSDKConfig extends PolySDKOptions {}
+export interface PolymarketSDKConfig extends PolySDKOptions { }
 
 export class PolymarketSDK {
   // Infrastructure
@@ -448,7 +295,9 @@ export class PolymarketSDK {
       this.realtime,
       this.tradingService,
       {},  // default config
+      this.gammaApi,
       this.dataApi  // pass dataApi for report generation
+
     );
 
     // Initialize DipArbService

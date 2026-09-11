@@ -589,3 +589,13 @@ export interface TokenUnderlyingCorrelation {
   /** Correlation coefficients (if calculated) */
   correlation?: TokenUnderlyingCorrelationCoefficients;
 }
+
+export interface TradePositions {
+  marketSlug: string;
+  outcome?: string;
+  side: 'BUY' | 'SELL';
+  size: number;
+  avgEntryPrice: number;
+  timestamp: number;
+  traderAddress?: string;
+}
