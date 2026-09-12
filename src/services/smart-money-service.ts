@@ -156,6 +156,7 @@ export interface AutoCopyTradingOptions {
   dryRun?: boolean;
 
   isCanTrade: () => boolean;
+  positions: () => Map<string, TradePositions>
 
   /** Callbacks */
   onTrade?: (trade: SmartMoneyTrade, result: OrderResult) => void;
@@ -887,15 +888,16 @@ export class SmartMoneyService {
     options: {
       takeProfitPercent?: number;
       stopLossPercent?: number;
+      maxTradeDurationMinutes?: number; // 1. Novo parâmetro para o timeout em minutos
       dryRun?: boolean;
       onPositionClosed?: (trade: SmartMoneyTrade, result: OrderResult, pnlPercent: number) => void;
       onPriceUpdate?: (posKey: string, currentPrice: number, pnlPercent: number) => void;
-      // 1. Adicionar o callback na assinatura das opções
       executeTradeHandler?: (trade: SmartMoneyTrade, result: OrderResult) => void;
     } = {}
   ): Promise<{ id: string; unsubscribe: () => void }> {
     const takeProfit = options.takeProfitPercent ?? 15.0;
     const stopLoss = options.stopLossPercent ?? -10.0;
+    const maxDurationMs = options.maxTradeDurationMinutes ? options.maxTradeDurationMinutes * 60 * 1000 : null;
     const dryRun = options.dryRun ?? false;
 
     const internalHandler = async (posKey: string, currentPrice: number, pnlPercent: number) => {
@@ -904,9 +906,19 @@ export class SmartMoneyService {
       const position = realPositions.get(posKey);
       if (!position) return;
 
-      if (pnlPercent >= takeProfit || pnlPercent <= stopLoss) {
-        const actionType = pnlPercent >= takeProfit ? '🎯 Take-Profit' : '🛑 Stop-Loss';
-        console.log(`💰 ${actionType} de ${pnlPercent.toFixed(1)}% atingido em ${posKey}! A fechar posição...`);
+      // 2. Verificar se o tempo limite foi atingido (se a opção estiver ativa)
+      const age = Date.now() - (position.timestamp || Date.now());
+      const isTimeout = maxDurationMs !== null && age >= maxDurationMs;
+
+      const marketInfo = await this.getMarketBySlug(position.marketSlug);
+      const isMarketClosed = marketInfo?.closed || currentPrice >= 0.99 || currentPrice <= 0.01;
+
+      if (pnlPercent >= takeProfit || isTimeout || isMarketClosed) {
+        let actionType = '🎯 Take-Profit';
+        if (pnlPercent <= stopLoss) actionType = '🛑 Stop-Loss';
+        if (isTimeout) actionType = '⏰ Timeout (Tempo Limite)';
+
+        console.log(`💰 ${actionType} de ${pnlPercent.toFixed(1)}% (Idade: ${(age / 60000).toFixed(1)}m) atingido em ${posKey}! A fechar posição...`);
 
         const exitShares = position.size;
         const exitValue = exitShares * currentPrice;
@@ -920,6 +932,7 @@ export class SmartMoneyService {
             shares: exitShares.toFixed(2),
             price: currentPrice.toFixed(3),
             pnlPercent: pnlPercent.toFixed(2) + '%',
+            reason: actionType,
           });
         } else {
           const tokenId = (position as any).tokenId;
@@ -949,7 +962,6 @@ export class SmartMoneyService {
             isSmartMoney: true
           };
 
-          // 2. Chamar o handler injetado em vez de chamar diretamente uma função global
           if (options.executeTradeHandler) {
             options.executeTradeHandler(exitTrade, result);
           } else {
@@ -986,7 +998,6 @@ export class SmartMoneyService {
       },
     };
   }
-
 
 
   private async handleActivityTrade(
@@ -1110,6 +1121,7 @@ export class SmartMoneyService {
     const delay = options.delay ?? 0;
     const dryRun = options.dryRun ?? false;
     const isCanTrade = options.isCanTrade ?? false;
+    const getPositions = options.positions;
 
     // Subscribe
     const subscription = this.subscribeSmartMoneyTrades(
@@ -1122,7 +1134,7 @@ export class SmartMoneyService {
             return;
           }
 
-          if (options.isCanTrade && !options.isCanTrade()) {
+          if (options.isCanTrade && !options.isCanTrade() && trade.side === 'BUY') {
             stats.tradesSkipped++;
             console.warn(`[SmartMoneyService] ⚠️ Sinal ignorado: canTrade() retornou falso.`);
             return;
@@ -1140,6 +1152,38 @@ export class SmartMoneyService {
             return;
           }
 
+          // 🛑 Filtro Anti-Duplicação: Verifica se já existe uma posição aberta para este ativo
+          if (trade.side === 'BUY') {
+            const marketSlug = trade.marketSlug || (trade as any).market;
+            const outcomeSuffix = trade.outcome ? `-${trade.outcome}` : '';
+            const posKey = `${marketSlug}${outcomeSuffix}`;
+
+            const currentPositions = getPositions();
+            if (currentPositions && currentPositions.has(posKey)) {
+              stats.tradesSkipped++;
+              console.log(`[SmartMoneyService] ⚠️ Sinal ignorado (Anti-Duplicação): Já tens posição em ${posKey}`);
+              return;
+            }
+          }
+
+          // 1. Calcular o tamanho proporcional com base no sizeScale
+          let copySize = trade.size * sizeScale;
+          let copyValue = copySize * trade.price;
+
+          // 2. Aplicar estritamente o teto máximo por trade
+          if (copyValue > maxSizePerTrade) {
+            copyValue = maxSizePerTrade;
+            copySize = copyValue / trade.price;
+          }
+
+          // 3. Validar mínimos e filtros de tamanho
+          const MIN_ORDER_SIZE = 1;
+          if (copyValue < MIN_ORDER_SIZE || copyValue < minTradeSize) {
+            stats.tradesSkipped++;
+            return;
+          }
+
+          /** 
           // Calculate size
           let copySize = trade.size * sizeScale;
           let copyValue = copySize * trade.price;
@@ -1156,7 +1200,7 @@ export class SmartMoneyService {
             stats.tradesSkipped++;
             return;
           }
-
+          **/
           // Delay
           if (delay > 0) {
             await new Promise(resolve => setTimeout(resolve, delay));

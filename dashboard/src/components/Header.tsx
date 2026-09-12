@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { BotState, BotConfig } from '../types';
+import type { BotConfig, BotState } from '../types';
 import { NetworkStatus } from './NetworkStatus';
 
 interface HeaderProps {
@@ -39,6 +39,7 @@ export function Header({ state, config, connected, onHistoryClick, onPositionsCl
   }, [state?.startTime]);
 
   const isPaused = state?.isPaused ?? false;
+  const positions = state?.positions ?? []
   const isDryRun = config?.dryRun ?? true;
 
   // Mock wallet address (in real app, this would come from config/state)
@@ -86,7 +87,13 @@ export function Header({ state, config, connected, onHistoryClick, onPositionsCl
                 ? isPaused ? 'bg-yellow-400' : 'bg-green-400 animate-pulse'
                 : 'bg-red-400'
                 }`} />
-              {connected ? (isPaused ? 'PAUSED' : 'RUNNING') : 'OFFLINE'}
+              {connected
+                ? isPaused
+                  ? positions.length > 0
+                    ? `MANAGING (${positions.length})`
+                    : 'PAUSED'
+                  : 'RUNNING'
+                : 'OFFLINE'}
             </span>
 
             <span className={`badge ${isDryRun ? 'badge-blue' : 'badge-green'}`}>
@@ -124,8 +131,8 @@ export function Header({ state, config, connected, onHistoryClick, onPositionsCl
           <button
             onClick={onToggleDryRun}
             className={`btn text-sm ${isDryRun
-                ? 'bg-green-500/10 border-green-500/30 hover:bg-green-500/20 text-green-300'
-                : 'bg-red-500/10 border-red-500/30 hover:bg-red-500/20 text-red-300'
+              ? 'bg-green-500/10 border-green-500/30 hover:bg-green-500/20 text-green-300'
+              : 'bg-red-500/10 border-red-500/30 hover:bg-red-500/20 text-red-300'
               }`}
           >
             <span>{isDryRun ? '💰' : '🧪'}</span>

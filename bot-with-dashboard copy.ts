@@ -10,17 +10,16 @@
 
 import 'dotenv/config';
 import { ethers } from 'ethers';
+import { CTFClient } from './src/clients/ctf-client.js';
+import { dashboardEmitter, startDashboard } from './src/dashboard/index.js';
+import type { BotConfig, BotState, DipArbSignal, LogLevel, SmartMoneySignal } from './src/dashboard/types.js';
 import {
-  PolymarketSDK,
   ArbitrageService,
+  OnchainService,
+  PolymarketSDK,
   SwapService,
   type SmartMoneyTrade,
-  OnchainService,
 } from './src/index.js';
-import { CTFClient } from './src/clients/ctf-client.js';
-import { startDashboard, dashboardEmitter } from './src/dashboard/index.js';
-import type { BotState, BotConfig, LogLevel, DipArbSignal, SmartMoneySignal } from './src/dashboard/types.js';
-import { addSession, createSessionFromState, type TradeRecord } from './src/dashboard/session-history.js';
 
 // ============================================================================
 // CONFIGURATION (same as bot-config.ts)
@@ -232,7 +231,7 @@ function updateDashboard() {
 }
 
 // 🔴 FIXED: v3.1 Multi-layer risk management
-function canTrade(): boolean {
+function canTrade__(): boolean {
   // Check if permanently halted
   if (state.permanentlyHalted) {
     log('ERROR', '🛑 Trading permanently halted - total loss limit reached');
@@ -306,6 +305,94 @@ function canTrade(): boolean {
     log('ERROR', '💀 TOTAL LOSS LIMIT REACHED - TRADING PERMANENTLY HALTED');
     log('ERROR', `Total loss: -$${Math.abs(state.totalPnL).toFixed(2)} (limit: $${totalLossLimit.toFixed(2)})`);
     updateDashboard();
+    return false;
+  }
+
+  return true;
+}
+
+function canTrade(): boolean {
+  // 1. Check if permanently halted
+  if (state.permanentlyHalted) {
+    log('ERROR', '🛑 Trading permanently halted - total loss limit reached');
+    return false;
+  }
+
+  // 2. Reset daily PnL if new day
+  const daysSinceReset = (Date.now() - state.lastDailyReset) / (1000 * 60 * 60 * 24);
+  if (daysSinceReset >= 1) {
+    log('INFO', `Daily PnL reset. Previous day: $${state.dailyPnL.toFixed(2)}`);
+    state.dailyPnL = 0;
+    state.lastDailyReset = Date.now();
+    if (state.isPaused) {
+      state.isPaused = false;
+      state.pauseUntil = 0;
+    }
+  }
+
+  // 3. Reset monthly PnL if new month
+  const daysSinceMonthStart = (Date.now() - state.monthStartTime) / (1000 * 60 * 60 * 24);
+  if (daysSinceMonthStart >= 30) {
+    log('INFO', `Monthly PnL reset. Previous month: $${state.monthlyPnL.toFixed(2)}`);
+    state.monthlyPnL = 0;
+    state.monthStartTime = Date.now();
+  }
+
+  // 4. Update current capital and drawdown
+  state.currentCapital = CONFIG.capital.totalUsd + state.totalPnL;
+  if (state.currentCapital > state.peakCapital) {
+    state.peakCapital = state.currentCapital;
+  }
+  state.currentDrawdown = (state.peakCapital - state.currentCapital) / state.peakCapital;
+
+  // 5. Check hard limits (Total, Monthly, Drawdown - estes mantêm a pausa)
+  const totalLossLimit = CONFIG.capital.totalUsd * CONFIG.risk.totalMaxLossPct;
+  if (state.totalPnL <= -totalLossLimit) {
+    state.permanentlyHalted = true;
+    log('ERROR', '💀 TOTAL LOSS LIMIT REACHED - TRADING PERMANENTLY HALTED');
+    return false;
+  }
+
+  const monthlyLossLimit = CONFIG.capital.totalUsd * CONFIG.risk.monthlyMaxLossPct;
+  if (state.monthlyPnL <= -monthlyLossLimit) {
+    log('ERROR', `🛑 Monthly loss limit breached: -$${Math.abs(state.monthlyPnL).toFixed(2)}`);
+    state.isPaused = true;
+    return false;
+  }
+
+  if (state.currentDrawdown >= CONFIG.risk.maxDrawdownFromPeak) {
+    log('ERROR', `🛑 Maximum drawdown reached: ${(state.currentDrawdown * 100).toFixed(1)}%`);
+    state.isPaused = true;
+    return false;
+  }
+
+  // 6. Daily loss limit with Dynamic Auto-Recovery
+  const dailyLossLimit = CONFIG.capital.totalUsd * CONFIG.risk.dailyMaxLossPct;
+
+  if (state.dailyPnL <= -dailyLossLimit) {
+    // Se bateu o limite e ainda não estava pausado por isto
+    if (!state.isPaused) {
+      state.isPaused = true;
+      state.pauseUntil = Date.now() + CONFIG.risk.pauseOnBreachMinutes * 60 * 1000;
+      log('WARN', `Daily loss limit breached: -$${Math.abs(state.dailyPnL).toFixed(2)} (limit: $${dailyLossLimit.toFixed(2)})`);
+      updateDashboard();
+    }
+    // Enquanto o tempo de pausa não expirar OU o PnL continuar abaixo do limite, bloqueia
+    if (Date.now() < state.pauseUntil) {
+      return false;
+    }
+  }
+
+  // Se o PnL diário já subiu acima do limite (mesmo antes do tempo expirar), limpa a pausa e deixa negociar!
+  if (state.isPaused && state.dailyPnL > -dailyLossLimit) {
+    state.isPaused = false;
+    state.pauseUntil = 0;
+    log('INFO', '✅ PnL diário recuperado com fechos lucrativos. Bot retomou novas entradas.');
+    updateDashboard();
+  }
+
+  // Se houver outra pausa ativa geral
+  if (state.isPaused && Date.now() < state.pauseUntil) {
     return false;
   }
 

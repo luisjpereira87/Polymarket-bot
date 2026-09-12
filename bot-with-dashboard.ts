@@ -10,13 +10,14 @@
 import 'dotenv/config';
 import { ethers } from 'ethers';
 import { dashboardEmitter, startDashboard } from './src/dashboard/index.js';
-import type { BotConfig, BotState, DipArbSignal, LogLevel, SmartMoneySignal, TradePositions } from './src/dashboard/types.js';
+import type { BotConfig, BotState, DipArbSignal, LogLevel, SmartMoneySignal } from './src/dashboard/types.js';
 import {
   ArbitrageService,
   OnchainService,
   OrderResult,
   PolymarketSDK,
   SwapService,
+  TradePositions,
   type SmartMoneyTrade,
 } from './src/index.js';
 
@@ -26,7 +27,7 @@ import {
 
 let CONFIG = {
   capital: {
-    totalUsd: parseFloat(process.env.CAPITAL_USD || '250'),
+    totalUsd: parseFloat(process.env.CAPITAL_USD || '10'),
     maxPerTradePct: 0.02,
     maxPerMarketPct: 0.10,
     maxTotalExposurePct: 0.30,
@@ -72,8 +73,8 @@ let CONFIG = {
     maxSingleTradeExposure: 0.3,
     checkLastNTrades: 10,
 
-    sizeScale: 0.1,
-    maxSizePerTrade: 15,
+    sizeScale: 0.02,
+    maxSizePerTrade: 1.5,
 
     maxSlippage: 0.05,         // Subido de 0.03 para 0.05 (Evita rejeitar trades por ligeira variação de preço)
     minTradeSize: 1.0,         // 🚨 CRÍTICO: Baixado de 10 para 1.0 (Não descarta ordens pequenas!)
@@ -682,8 +683,23 @@ function processTradeExecution(trade: SmartMoneyTrade, result: OrderResult) {
     }
   }
 
+  /** 
   const execShares = trade.size * (CONFIG.smartMoney.sizeScale || 0.25);
   const tradeCost = execShares * execPrice;
+  **/
+
+  const sizeScale = CONFIG.smartMoney.sizeScale || 0.1;
+  const maxSizePerTrade = CONFIG.smartMoney.maxSizePerTrade || 3.0; // Põe o teu teto máximo (ex: 3 ou o valor do config)
+
+  let copySize = trade.size * sizeScale;
+  let tradeCost = copySize * trade.price;
+
+  if (tradeCost > maxSizePerTrade) {
+    tradeCost = maxSizePerTrade;
+    copySize = tradeCost / execPrice;
+  }
+
+  const execShares = copySize;
 
   // 3. Gestão de Posições e Balanços
   if (isDryRun) {
@@ -795,6 +811,7 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
       minTradeSize: CONFIG.smartMoney.minTradeSize || 10,
       delay: CONFIG.smartMoney.delay || 0,
       isCanTrade: () => canTrade(),
+      positions: () => realPositions,
       dryRun: isDryRun, // 👈 O SDK simula se for true, executa ordens reais se for false
       onTrade: async (trade, result) => {
         try {
@@ -827,36 +844,12 @@ async function setupPriceMonitor(sdk: PolymarketSDK) {
   sdk.smartMoney.subscribePositionPricesWithExecution(realPositions, {
     takeProfitPercent: TAKE_PROFIT_PCT,
     stopLossPercent: STOP_LOSS_PCT,
+    maxTradeDurationMinutes: 24 * 60,
     dryRun: true,
     executeTradeHandler: (trade, result) => {
       processTradeExecution(trade, result);
     }
   });
-
-  /** 
-  sdk.smartMoney.subscribePositionPrices(realPositions, (slug, currentPrice, pnlPercent) => {
-    const pos = realPositions.get(slug);
-    if (!pos) return;
-
-    const unrealizedUsd = (currentPrice - pos.avgEntryPrice) * pos.size;
-    const status = pnlPercent >= 0 ? '📈 A SUBIR' : '📉 A DESCER';
-
-    log('INFO', `[${slug}] ${status} | Entrada: $${pos.avgEntryPrice.toFixed(3)} | Atual: $${currentPrice.toFixed(3)} | PnL: ${pnlPercent.toFixed(1)}% ($${unrealizedUsd.toFixed(2)})`);
-
-    const TAKE_PROFIT_PCT = CONFIG.risk?.takeProfitPercent || 15;
-    const STOP_LOSS_PCT = CONFIG.risk?.stopLossPercent || 10;
-
-    if (pnlPercent >= TAKE_PROFIT_PCT) {
-      log('TRADE', `🎯 Take-profit de ${pnlPercent.toFixed(1)}% atingido em ${slug}! A fechar posição...`);
-      // TODO: Executar ordem de saída no SDK
-    } else if (pnlPercent <= -STOP_LOSS_PCT) {
-      log('TRADE', `🛑 Stop-loss de ${pnlPercent.toFixed(1)}% atingido em ${slug}! A cortar perdas...`);
-      // TODO: Executar ordem de saída no SDK
-    }
-
-    updateDashboard();
-  });
-  **/
   log('INFO', '✅ Motor de monitorização de preços integrado e ativo.');
 }
 
@@ -1170,7 +1163,8 @@ let swapService: SwapService | null = null;
 
 async function updateBalances() {
   if (CONFIG.dryRun) {
-    state.usdcEBalance = 250 + state.totalPnL;
+    const totalUsdc = CONFIG.capital.totalUsd || 250
+    state.usdcEBalance = totalUsdc + state.totalPnL;
     state.maticBalance = 100;
     updateDashboard();
     return;
@@ -1365,7 +1359,7 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
   setTimeout(checkTrendTrades, 10000);
 }
 
-async function setupPortfolioManager(sdk: PolymarketSDK) {
+async function setupPortfolioManager__(sdk: PolymarketSDK) {
   log('INFO', 'Iniciando Gestor de Portfólio...');
 
   try {
@@ -1419,6 +1413,109 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
         } catch (e) { }
         return pos;
       }));
+
+      let unrealized = 0;
+      for (const p of enrichedPositions) {
+        const entry = Number(p.avgPrice) || 0;
+        const current = Number(p.curPrice) || Number(p.msg_price) || 0;
+        const size = Number(p.size) || 0;
+
+        if (current > 0 && size > 0) {
+          unrealized += (current - entry) * size;
+        }
+      }
+      state.unrealizedPnL = unrealized;
+      state.positions = enrichedPositions;
+      updateDashboard();
+    } catch (err: any) {
+      log('WARN', `Erro de sincronização de posições: ${err.message}`);
+    }
+  }, 30 * 1000);
+}
+
+async function setupPortfolioManager(sdk: PolymarketSDK) {
+  log('INFO', 'Iniciando Gestor de Portfólio...');
+
+  try {
+    const positions = await sdk.wallets.getWalletPositions(sdk.tradingService.getAddress());
+    state.positions = positions;
+
+    realPositions.clear();
+
+    for (const p of positions) {
+      const size = Number(p.size) || 0;
+      const avgPrice = Number(p.avgPrice) || 0;
+      const marketSlug = p.slug || p.eventSlug;
+      const outcome = p.outcome;
+      const outcomeSuffix = outcome ? `-${outcome}` : '';
+      const posKey = `${marketSlug}${outcomeSuffix}`;
+
+      if (size > 0 && marketSlug) {
+        realPositions.set(posKey, {
+          marketSlug: marketSlug,
+          outcome: outcome,
+          side: 'BUY',
+          size: size,
+          avgEntryPrice: avgPrice,
+          timestamp: Date.now(),
+          traderAddress: p.proxyWallet || sdk.tradingService.getAddress()
+        });
+      }
+    }
+
+    log('WALLET', `Sincronizadas ${positions.length} posições existentes.`);
+    updateDashboard();
+  } catch (err: any) {
+    log('WARN', `Sincronização de Portfólio falhou: ${err.message}`);
+  }
+
+  setInterval(async () => {
+    try {
+      const positions = await sdk.wallets.getWalletPositions(sdk.tradingService.getAddress());
+
+      const enrichedPositions = await Promise.all(positions.map(async (pos: any) => {
+        try {
+          const market = await sdk.markets.getMarket(pos.conditionId);
+          if (market) {
+            pos.marketClosed = market.closed;
+            const token = market.tokens.find((t: any) => t.tokenId === pos.asset);
+            if (token) {
+              pos.isWinner = token.winner || false;
+              pos.curPrice = token.price || 0;
+            }
+          }
+        } catch (e) { }
+        return pos;
+      }));
+
+      for (const p of enrichedPositions) {
+        const size = Number(p.size) || 0;
+        const avgPrice = Number(p.avgPrice) || 0;
+        const marketSlug = p.slug || p.eventSlug;
+        const outcome = p.outcome;
+        const outcomeSuffix = outcome ? `-${outcome}` : '';
+        const posKey = `${marketSlug}${outcomeSuffix}`;
+
+        if (size > 0 && marketSlug) {
+          if (realPositions.has(posKey)) {
+            const existing = realPositions.get(posKey);
+            if (existing) {
+              existing.size = size;
+              existing.avgEntryPrice = avgPrice;
+            }
+          } else {
+            realPositions.set(posKey, {
+              marketSlug: marketSlug,
+              outcome: outcome,
+              side: 'BUY',
+              size: size,
+              avgEntryPrice: avgPrice,
+              timestamp: Date.now(),
+              traderAddress: p.proxyWallet || sdk.tradingService.getAddress()
+            });
+          }
+        }
+      }
 
       let unrealized = 0;
       for (const p of enrichedPositions) {
@@ -1562,29 +1659,29 @@ async function main() {
     }
   }, TEN_MINUTES);
   **/
- /**
-  setInterval(async () => {
-    log('INFO', '⏰ A verificar rotação de carteiras de Smart Money...');
-
-    // Se houver alguma ordem a ser copiada NESTE instante, aguarda uns segundos
-    if (activeTradesProcessing > 0) {
-      log('WARN', `⏳ Existe(m) ${activeTradesProcessing} ordem(ns) a ser processada(s). A aguardar conclusão...`);
-      await new Promise(r => setTimeout(r, 2000));
-    }
-
-    // Faz a rotação limpa: cancela a antiga e inicia a nova lista
-    if (autoCopyTradingSubscription) {
-      log('INFO', '🔄 A fechar subscrição antiga...');
-      autoCopyTradingSubscription.stop();
-      autoCopyTradingSubscription = null;
-      await new Promise(r => setTimeout(r, 4000)); // Pausa para fecho do WS no SDK
-    }
-
-    // Carrega as novas carteiras e subscreve de novo
-    await initializeSmartMoney(sdk);
-
-  }, TWO_HOURS_MS);
-  **/
+  /**
+   setInterval(async () => {
+     log('INFO', '⏰ A verificar rotação de carteiras de Smart Money...');
+ 
+     // Se houver alguma ordem a ser copiada NESTE instante, aguarda uns segundos
+     if (activeTradesProcessing > 0) {
+       log('WARN', `⏳ Existe(m) ${activeTradesProcessing} ordem(ns) a ser processada(s). A aguardar conclusão...`);
+       await new Promise(r => setTimeout(r, 2000));
+     }
+ 
+     // Faz a rotação limpa: cancela a antiga e inicia a nova lista
+     if (autoCopyTradingSubscription) {
+       log('INFO', '🔄 A fechar subscrição antiga...');
+       autoCopyTradingSubscription.stop();
+       autoCopyTradingSubscription = null;
+       await new Promise(r => setTimeout(r, 4000)); // Pausa para fecho do WS no SDK
+     }
+ 
+     // Carrega as novas carteiras e subscreve de novo
+     await initializeSmartMoney(sdk);
+ 
+   }, TWO_HOURS_MS);
+   **/
   // 2. Re-verificação de Arbitragem (A cada 10 minutos)
   /** 
   setInterval(async () => {
