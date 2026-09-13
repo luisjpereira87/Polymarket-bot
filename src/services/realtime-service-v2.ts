@@ -1258,6 +1258,19 @@ export class RealtimeServiceV2 extends EventEmitter {
       clearInterval(this.pricePollingInterval);
     }
 
+    const parseJsonArray = (val: any): any[] => {
+      if (Array.isArray(val)) return val;
+      if (typeof val === 'string') {
+        try {
+          const parsed = JSON.parse(val);
+          if (Array.isArray(parsed)) return parsed;
+        } catch (e) {
+          return [];
+        }
+      }
+      return [];
+    };
+
     this.pricePollingInterval = setInterval(async () => {
       console.log(`[DEBUG_POLL] Posições no mapa: ${realPositions.size}`, Array.from(realPositions.keys()));
       if (realPositions.size === 0) return;
@@ -1300,6 +1313,8 @@ export class RealtimeServiceV2 extends EventEmitter {
             Array.from(realPositions.values()).map(pos => pos.marketSlug)
           ));
 
+          //console.log(`[DEBUG_DRY_RUN] Slugs ativos a consultar na Gamma API:`, activeMarketSlugs);
+
           const chunkSize = 25;
 
           for (let i = 0; i < activeMarketSlugs.length; i += chunkSize) {
@@ -1308,9 +1323,13 @@ export class RealtimeServiceV2 extends EventEmitter {
 
             const url = `https://gamma-api.polymarket.com/markets?${queryParams}`;
             const response = await fetch(url);
-            if (!response.ok) continue;
+            if (!response.ok) {
+              console.warn(`[DEBUG_DRY_RUN] Erro ao contactar Gamma API: ${response.statusText}`);
+              continue;
+            }
 
             const markets = await response.json();
+            //console.log(`[DEBUG_DRY_RUN] Mercados devolvidos pela Gamma API:`, Array.isArray(markets) ? markets.length : 0);
             if (!Array.isArray(markets)) continue;
 
             for (const market of markets) {
@@ -1321,27 +1340,60 @@ export class RealtimeServiceV2 extends EventEmitter {
                 if (position.marketSlug !== slug) continue;
 
                 let currentPrice: number | null = null;
+                const targetTokenId = (position as any).tokenId;
 
-                if (market.tokens && Array.isArray(market.tokens)) {
-                  const targetTokenId = (position as any).tokenId;
-                  const matchedToken = market.tokens.find((t: any) => t.tokenId === targetTokenId);
+                // 1. Tentar encontrar pelo Token ID exato
+                if (targetTokenId && market.tokens && Array.isArray(market.tokens)) {
+                  const matchedToken = market.tokens.find((t: any) => String(t.tokenId) === String(targetTokenId));
                   if (matchedToken && matchedToken.price !== undefined) {
                     currentPrice = Number(matchedToken.price);
                   }
                 }
 
-                if ((currentPrice === null || isNaN(currentPrice)) && market.outcomePrices && Array.isArray(market.outcomePrices) && market.outcomes) {
-                  const outcomeIndex = market.outcomes.findIndex((o: string) => o.toLowerCase() === position.outcome?.toLowerCase());
-                  if (outcomeIndex !== -1 && market.outcomePrices[outcomeIndex] !== undefined) {
-                    currentPrice = Number(market.outcomePrices[outcomeIndex]);
+                // 2. Se falhar pelo ID, tentar pelo nome do outcome (com parse seguro)
+                const outcomes = parseJsonArray(market.outcomes);
+                const prices = parseJsonArray(market.outcomePrices);
+
+                if ((currentPrice === null || isNaN(currentPrice)) && outcomes.length > 0 && prices.length > 0) {
+                  const targetOutcome = position.outcome?.toString().trim().toLowerCase() || '';
+
+                  // 1. Match direto e exato pelo texto do outcome da posição (ex: "Yes", "No", "Team A")
+                  let outcomeIndex = outcomes.findIndex((o: string) =>
+                    o?.toString().trim().toLowerCase() === targetOutcome
+                  );
+
+                  // 2. Se falhar no match exato, tenta match parcial (caso venha ligeiramente diferente)
+                  if (outcomeIndex === -1) {
+                    outcomeIndex = outcomes.findIndex((o: string) => {
+                      const opt = o.toString().trim().toLowerCase();
+                      return opt.includes(targetOutcome) || targetOutcome.includes(opt);
+                    });
+                  }
+
+                  if (outcomeIndex !== -1 && prices[outcomeIndex] !== undefined) {
+                    currentPrice = Number(prices[outcomeIndex]);
                   }
                 }
 
-                if (currentPrice === null || isNaN(currentPrice)) continue;
+                // 3. Fallback final pelos tokens
+                if ((currentPrice === null || isNaN(currentPrice)) && market.tokens && Array.isArray(market.tokens)) {
+                  const fallbackToken = market.tokens.find((t: any) =>
+                    t.outcome?.toString().trim().toLowerCase() === position.outcome?.toString().trim().toLowerCase()
+                  ) || market.tokens[0];
+
+                  if (fallbackToken && fallbackToken.price !== undefined) {
+                    currentPrice = Number(fallbackToken.price);
+                  }
+                }
+
+                if (currentPrice === null || isNaN(currentPrice)) {
+                  //console.warn(`[DEBUG_DRY_RUN] ⚠️ Preço não encontrado para ${posKey} (Outcome: ${position.outcome})`);
+                  continue;
+                }
 
                 const diff = currentPrice - position.avgEntryPrice;
                 const pnlPercent = (diff / position.avgEntryPrice) * 100;
-
+                console.log(`[DEBUG_DRY_RUN] 🎯 Match encontrado | Slug: ${slug} | PnL: ${pnlPercent.toFixed(2)}% | Entrada: $${position.avgEntryPrice} | Atual: $${currentPrice}`);
                 handlers.onPriceUpdate?.(posKey, currentPrice, pnlPercent);
               }
             }

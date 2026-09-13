@@ -429,6 +429,7 @@ async function agressiveQualifiedWallets(sdk: PolymarketSDK) {
       const lastActive = new Date(profile.lastActiveAt).getTime();
       const now = Date.now();
       const hoursSinceLastActive = (now - lastActive) / (1000 * 60 * 60);
+      profile.winRate
 
       // Critério para Bots/HFT: Elevado número de trades, múltiplas posições e atividade recente (< 24h)
       if (
@@ -437,7 +438,7 @@ async function agressiveQualifiedWallets(sdk: PolymarketSDK) {
         hoursSinceLastActive <= 24
       ) {
         qualified.push(entry.address);
-        log('WALLET', `🤖 Bot Qualificado: ${entry.address.slice(0, 10)}... (Trades: ${trades} | Posições: ${positions} | Ativo há ${hoursSinceLastActive.toFixed(1)}h)`);
+        log('WALLET', `🤖 Bot Qualificado: ${entry.address.slice(0, 10)}... (Trades: ${trades} | Posições: ${positions} | WinRate: ${profile.winRate} | Ativo há ${hoursSinceLastActive.toFixed(1)}h)`);
       }
 
       await new Promise(r => setTimeout(r, 200));
