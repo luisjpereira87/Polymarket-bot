@@ -713,6 +713,8 @@ export class SmartMoneyService {
     this.dataApi = dataApi ?? null;
     this.rateLimiter = new RateLimiter();
 
+    this.tradingService.getAddress
+
     this.config = {
       minPnl: config.minPnl ?? 1000,
       cacheTtl: config.cacheTtl ?? 300000,
@@ -868,7 +870,7 @@ export class SmartMoneyService {
             handler(slug, currentPrice, pnlPercent);
           }
         }
-      });
+      }, this.tradingService.getFunderAddress());
     }
 
     return {
@@ -913,9 +915,18 @@ export class SmartMoneyService {
       const marketInfo = await this.getMarketBySlug(position.marketSlug);
       const isMarketClosed = marketInfo?.closed || currentPrice >= 0.99 || currentPrice <= 0.01;
 
-      if (pnlPercent >= takeProfit || isTimeout || isMarketClosed) {
+      if (isMarketClosed) {
+        console.log(`[SmartMoneyService] ℹ️ Mercado ${position.marketSlug} fechado/resolvido. A remover da monitorização.`);
+        realPositions.delete(posKey);
+        return;
+      }
+
+      const isTakeProfit = pnlPercent >= takeProfit;
+      const isStopLoss = pnlPercent <= stopLoss;
+
+      if (isTakeProfit || isStopLoss || isTimeout) {
         let actionType = '🎯 Take-Profit';
-        if (pnlPercent <= stopLoss) actionType = '🛑 Stop-Loss';
+        if (isStopLoss) actionType = '🛑 Stop-Loss';
         if (isTimeout) actionType = '⏰ Timeout (Tempo Limite)';
 
         console.log(`💰 ${actionType} de ${pnlPercent.toFixed(1)}% (Idade: ${(age / 60000).toFixed(1)}m) atingido em ${posKey}! A fechar posição...`);
@@ -944,7 +955,7 @@ export class SmartMoneyService {
           result = await this.tradingService.createMarketOrder({
             tokenId,
             side: 'SELL',
-            amount: exitValue,
+            amount: exitShares,
             price: currentPrice * 0.98,
             orderType: 'FOK',
           });
@@ -969,6 +980,7 @@ export class SmartMoneyService {
           }
 
           options.onPositionClosed?.(exitTrade, result, pnlPercent);
+          realPositions.delete(posKey);
         } else {
           console.error(`[SmartMoneyService] ❌ Erro ao fechar posição ${posKey}:`, result.errorMsg);
         }
@@ -984,7 +996,7 @@ export class SmartMoneyService {
             handler(posKey, currentPrice, pnlPercent);
           }
         }
-      });
+      }, this.tradingService.getFunderAddress(), dryRun);
     }
 
     return {

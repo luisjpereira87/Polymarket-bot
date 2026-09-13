@@ -39,14 +39,14 @@ import { ethers } from 'ethers';
 import {
   CTFClient,
   type CTFConfig,
-  type SplitResult,
-  type MergeResult,
-  type RedeemResult,
-  type PositionBalance,
-  type MarketResolution,
   type GasEstimate,
-  type TransactionStatus,
+  type MarketResolution,
+  type MergeResult,
+  type PositionBalance,
+  type RedeemResult,
+  type SplitResult,
   type TokenIds,
+  type TransactionStatus,
 } from '../clients/ctf-client.js';
 
 import {
@@ -58,12 +58,12 @@ import {
 
 import {
   SwapService,
+  type PoolInfo,
+  type QuoteResult,
   type SwapQuote,
   type SwapResult,
   type TokenBalance,
   type TransferResult,
-  type QuoteResult,
-  type PoolInfo,
 } from './swap-service.js';
 
 // ===== Types =====
@@ -103,25 +103,23 @@ export interface TokenBalances {
   wmatic: string;
 }
 
+export interface PolymarketBalances {
+  matic: string;
+  usdc: string;
+  usdcE: string;
+  usdt: string;
+  dai: string;
+  weth: string;
+  wmatic: string;
+}
+
 // Re-export types from underlying services
 export type {
-  SplitResult,
-  MergeResult,
-  RedeemResult,
-  PositionBalance,
-  MarketResolution,
-  GasEstimate,
-  TransactionStatus,
-  TokenIds,
   AllowancesResult,
   ApprovalsResult,
-  ApprovalTxResult,
-  SwapQuote,
+  ApprovalTxResult, GasEstimate, MarketResolution, MergeResult, PoolInfo, PositionBalance, QuoteResult, RedeemResult, SplitResult, SwapQuote,
   SwapResult,
-  TokenBalance,
-  TransferResult,
-  QuoteResult,
-  PoolInfo,
+  TokenBalance, TokenIds, TransactionStatus, TransferResult
 };
 
 // ===== OnchainService =====

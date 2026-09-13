@@ -1179,8 +1179,80 @@ export class RealtimeServiceV2 extends EventEmitter {
     };
   }
 
-  subscribePositionPricePolling(realPositions: Map<string, TradePositions>, handlers: { onPriceUpdate?: (posKey: string, currentPrice: number, pnlPercent: number) => void } = {}): Subscription {
-    console.log('[RealtimeServiceV2] 🔄 A iniciar polling REST para monitorização de PnL das posições...');
+  subscribePositionPricePolling__(
+    realPositions: Map<string, TradePositions>,
+    handlers: { onPriceUpdate?: (posKey: string, currentPrice: number, pnlPercent: number) => void } = {},
+    funderAddress: String
+  ): Subscription {
+    console.log('[RealtimeServiceV2] 🔄 A iniciar polling REST na Data API para PnL das posições...');
+
+    if (this.pricePollingInterval) {
+      clearInterval(this.pricePollingInterval);
+    }
+
+    // O endereço da tua Proxy Wallet configurada
+    //const targetWalletAddress = process.env.FUNDER_ADDRESS || '0xA54565850546fA81E11880F493749c7a07Aa7eDF';
+
+    this.pricePollingInterval = setInterval(async () => {
+      console.log(`[DEBUG_POLL] Posições no mapa local: ${realPositions.size}`, Array.from(realPositions.keys()));
+      if (realPositions.size === 0) return;
+
+      try {
+        const url = `https://data-api.polymarket.com/positions?user=${funderAddress}`;
+        const response = await fetch(url);
+        if (!response.ok) return;
+
+        const apiPositions = await response.json();
+        if (!Array.isArray(apiPositions)) return;
+
+        // Mapear as posições que vêm diretamente da Data API
+        for (const apiPos of apiPositions) {
+          const marketSlug = apiPos.slug || apiPos.eventSlug;
+          const outcome = apiPos.outcome;
+          const outcomeSuffix = outcome ? `-${outcome}` : '';
+          const posKey = `${marketSlug}${outcomeSuffix}`;
+
+          // Verificar se esta posição ativa existe no nosso mapa local
+          if (realPositions.has(posKey)) {
+            const currentPrice = Number(apiPos.curPrice) || 0;
+            const pnlPercent = Number(apiPos.percentPnl) || 0;
+
+            // Atualiza também os dados locais da posição se necessário (como o tokenId/asset)
+            const localPos = realPositions.get(posKey);
+            if (localPos && apiPos.asset) {
+              (localPos as any).tokenId = apiPos.asset;
+            }
+
+            // Disparar o handler com os valores exatos da Polymarket
+            handlers.onPriceUpdate?.(posKey, currentPrice, pnlPercent);
+          }
+        }
+      } catch (error) {
+        console.error('[RealtimeServiceV2] Erro no polling REST da Data API:', error);
+      }
+    }, 15000); // Roda a cada 15 segundos
+
+    return {
+      id: `rtds_price_polling_${Date.now()}`,
+      topic: 'positions-price',
+      type: '*',
+      unsubscribe: () => {
+        if (this.pricePollingInterval) {
+          clearInterval(this.pricePollingInterval);
+          this.pricePollingInterval = null;
+          console.log('[RealtimeServiceV2] 🛑 Polling REST de preços parado.');
+        }
+      },
+    };
+  }
+
+  subscribePositionPricePolling(
+    realPositions: Map<string, TradePositions>,
+    handlers: { onPriceUpdate?: (posKey: string, currentPrice: number, pnlPercent: number) => void } = {},
+    funderAddress?: string,
+    dryRun: boolean = false
+  ): Subscription {
+    console.log(`[RealtimeServiceV2] 🔄 A iniciar polling REST para monitorização de PnL (${dryRun ? 'MODO SIMULAÇÃO/GAMMA' : 'MODO REAL/DATA API'})...`);
 
     if (this.pricePollingInterval) {
       clearInterval(this.pricePollingInterval);
@@ -1190,68 +1262,99 @@ export class RealtimeServiceV2 extends EventEmitter {
       console.log(`[DEBUG_POLL] Posições no mapa: ${realPositions.size}`, Array.from(realPositions.keys()));
       if (realPositions.size === 0) return;
 
-      // Extrair apenas os marketSlugs únicos para a query da Gamma API
-      const activeMarketSlugs = Array.from(new Set(
-        Array.from(realPositions.values()).map(pos => pos.marketSlug)
-      ));
-
-      const chunkSize = 25; // Lotes seguros para a Gamma API
-
-      for (let i = 0; i < activeMarketSlugs.length; i += chunkSize) {
-        const chunk = activeMarketSlugs.slice(i, i + chunkSize);
-        const queryParams = chunk.map(slug => `slug=${slug}`).join('&');
-
-        try {
-          const url = `https://gamma-api.polymarket.com/markets?${queryParams}`;
+      try {
+        if (!dryRun && funderAddress) {
+          // ==========================================
+          // LÓGICA REAL: Data API (Usa a wallet/proxy)
+          // ==========================================
+          const url = `https://data-api.polymarket.com/positions?user=${funderAddress}`;
           const response = await fetch(url);
-          if (!response.ok) continue;
+          if (!response.ok) return;
 
-          const markets = await response.json();
-          if (!Array.isArray(markets)) continue;
+          const apiPositions = await response.json();
+          if (!Array.isArray(apiPositions)) return;
 
-          for (const market of markets) {
-            const slug = market.slug;
-            if (!slug) continue;
+          for (const apiPos of apiPositions) {
+            const marketSlug = apiPos.slug || apiPos.eventSlug;
+            const outcome = apiPos.outcome;
+            const outcomeSuffix = outcome ? `-${outcome}` : '';
+            const posKey = `${marketSlug}${outcomeSuffix}`;
 
-            // Correlacionar o mercado retornado com todas as posições ativas que partilham este marketSlug
-            for (const [posKey, position] of realPositions.entries()) {
-              if (position.marketSlug !== slug) continue;
+            if (realPositions.has(posKey)) {
+              const currentPrice = Number(apiPos.curPrice) || 0;
+              const pnlPercent = Number(apiPos.percentPnl) || 0;
 
-              // 🛡️ Extração rigorosa do preço do outcome específico
-              let currentPrice: number | null = null;
-
-              if (market.outcomePrices && Array.isArray(market.outcomePrices) && market.outcomes && Array.isArray(market.outcomes)) {
-                // Tenta encontrar o índice exato do outcome (ex: "Leonardo Rossi")
-                const outcomeIndex = market.outcomes.findIndex((o: string) => o.toLowerCase() === position.outcome?.toLowerCase());
-                if (outcomeIndex !== -1 && market.outcomePrices[outcomeIndex] !== undefined) {
-                  currentPrice = Number(market.outcomePrices[outcomeIndex]);
-                }
+              const localPos = realPositions.get(posKey);
+              if (localPos && apiPos.asset) {
+                (localPos as any).tokenId = apiPos.asset;
               }
 
-              // Fallback se não encontrar o outcome pelo nome exato
-              if (currentPrice === null || isNaN(currentPrice)) {
-                const fallbackStr = market.lastTradePrice ?? market.outcomePrices?.[0];
-                currentPrice = fallbackStr !== undefined ? Number(fallbackStr) : NaN;
-              }
-
-              if (isNaN(currentPrice)) continue;
-
-              // Calcular PnL percentual
-              const diff = currentPrice - position.avgEntryPrice;
-              const pnlPercent = (diff / position.avgEntryPrice) * 100;
-
-              // Disparar handler passando a chave exata da posição (`posKey`)
               handlers.onPriceUpdate?.(posKey, currentPrice, pnlPercent);
             }
           }
-        } catch (error) {
-          console.error('[RealtimeServiceV2] Erro no polling REST de preços:', error);
-        }
+        } else {
+          // ==========================================
+          // LÓGICA DE SIMULAÇÃO: Gamma API (Preços públicos)
+          // ==========================================
+          const activeMarketSlugs = Array.from(new Set(
+            Array.from(realPositions.values()).map(pos => pos.marketSlug)
+          ));
 
-        // Pequena pausa entre lotes para evitar rate limits
-        await new Promise(r => setTimeout(r, 100));
+          const chunkSize = 25;
+
+          for (let i = 0; i < activeMarketSlugs.length; i += chunkSize) {
+            const chunk = activeMarketSlugs.slice(i, i + chunkSize);
+            const queryParams = chunk.map(slug => `slug=${slug}`).join('&');
+
+            const url = `https://gamma-api.polymarket.com/markets?${queryParams}`;
+            const response = await fetch(url);
+            if (!response.ok) continue;
+
+            const markets = await response.json();
+            if (!Array.isArray(markets)) continue;
+
+            for (const market of markets) {
+              const slug = market.slug;
+              if (!slug) continue;
+
+              for (const [posKey, position] of realPositions.entries()) {
+                if (position.marketSlug !== slug) continue;
+
+                let currentPrice: number | null = null;
+
+                if (market.tokens && Array.isArray(market.tokens)) {
+                  const targetTokenId = (position as any).tokenId;
+                  const matchedToken = market.tokens.find((t: any) => t.tokenId === targetTokenId);
+                  if (matchedToken && matchedToken.price !== undefined) {
+                    currentPrice = Number(matchedToken.price);
+                  }
+                }
+
+                if ((currentPrice === null || isNaN(currentPrice)) && market.outcomePrices && Array.isArray(market.outcomePrices) && market.outcomes) {
+                  const outcomeIndex = market.outcomes.findIndex((o: string) => o.toLowerCase() === position.outcome?.toLowerCase());
+                  if (outcomeIndex !== -1 && market.outcomePrices[outcomeIndex] !== undefined) {
+                    currentPrice = Number(market.outcomePrices[outcomeIndex]);
+                  }
+                }
+
+                if (currentPrice === null || isNaN(currentPrice)) continue;
+
+                const diff = currentPrice - position.avgEntryPrice;
+                const pnlPercent = (diff / position.avgEntryPrice) * 100;
+
+                handlers.onPriceUpdate?.(posKey, currentPrice, pnlPercent);
+              }
+            }
+
+            if (activeMarketSlugs.length > chunkSize) {
+              await new Promise(r => setTimeout(r, 100));
+            }
+          }
+        }
+      } catch (error) {
+        console.error('[RealtimeServiceV2] Erro no ciclo de polling de preços:', error);
       }
-    }, 15000); // Roda a cada 15 segundos
+    }, 15000);
 
     return {
       id: `rtds_price_polling_${Date.now()}`,

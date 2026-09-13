@@ -119,6 +119,8 @@ export interface PolySDKOptions {
     secret: string;
     passphrase: string;
   };
+
+  funderAddress?: string;
 }
 
 // K-Line interval types
@@ -598,4 +600,5 @@ export interface TradePositions {
   avgEntryPrice: number;
   timestamp: number;
   traderAddress?: string;
+  tokenId: string;
 }

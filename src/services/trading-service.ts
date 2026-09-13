@@ -77,6 +77,7 @@ export interface TradingServiceConfig {
   chainId?: number;
   /** Pre-generated API credentials (optional) */
   credentials?: ApiCredentials;
+  funderAddress?: string;
 }
 
 // Order types
@@ -155,6 +156,12 @@ export interface MarketReward {
   }>;
 }
 
+export interface PolymarketBalances {
+  freeBalance: string;
+  positionsBalance: string;
+  pnlBalance: string;
+}
+
 // ============================================================================
 // TradingService Implementation
 // ============================================================================
@@ -167,6 +174,8 @@ export class TradingService {
   private initialized = false;
   private tickSizeCache: Map<string, string> = new Map();
   private negRiskCache: Map<string, boolean> = new Map();
+  private privateKey: string;
+  private funderAddress?: string;
 
   constructor(
     private rateLimiter: RateLimiter,
@@ -176,19 +185,21 @@ export class TradingService {
     this.wallet = new Wallet(config.privateKey);
     this.chainId = (config.chainId || POLYGON_MAINNET) as Chain;
     this.credentials = config.credentials || null;
+    this.privateKey = config.privateKey
+    this.funderAddress = config.funderAddress
   }
 
   // ============================================================================
   // Initialization
   // ============================================================================
-  async initialize(): Promise<void> {
+  async initialize_(): Promise<void> {
     if (this.initialized) return;
 
     const host = 'https://clob.polymarket.com';
     const chainId = 137;
 
     // Configurar a conta e o signatário com Viem
-    const privateKey = this.config?.privateKey || process.env.PRIVATE_KEY;
+    const privateKey = this.privateKey || process.env.PRIVATE_KEY;
     if (!privateKey) {
       throw new Error('❌ Chave privada não encontrada na configuração ou variáveis de ambiente.');
     }
@@ -226,6 +237,70 @@ export class TradingService {
         secret: this.credentials.secret,
         passphrase: this.credentials.passphrase,
       },
+    });
+
+    this.initialized = true;
+  }
+
+  async initialize(): Promise<void> {
+    if (this.initialized) return;
+
+    const host = 'https://clob.polymarket.com';
+    const chainId = 137;
+
+    const privateKey = this.privateKey || process.env.PRIVATE_KEY;
+    if (!privateKey) {
+      throw new Error('❌ Chave privada não encontrada na configuração ou variáveis de ambiente.');
+    }
+    const account = privateKeyToAccount(privateKey as `0x${string}`);
+    const walletClient = createWalletClient({
+      account,
+      chain: polygon,
+      transport: http(),
+    });
+
+    // Podes colocar o endereço da tua Proxy/Deposit Wallet diretamente aqui ou ler de uma variável de ambiente (ex: process.env.FUNDER_ADDRESS)
+    //const funderAddress = process.env.FUNDER_ADDRESS || '0xA54565850546fA81E11880F493749c7a07Aa7eDF'; // <--- COLOCA AQUI O ENDEREÇO DA PROXY WALLET
+    const signatureType = 3; // 1 para Poly Proxy (ou 2 se for Gnosis Safe)
+
+    // 1. Cliente L1 com o funder e signatureType
+    const tempClient = new ClobClient({
+      host,
+      chain: chainId,
+      signer: walletClient,
+      signatureType: signatureType,
+      funderAddress: this.funderAddress,
+    });
+
+    if (!this.credentials) {
+      const creds = await tempClient.createOrDeriveApiKey();
+      this.credentials = {
+        key: creds.key,
+        secret: creds.secret,
+        passphrase: creds.passphrase,
+      };
+    }
+    console.log('🔍 [DEBUG CONEXÃO POLYMARKET]', {
+      host,
+      chainId,
+      signerAddress: account.address,
+      signatureType,
+      funderAddress: this.funderAddress,
+      hasExistingCreds: !!this.credentials,
+    });
+
+    // 2. Instancia o cliente definitivo também com o funder e signatureType
+    this.clobClient = new ClobClient({
+      host,
+      chain: chainId,
+      signer: walletClient,
+      creds: {
+        key: this.credentials.key,
+        secret: this.credentials.secret,
+        passphrase: this.credentials.passphrase,
+      },
+      signatureType: signatureType,
+      funderAddress: this.funderAddress,
     });
 
     this.initialized = true;
@@ -402,6 +477,11 @@ export class TradingService {
           orderType
         );
 
+        // Adiciona este log temporário para inspecionar o que a API devolve
+        if (!result || result.success !== true) {
+          console.error("DEBUG_CLOB_RESULT:", JSON.stringify(result, null, 2));
+        }
+
         const success = result.success === true ||
           (result.success !== false &&
             (result.orderID !== undefined && result.orderID !== ''));
@@ -413,6 +493,7 @@ export class TradingService {
           transactionHashes: result.transactionsHashes || [],
         };
       } catch (error) {
+        console.error("DEBUG_CATCH_ERROR:", error);
         return {
           success: false,
           errorMsg: `Market order failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -636,4 +717,57 @@ export class TradingService {
     return this.clobClient;
   }
 
+  getFunderAddress(): string {
+    return this.funderAddress || '';
+  }
+
+  async getPolymarketBalances(): Promise<PolymarketBalances> {
+    const proxyWallet = this.funderAddress;
+
+    // 1. Buscar saldo livre, posições ativas e estatísticas globais em paralelo
+    const [balanceResponse, positionsRes, statsRes] = await Promise.all([
+      this.getBalanceAllowance('COLLATERAL'),
+      fetch(`https://data-api.polymarket.com/positions?user=${proxyWallet}`),
+      fetch(`https://data-api.polymarket.com/v2/user-stats?user=${proxyWallet}`)
+    ]);
+
+    const freeCash = (Number(balanceResponse?.balance) || 0) / 1e6;
+    const apiPositions = await positionsRes.json();
+    const userStats = (await statsRes.json()) as {
+      data?: {
+        all_time_pnl?: {
+          realized_pnl?: number;
+          unrealized_pnl?: number;
+        };
+      };
+    };
+
+    let totalCurrentValue = 0;
+    let unrealizedPnl = 0;
+
+    if (Array.isArray(apiPositions)) {
+      for (const pos of apiPositions) {
+        totalCurrentValue += Number(pos.currentValue) || 0;
+        unrealizedPnl += Number(pos.cashPnl) || 0;
+      }
+    }
+
+    // 2. Obter o PnL realizado acumulado (funciona mesmo sem posições abertas)
+    const realizedPnl = Number(userStats?.data?.all_time_pnl?.realized_pnl) || 0;
+
+    // PnL Total = Lucro/Prejuízo fechado no passado + Lucro/Prejuízo das posições correntes
+    const totalCombinedPnl = realizedPnl + unrealizedPnl;
+    const totalPortfolioValue = freeCash + totalCurrentValue;
+
+    console.log(`💵 Saldo Livre: $${freeCash.toFixed(2)}`);
+    console.log(`📈 Valor Atual das Posições: $${totalCurrentValue.toFixed(2)}`);
+    console.log(`💰 Património Total (Livre + Posições): $${totalPortfolioValue.toFixed(2)}`);
+    console.log(`📊 PnL Consolidado (Realizado + Ativo): $${totalCombinedPnl.toFixed(2)}`);
+
+    return {
+      freeBalance: freeCash.toFixed(2),
+      positionsBalance: totalCurrentValue.toFixed(2),
+      pnlBalance: totalCombinedPnl.toFixed(2)
+    };
+  }
 }

@@ -277,10 +277,13 @@ export class PolymarketSDK {
 
     // TradingService requires a private key - use provided key or dummy key for read-only
     const privateKey = config.privateKey || '0x' + '1'.repeat(64);
+
+    const funderAddress = config.funderAddress || '0x' + '1'.repeat(64);
     this.tradingService = new TradingService(this.rateLimiter, this.cache, {
       privateKey,
       chainId: config.chainId,
       credentials: config.creds,
+      funderAddress
     });
 
     this.subgraph = new SubgraphClient(this.rateLimiter, this.cache);

@@ -3,10 +3,10 @@
  * Handles: positions, activity, trades, leaderboard
  */
 
-import { RateLimiter, ApiType } from '../core/rate-limiter.js';
+import { PolymarketError } from '../core/errors.js';
+import { ApiType, RateLimiter } from '../core/rate-limiter.js';
 import type { UnifiedCache } from '../core/unified-cache.js';
 import { CACHE_TTL } from '../core/unified-cache.js';
-import { PolymarketError } from '../core/errors.js';
 
 const DATA_API_BASE = 'https://data-api.polymarket.com';
 
@@ -52,6 +52,7 @@ export interface Position {
   mergeable?: boolean;
   endDate?: string;
   negativeRisk?: boolean;
+  tokenId: string;
 }
 
 export interface Activity {
@@ -386,7 +387,7 @@ export class DataApiClient {
   constructor(
     private rateLimiter: RateLimiter,
     private cache: UnifiedCache
-  ) {}
+  ) { }
 
   // ===== Wallet-related =====
 
@@ -601,7 +602,7 @@ export class DataApiClient {
     if (offset >= API_OFFSET_LIMIT && all.length >= API_OFFSET_LIMIT) {
       console.warn(
         `[DataApiClient] Hit API offset limit (${API_OFFSET_LIMIT}). ` +
-          'Use time filtering (start/end params) to access older activity data.'
+        'Use time filtering (start/end params) to access older activity data.'
       );
     }
 
@@ -927,6 +928,7 @@ export class DataApiClient {
         mergeable: p.mergeable !== undefined ? Boolean(p.mergeable) : undefined,
         endDate: p.endDate !== undefined ? String(p.endDate) : undefined,
         negativeRisk: p.negativeRisk !== undefined ? Boolean(p.negativeRisk) : undefined,
+        tokenId: String(p.asset || p.tokenId || ''),
       };
     });
   }
