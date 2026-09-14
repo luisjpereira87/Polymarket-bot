@@ -41,7 +41,7 @@ let CONFIG = {
   },
 
   risk: {
-    dailyMaxLossPct: 0.05,
+    dailyMaxLossPct: 1,
     maxConsecutiveLosses: 6,
     pauseOnBreachMinutes: 60,
 
