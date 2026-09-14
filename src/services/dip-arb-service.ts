@@ -29,49 +29,49 @@
  */
 
 import { EventEmitter } from 'events';
-import {
-  RealtimeServiceV2,
-  type MarketSubscription,
-  type OrderbookSnapshot,
-  type Subscription,
-  type CryptoPrice,
-} from './realtime-service-v2.js';
-import { TradingService, type MarketOrderParams } from './trading-service.js';
-import { MarketService } from './market-service.js';
 import { CTFClient } from '../clients/ctf-client.js';
 import type { Side } from '../core/types.js';
 import {
-  type DipArbServiceConfig,
-  type DipArbConfigInternal,
-  type DipArbMarketConfig,
-  type DipArbRoundState,
-  type DipArbStats,
-  type DipArbSignal,
-  type DipArbLeg1Signal,
-  type DipArbLeg2Signal,
-  type DipArbExecutionResult,
-  type DipArbRoundResult,
-  type DipArbNewRoundEvent,
-  type DipArbPriceUpdateEvent,
-  type DipArbScanOptions,
-  type DipArbFindAndStartOptions,
-  type DipArbSide,
-  type DipArbAutoRotateConfig,
-  type DipArbSettleResult,
-  type DipArbRotateEvent,
-  type DipArbUnderlying,
-  type DipArbPendingRedemption,
-  DEFAULT_DIP_ARB_CONFIG,
   DEFAULT_AUTO_ROTATE_CONFIG,
+  DEFAULT_DIP_ARB_CONFIG,
+  calculateDipArbProfitRate,
   createDipArbInitialStats,
   createDipArbRoundState,
-  calculateDipArbProfitRate,
-  estimateUpWinRate,
   detectMispricing,
-  parseUnderlyingFromSlug,
-  parseDurationFromSlug,
+  estimateUpWinRate,
   isDipArbLeg1Signal,
+  parseDurationFromSlug,
+  parseUnderlyingFromSlug,
+  type DipArbAutoRotateConfig,
+  type DipArbConfigInternal,
+  type DipArbExecutionResult,
+  type DipArbFindAndStartOptions,
+  type DipArbLeg1Signal,
+  type DipArbLeg2Signal,
+  type DipArbMarketConfig,
+  type DipArbNewRoundEvent,
+  type DipArbPendingRedemption,
+  type DipArbPriceUpdateEvent,
+  type DipArbRotateEvent,
+  type DipArbRoundResult,
+  type DipArbRoundState,
+  type DipArbScanOptions,
+  type DipArbServiceConfig,
+  type DipArbSettleResult,
+  type DipArbSide,
+  type DipArbSignal,
+  type DipArbStats,
+  type DipArbUnderlying,
 } from './dip-arb-types.js';
+import { MarketService } from './market-service.js';
+import {
+  RealtimeServiceV2,
+  type CryptoPrice,
+  type MarketSubscription,
+  type OrderbookSnapshot,
+  type Subscription,
+} from './realtime-service-v2.js';
+import { TradingService, type MarketOrderParams } from './trading-service.js';
 
 // ===== DipArbService =====
 
@@ -408,7 +408,7 @@ export class DipArbService extends EventEmitter {
    * When the service starts or rotates to a new market, check if there are
    * existing UP + DOWN token pairs from previous sessions and merge them.
    */
-  private async scanAndMergeExistingPairs(): Promise<void> {
+  private async scanAndMergeExistingPairs__(): Promise<void> {
     if (!this.ctf || !this.market) return;
 
     try {
@@ -454,6 +454,58 @@ export class DipArbService extends EventEmitter {
       }
     } catch (error) {
       this.log(`Warning: Failed to scan existing pairs: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private async scanAndMergeExistingPairs(): Promise<void> {
+    if (!this.ctf || !this.market) return;
+
+    let attempts = 0;
+    const maxAttempts = 3;
+
+    while (attempts < maxAttempts) {
+      attempts++;
+      try {
+        const tokenIds = {
+          yesTokenId: this.market.upTokenId,
+          noTokenId: this.market.downTokenId,
+        };
+
+        const balances = await this.ctf.getPositionBalanceByTokenIds(
+          this.market.conditionId,
+          tokenIds
+        );
+
+        const upBalance = parseFloat(balances.yesBalance);
+        const downBalance = parseFloat(balances.noBalance);
+        const pairsToMerge = Math.min(upBalance, downBalance);
+
+        if (pairsToMerge > 0.01) {
+          this.log(`🔍 Found existing pairs: UP=${upBalance.toFixed(2)}, DOWN=${downBalance.toFixed(2)}`);
+          this.log(`🔄 Auto-merging ${pairsToMerge.toFixed(2)} pairs at startup...`);
+
+          const result = await this.ctf.mergeByTokenIds(
+            this.market.conditionId,
+            tokenIds,
+            pairsToMerge.toString()
+          );
+
+          if (result.success) {
+            this.log(`✅ Startup merge successful: ${pairsToMerge.toFixed(2)} pairs → $${result.usdcReceived || pairsToMerge.toFixed(2)} USDC.e`);
+            this.log(`   TxHash: ${result.txHash?.slice(0, 20)}...`);
+          } else {
+            this.log(`❌ Startup merge failed`);
+          }
+        }
+        return; // Sucesso, sai do loop de tentativas
+      } catch (error) {
+        const errMessage = error instanceof Error ? error.message : String(error);
+        if (attempts >= maxAttempts) {
+          this.log(`Warning: Failed to scan existing pairs after ${maxAttempts} attempts: ${errMessage}`);
+        } else {
+          await new Promise(r => setTimeout(r, 2000 * attempts)); // Backoff antes de tentar ler o saldo de novo
+        }
+      }
     }
   }
 

@@ -18,6 +18,7 @@ import {
   PolymarketSDK,
   SwapService,
   TradePositions,
+  WalletProfile,
   type SmartMoneyTrade,
 } from './src/index.js';
 
@@ -403,6 +404,61 @@ async function conservativeQualifiedWallets(sdk: PolymarketSDK) {
   }
 }
 
+async function smartHybridQualifiedWallets(sdk: PolymarketSDK): Promise<string[]> {
+  try {
+    const qualified: string[] = [];
+
+    if (CONFIG.smartMoney.customWallets?.length > 0) {
+      for (const wallet of CONFIG.smartMoney.customWallets) {
+        qualified.push(wallet);
+        log('WALLET', `⭐ Carteira personalizada adicionada: ${wallet.slice(0, 10)}...`);
+      }
+    }
+
+    const leaderboard = await sdk.wallets.getLeaderboardByPeriod('week', CONFIG.smartMoney.topN * 2, 'pnl');
+
+    for (const entry of leaderboard) {
+      if (!CONFIG.smartMoney.enabled && qualified.length === 0) break;
+      if (qualified.length >= 12) break;
+      if (qualified.includes(entry.address)) continue;
+
+      const profile: WalletProfile | null = await sdk.wallets.getWalletProfile(entry.address);
+      if (!profile) continue;
+
+      const winRate = profile.winRate ?? 0;
+      const totalPnL = profile.totalPnL ?? 0;
+      const smartScore = profile.smartScore ?? 0;
+      const trades = profile.tradeCount ?? 0;
+      const positions = profile.positionCount ?? 0;
+
+      const lastActive = profile.lastActiveAt ? new Date(profile.lastActiveAt).getTime() : Date.now();
+      const hoursSinceLastActive = (Date.now() - lastActive) / (1000 * 60 * 60);
+
+      // 🛡️ Filtros rigorosos aproveitando a estrutura exata da WalletProfile
+      const minWinRate = CONFIG.smartMoney.minWinRate ?? 0.55; // Mínimo 55% de acerto
+      const minSmartScore = 50;                                // Aproveita o smartScore nativo da SDK
+
+      const isValidWinRate = winRate >= minWinRate;
+      const isProfitable = totalPnL > 0;
+      const hasGoodScore = smartScore >= minSmartScore;
+      const isRecentlyActive = hoursSinceLastActive <= 48;     // Ativo nas últimas 48h
+      const isNotToxicHFT = positions < 40;                    // Descarta market makers com 100+ posições estéreis
+
+      if (isValidWinRate && isProfitable && hasGoodScore && isRecentlyActive && isNotToxicHFT) {
+        qualified.push(entry.address);
+        log('WALLET', `🎯 Smart Money Qualificado: ${entry.address.slice(0, 10)}... (WR: ${(winRate * 100).toFixed(0)}% | PnL: $${totalPnL.toFixed(0)} | Score: ${smartScore} | Trades: ${trades})`);
+      }
+
+      await new Promise(r => setTimeout(r, 250));
+    }
+
+    return qualified;
+  } catch (err) {
+    log('WARN', `Erro ao carregar Leaderboard Híbrido: ${(err as Error).message}`);
+    return [];
+  }
+}
+
 async function agressiveQualifiedWallets(sdk: PolymarketSDK) {
   try {
     const qualified: string[] = [];
@@ -450,128 +506,6 @@ async function agressiveQualifiedWallets(sdk: PolymarketSDK) {
   }
 }
 
-function simulateSmartMoneyTrade(trade: SmartMoneyTrade & { id?: string; market?: string }) {
-  // 1. Resolver fallback de campos (garantir que pega 'marketSlug' ou 'market')
-  const marketSlug = trade.marketSlug || trade.market;
-
-  // 2. Ignorar IMEDIATAMENTE se o mercado for inválido/vazio
-  if (!marketSlug || marketSlug.trim() === '') {
-    log('INFO', `[SIMULATION] Sinal ignorado: mercado inválido/vazio.`);
-    return;
-  }
-
-  // 3. Garantir o traderAddress
-  if (!trade.traderAddress) {
-    log('INFO', `[SIMULATION] Sinal ignorado: traderAddress ausente.`);
-    return;
-  }
-
-  // 4. Determinar se o sinal de SELL consegue encontrar a posição mesmo sem outcome
-  const outcomeSuffix = trade.outcome ? `-${trade.outcome}` : '';
-  let posKey = `${trade.traderAddress}-${marketSlug}${outcomeSuffix}`;
-
-  // Se for SELL e não encontrar a posKey exata, procura por qualquer posição aberta deste trader neste mercado
-  if (trade.side === 'SELL' && !simulatedPositions.has(posKey)) {
-    for (const key of simulatedPositions.keys()) {
-      if (key.startsWith(`${trade.traderAddress}-${marketSlug}`)) {
-        posKey = key; // Encontrou a posição correspondente!
-        break;
-      }
-    }
-  }
-
-  // 5. Evitar trades duplicados
-  const tradeHash = `${posKey}-${trade.side}-${trade.size}-${trade.price}`;
-  if (processedTrades.has(tradeHash)) {
-    return;
-  }
-  processedTrades.add(tradeHash);
-
-  if (processedTrades.size > 5000) processedTrades.clear();
-
-  // 6. Filtro de preço mínimo
-  if (trade.price < 0.10) {
-    log('INFO', `[SIMULATION] Sinal ignorado: preço muito baixo ($${trade.price.toFixed(3)})`);
-    return;
-  }
-
-  // EXECUÇÃO DO COPY TRADE SIMULADO
-  if (trade.side === 'BUY') {
-    // 🛡️ APLICAR DIMENSIONAMENTO (Não copiar cegamente as shares do trader grande)
-    const maxUsdPerTrade = CONFIG.smartMoney?.maxSizePerTrade || 5;
-    const targetUsd = Math.min(trade.size * trade.price, maxUsdPerTrade);
-    const scaledSize = targetUsd / trade.price; // As Tuas shares reais baseadas na TUA banca
-    const tradeCost = scaledSize * trade.price;
-
-    // 🛡️ VALIDAÇÃO DE CAIXA DISPONÍVEL
-    const currentAvailableCash = financialState.availableCash ?? CONFIG.capital.totalUsd ?? 1000;
-    if (currentAvailableCash < tradeCost) {
-      log('ERROR', `[SIMULATION] ❌ Compra ignorada em ${marketSlug}: Caixa insuficiente ($${currentAvailableCash.toFixed(2)}) para o custo de $${tradeCost.toFixed(2)}.`);
-      return;
-    }
-
-    // Atualizar o estado de caixa e capital bloqueado
-    financialState.availableCash = currentAvailableCash - tradeCost;
-    financialState.committedCapital = (financialState.committedCapital || 0) + tradeCost;
-
-    const existing = simulatedPositions.get(posKey);
-
-    if (existing) {
-      // Recalcular Preço Médio (DCA)
-      const totalSize = existing.size + scaledSize;
-      const avgPrice = ((existing.entryPrice * existing.size) + (trade.price * scaledSize)) / totalSize;
-
-      simulatedPositions.set(posKey, {
-        ...existing,
-        size: totalSize,
-        entryPrice: avgPrice,
-        timestamp: Date.now(),
-      });
-    } else {
-      simulatedPositions.set(posKey, {
-        traderAddress: trade.traderAddress,
-        marketSlug: marketSlug,
-        outcome: trade.outcome,
-        side: 'BUY',
-        size: scaledSize, // Usa o tamanho dimensionado!
-        entryPrice: trade.price,
-        timestamp: Date.now(),
-      });
-    }
-
-    log('TRADE', `[SIMULATION] Smart Money BUY: ${scaledSize.toFixed(1)} shares @ $${trade.price.toFixed(3)} em ${marketSlug} ${outcomeSuffix} | Caixa Restante: $${financialState.availableCash.toFixed(2)}`);
-
-  } else if (trade.side === 'SELL') {
-    const existingPos = simulatedPositions.get(posKey);
-
-    if (!existingPos || existingPos.size <= 0) {
-      log('INFO', `[SIMULATION] Venda ignorada (${marketSlug}): sem posição de compra correspondente.`);
-      return;
-    }
-
-    // 🛡️ PROTEÇÃO: Vende no MÁXIMO o número de shares que TU tens guardadas na memória
-    const closedShares = Math.min(existingPos.size, existingPos.size * (trade.size / (trade.size || 1)));
-    const actualClosedShares = Math.min(closedShares, existingPos.size);
-
-    const tradeProceeds = actualClosedShares * trade.price;
-    const costBasis = actualClosedShares * existingPos.entryPrice;
-    const profit = (trade.price - existingPos.entryPrice) * actualClosedShares;
-
-    // Libertar capital bloqueado e reintegrar o valor da venda no caixa disponível
-    financialState.committedCapital = Math.max(0, (financialState.committedCapital || 0) - costBasis);
-    financialState.availableCash = (financialState.availableCash || 0) + tradeProceeds;
-
-    if (existingPos.size - actualClosedShares > 0.01) {
-      existingPos.size -= actualClosedShares;
-      simulatedPositions.set(posKey, existingPos);
-    } else {
-      simulatedPositions.delete(posKey); // Elimina a posição se foi toda vendida
-    }
-
-    log('TRADE', `[SIMULATION] Smart Money SELL: ${actualClosedShares.toFixed(1)} shares @ $${trade.price.toFixed(3)} | PnL: $${profit.toFixed(2)} | Novo Caixa: $${financialState.availableCash.toFixed(2)}`);
-    recordTrade(profit, 'smartMoney');
-  }
-}
 
 function simulateTrade(profit: number, strategy: string, description: string) {
   if (!CONFIG.dryRun || !state.paper) return;
@@ -585,12 +519,7 @@ function simulateTrade(profit: number, strategy: string, description: string) {
 // ============================================================================
 
 let arbService: ArbitrageService | null = null;
-let isSmartMoneyInitialized = false;
-let isSmartMoneyInitializing = false;
-//let currentSmartMoneySub: any = null;
-let currentSmartMoneySub: { id: string; unsubscribe: () => void } | null = null;
 let autoCopyTradingSubscription: { id: string; stop: () => void } | null = null;
-let qualifiedCache: string[] = [];
 const liveMarketPrices = new Map<string, number>();
 
 
@@ -603,28 +532,6 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
   }
 }
 
-const recentSmartMoneyTradesCache = new Map<string, number>();
-
-function isDuplicateSmartMoneyTrade(trade: any): boolean {
-  // Gera uma impressão digital baseada no trader, mercado, ação (BUY/SELL), quantidade e preço
-  const signature = `${trade.traderAddress}-${trade.marketSlug || trade.market}-${trade.side}-${trade.size}-${trade.price}`;
-  const now = Date.now();
-
-  // Limpa registos mais antigos que 3 segundos (3000 ms)
-  for (const [key, timestamp] of recentSmartMoneyTradesCache.entries()) {
-    if (now - timestamp > 3000) {
-      recentSmartMoneyTradesCache.delete(key);
-    }
-  }
-
-  // Se o sinal já deu entrada nos últimos 3s, é duplicado!
-  if (recentSmartMoneyTradesCache.has(signature)) {
-    return true;
-  }
-
-  recentSmartMoneyTradesCache.set(signature, now);
-  return false;
-}
 
 async function updatePricesCache(sdk: PolymarketSDK, marketSlug: string) {
   try {
@@ -683,11 +590,6 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
       execPrice = cachedPrice;
     }
   }
-
-  /** 
-  const execShares = trade.size * (CONFIG.smartMoney.sizeScale || 0.25);
-  const tradeCost = execShares * execPrice;
-  **/
 
   const sizeScale = CONFIG.smartMoney.sizeScale || 0.1;
   const maxSizePerTrade = CONFIG.smartMoney.maxSizePerTrade || 3.0; // Põe o teu teto máximo (ex: 3 ou o valor do config)
@@ -748,7 +650,6 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
       const existingPos = realPositions.get(posKey);
 
       if (existingPos && existingPos.size > 0) {
-        //const closedShares = Math.min(existingPos.size, execShares);
         const closedShares = existingPos.size;
         const profit = (execPrice - existingPos.avgEntryPrice) * closedShares;
         const tradeProceeds = closedShares * execPrice;
@@ -758,14 +659,6 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
         financialState.committedCapital = Math.max(0, (financialState.committedCapital || 0) - costBasis);
         financialState.availableCash = (financialState.availableCash || 0) + tradeProceeds;
 
-        /** 
-        if (existingPos.size - closedShares > 0.01) {
-          existingPos.size -= closedShares;
-          realPositions.set(posKey, existingPos);
-        } else {
-          realPositions.delete(posKey);
-        }
-          **/
         realPositions.delete(posKey);
 
         log('TRADE', `✅ [DRY_RUN] SELL: ${closedShares.toFixed(1)} shares | PnL: $${profit.toFixed(2)} | Novo Caixa: $${financialState.availableCash.toFixed(2)}`);
@@ -783,13 +676,12 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
 }
 
 async function initializeSmartMoney(sdk: PolymarketSDK) {
-  isSmartMoneyInitializing = true;
 
   log('WALLET', 'Configurando Smart Money com filtros completos de qualidade...');
 
   //const qualified: string[] = [];
   //const qualified = await conservativeQualifiedWallets(sdk);
-  const qualified = await agressiveQualifiedWallets(sdk);
+  const qualified = await smartHybridQualifiedWallets(sdk);
 
   if (!qualified) {
     return;
@@ -819,7 +711,6 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
       dryRun: isDryRun, // 👈 O SDK simula se for true, executa ordens reais se for false
       onTrade: async (trade, result) => {
         try {
-          //if (isDuplicateSmartMoneyTrade(trade)) return;
 
           if (trade.marketSlug) {
             await updatePricesCache(sdk, trade.marketSlug);
@@ -827,7 +718,6 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
 
           processTradeExecution(sdk, trade, result);
 
-          //updateDashboard();
         } finally {
           activeTradesProcessing--;
         }
@@ -835,9 +725,6 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
       onError: (err) => log('ERROR', `❌ ${modeTag} Erro no motor de Copy Trading: ${err.message}`),
     });
   }
-
-  isSmartMoneyInitialized = true;
-  isSmartMoneyInitializing = false;
 }
 
 async function setupPriceMonitor(sdk: PolymarketSDK) {
@@ -855,112 +742,6 @@ async function setupPriceMonitor(sdk: PolymarketSDK) {
     }
   });
   log('INFO', '✅ Motor de monitorização de preços integrado e ativo.');
-}
-
-async function initializeSmartMoney__(sdk: PolymarketSDK) {
-  //if (isSmartMoneyInitialized || isSmartMoneyInitializing) return;
-
-  /**
-  if (isSmartMoneyInitializing) {
-    log('WARN', '⚠️ Inicialização do Smart Money já está em andamento. Chamada ignorada.');
-    return;
-  }
-    **/
-
-  isSmartMoneyInitializing = true;
-
-  log('WALLET', 'Configurando Smart Money com filtros completos de qualidade...');
-
-  const qualified: string[] = [];
-
-  if (CONFIG.smartMoney.customWallets?.length > 0) {
-    for (const wallet of CONFIG.smartMoney.customWallets) {
-      qualified.push(wallet);
-      log('WALLET', `⭐ Carteira personalizada adicionada: ${wallet.slice(0, 10)}...`);
-    }
-  }
-
-  try {
-    const leaderboard = await sdk.wallets.getLeaderboardByPeriod('week', CONFIG.smartMoney.topN * 2, 'pnl');
-
-    for (const entry of leaderboard) {
-      if (!CONFIG.smartMoney.enabled && qualified.length === 0) break;
-      if (qualified.length >= 10) break;
-      if (qualified.includes(entry.address)) continue;
-
-      const profile = await sdk.wallets.getWalletProfile(entry.address);
-      if (!profile) continue;
-
-      const winRate = (profile as any).winRate ?? 0;
-      const pnl = entry.pnl ?? 0;
-      const trades = profile.tradeCount ?? 0;
-      const profitFactor = (profile as any).profitFactor ?? 2.0;
-
-      // Fix do Issue: Aplicação de todos os filtros de qualidade
-      if (
-        winRate >= CONFIG.smartMoney.minWinRate &&
-        pnl >= CONFIG.smartMoney.minPnl &&
-        trades >= CONFIG.smartMoney.minTrades &&
-        profitFactor >= CONFIG.smartMoney.minProfitFactor
-      ) {
-        qualified.push(entry.address);
-        log('WALLET', `✅ Carteira Qualificada: ${entry.address.slice(0, 10)}... (WR:${(winRate * 100).toFixed(0)}% PnL:$${pnl.toFixed(0)} T:${trades})`);
-      }
-
-      await new Promise(r => setTimeout(r, 300));
-    }
-  } catch (err) {
-    log('WARN', `Erro ao carregar Leaderboard: ${(err as Error).message}`);
-  }
-
-  state.followedWallets = qualified;
-  log('WALLET', `A seguir ${qualified.length} carteiras qualificadas`);
-  updateDashboard();
-
-  if (qualified.length > 0) {
-    currentSmartMoneySub = sdk.smartMoney.subscribeSmartMoneyTrades(
-      async (trade: SmartMoneyTrade) => {
-
-        try {
-          if (!CONFIG.smartMoney.enabled) return;
-          if (!canTrade()) return; // Fix do Issue: Validação de risco antes de processar
-
-          const signal: SmartMoneySignal = {
-            id: `sm-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-            timestamp: new Date().toISOString(),
-            wallet: trade.traderAddress,
-            market: trade.marketSlug || 'Unknown',
-            side: trade.side as 'BUY' | 'SELL',
-            size: trade.size,
-            price: trade.price,
-          };
-          state.smartMoneySignals.unshift(signal);
-          if (state.smartMoneySignals.length > 50) {
-            state.smartMoneySignals = state.smartMoneySignals.slice(0, 50);
-          }
-
-          log('SIGNAL', `Sinal de Copy Trade recebido de ${trade.traderAddress.slice(0, 10)}...`, {
-            market: trade.marketSlug?.slice(0, 50),
-            side: trade.side,
-            size: trade.size,
-            price: trade.price,
-          });
-          updateDashboard();
-
-          if (CONFIG.dryRun) {
-            simulateSmartMoneyTrade(trade); // Fix do Issue: Execução com rastreio de PnL real
-          } else {
-            // Lógica de execução em conta real (Live)
-          }
-        } finally {
-          activeTradesProcessing--; // 🟢 Ordem concluída: liberta rotação
-        }
-      }, {
-      filterAddresses: qualified
-    });
-  }
-  isSmartMoneyInitialized = true;
-  isSmartMoneyInitializing = false;
 }
 
 async function setupArbitrage(_sdk: PolymarketSDK) {
@@ -1166,6 +947,8 @@ async function setupDipArb(sdk: PolymarketSDK) {
 let swapService: SwapService | null = null;
 
 async function updateBalances(sdk: PolymarketSDK) {
+  //await sdk.tradingService.getPolymarketBalances()
+
   if (CONFIG.dryRun) {
     const totalUsdc = CONFIG.capital.totalUsd || 250
     state.usdcEBalance = totalUsdc + state.totalPnL;
@@ -1174,34 +957,6 @@ async function updateBalances(sdk: PolymarketSDK) {
     return;
   }
 
-
-  // 1. Saldo livre em USDC na CLOB (o dinheiro que tens parado na conta)
-  const balanceResponse = await sdk.tradingService.getBalanceAllowance('COLLATERAL');
-  const freeCash = (Number(balanceResponse?.balance) || 0) / 1e6;
-
-  // 2. Buscar posições ativas à Data API
-  const response = await fetch(`https://data-api.polymarket.com/positions?user=0xA54565850546fA81E11880F493749c7a07Aa7eDF`);
-  const apiPositions = await response.json();
-
-  let totalInitialInvested = 0; // O que gastaste a abrir as posições
-  let totalCurrentValue = 0;    // Quanto valem agora
-  let totalCashPnl = 0;         // Lucro/Prejuízo em USD acumulado
-
-  if (Array.isArray(apiPositions)) {
-    for (const pos of apiPositions) {
-      totalInitialInvested += Number(pos.initialValue) || 0;
-      totalCurrentValue += Number(pos.currentValue) || 0;
-      totalCashPnl += Number(pos.cashPnl) || 0;
-    }
-  }
-
-  // 3. Cálculo global do património e PnL
-  const totalPortfolioValue = freeCash + totalCurrentValue;
-
-  console.log(`💵 Saldo Livre: $${freeCash.toFixed(2)}`);
-  console.log(`📈 Valor Atual das Posições: $${totalCurrentValue.toFixed(2)}`);
-  console.log(`💰 Património Total (Livre + Posições): $${totalPortfolioValue.toFixed(2)}`);
-  console.log(`📊 PnL Total das Posições: $${totalCashPnl.toFixed(2)}`);
 
   if (!swapService) return;
   try {
@@ -1643,41 +1398,29 @@ async function main() {
   const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
   const TEN_MINUTES = 5 * 60 * 1000
   const THIRTY_MINUTES = 30 * 60 * 1000
-  /** 
+
+
   setInterval(async () => {
-    try {
-      log('INFO', '🔄 A reanalisar o mercado e a procurar novas carteiras de Smart Money...');
-      currentSmartMoneySub?.unsubscribe()
-      currentSmartMoneySub = null;
-      await setupSmartMoney(sdk);
-    } catch (err: any) {
-      log('WARN', `❌ Erro ao atualizar Smart Money em background: ${err.message}`);
+    log('INFO', '⏰ A verificar rotação de carteiras de Smart Money...');
+
+    if (autoCopyTradingSubscription) {
+      if (realPositions.size > 0) {
+        log('INFO', `⚠️ Existem ${realPositions.size} posições ativas. A adiar rotação de carteiras para evitar conflito...`);
+        return; // Ou podes optar por rodar na mesma, dependendo da tua arquitetura de posições
+      }
+
+      log('INFO', '🔄 A fechar subscrição antiga...');
+      autoCopyTradingSubscription.stop();
+      autoCopyTradingSubscription = null;
+      await new Promise(r => setTimeout(r, 4000)); // Pausa para fecho limpo do WS
     }
-  }, TEN_MINUTES);
-  **/
-  /**
-   setInterval(async () => {
-     log('INFO', '⏰ A verificar rotação de carteiras de Smart Money...');
- 
-     // Se houver alguma ordem a ser copiada NESTE instante, aguarda uns segundos
-     if (activeTradesProcessing > 0) {
-       log('WARN', `⏳ Existe(m) ${activeTradesProcessing} ordem(ns) a ser processada(s). A aguardar conclusão...`);
-       await new Promise(r => setTimeout(r, 2000));
-     }
- 
-     // Faz a rotação limpa: cancela a antiga e inicia a nova lista
-     if (autoCopyTradingSubscription) {
-       log('INFO', '🔄 A fechar subscrição antiga...');
-       autoCopyTradingSubscription.stop();
-       autoCopyTradingSubscription = null;
-       await new Promise(r => setTimeout(r, 4000)); // Pausa para fecho do WS no SDK
-     }
- 
-     // Carrega as novas carteiras e subscreve de novo
-     await initializeSmartMoney(sdk);
- 
-   }, TWO_HOURS_MS);
-   **/
+
+    // Carrega as novas carteiras e reinicia a escuta
+    await initializeSmartMoney(sdk);
+    log('INFO', '✅ Rotação de Smart Money concluída com sucesso.');
+
+  }, TWO_HOURS_MS);
+
   // 2. Re-verificação de Arbitragem (A cada 10 minutos)
   /** 
   setInterval(async () => {
