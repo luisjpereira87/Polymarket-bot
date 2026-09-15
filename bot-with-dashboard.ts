@@ -506,6 +506,73 @@ async function agressiveQualifiedWallets(sdk: PolymarketSDK) {
   }
 }
 
+async function whalesQualifiedWallets(sdk: PolymarketSDK): Promise<string[]> {
+  try {
+    const qualified: string[] = [];
+
+    // 1. Adicionar carteiras personalizadas definidas nas configurações (se existirem)
+    if (CONFIG.smartMoney.customWallets && CONFIG.smartMoney.customWallets.length > 0) {
+      for (const wallet of CONFIG.smartMoney.customWallets) {
+        qualified.push(wallet);
+        log('WALLET', `⭐ Carteira personalizada adicionada: ${wallet.slice(0, 10)}...`);
+      }
+    }
+
+    // 2. Obter o leaderboard focado em lucro (PnL)
+    const leaderboard = await sdk.wallets.getLeaderboardByPeriod('week', CONFIG.smartMoney.topN * 3, 'pnl');
+    log('WALLET', `📊 Leaderboard obtido: ${leaderboard.length} carteiras para analisar.`);
+
+    for (const entry of leaderboard) {
+      if (!CONFIG.smartMoney.enabled && qualified.length === 0) break;
+      if (qualified.length >= 15) break;
+      if (qualified.includes(entry.address)) continue;
+
+      const profile: WalletProfile | null = await sdk.wallets.getWalletProfile(entry.address);
+      if (!profile) {
+        log('INFO', `⚠️ Perfil não encontrado para ${entry.address.slice(0, 10)}...`);
+        continue;
+      }
+
+      // 🔍 Captura flexível de propriedades (protege contra diferenças de nomenclatura na SDK)
+      const winRate = profile.winRate ?? (profile as any).win_rate ?? 0;
+      const totalPnL = profile.totalPnL ?? (profile as any).pnl ?? (profile as any).profit ?? 0;
+      const smartScore = profile.smartScore ?? (profile as any).smart_score ?? 0;
+      const trades = profile.tradeCount ?? (profile as any).trades_count ?? (profile as any).trades ?? 0;
+
+      const lastActiveRaw = profile.lastActiveAt ?? (profile as any).last_active_at ?? Date.now();
+      const lastActive = new Date(lastActiveRaw).getTime();
+      const hoursSinceLastActive = (Date.now() - lastActive) / (1000 * 60 * 60);
+
+      // 🪵 Log de diagnóstico para sabermos porque é que foi aceite ou rejeitado
+      log('INFO', `Wallet ${entry.address.slice(0, 8)} -> PnL: $${totalPnL} | WR: ${(winRate * 100).toFixed(1)}% | Score: ${smartScore} | Trades: ${trades} | Horas inativo: ${hoursSinceLastActive.toFixed(0)}h`);
+
+      // 🛡️ Filtros temporariamente mais tolerantes para testes (evita bloqueio total)
+      const minRequiredPnL = 10000;           //baixado temporariamente para $10k para teste(podes subir depois para 100000)
+      const minWinRate = 0.45;                // Tolerância maior para grandes traders
+      const minSmartScore = 20;               // Evita rejeitar perfis sem score calculado
+
+      const isProfitable = totalPnL >= minRequiredPnL;
+      const hasReasonableWinRate = winRate >= minWinRate;
+      const isRecentlyActive = hoursSinceLastActive <= 168; // Alargado para 7 dias para testes
+
+      if (isProfitable && hasReasonableWinRate && isRecentlyActive) {
+        qualified.push(entry.address);
+        log('WALLET', `🐋 Mega Baleia Qualificada: ${entry.address.slice(0, 10)}... (PnL: $${Number(totalPnL).toLocaleString()} | WR: ${(winRate * 100).toFixed(0)}% | Trades: ${trades})`);
+      } else {
+        log('INFO', `❌ Rejeitada: PnLOK=${isProfitable}, WROK=${hasReasonableWinRate}, ActiveOK=${isRecentlyActive}`);
+      }
+
+      await new Promise(r => setTimeout(r, 250)); // Respeitar rate limits da SDK
+    }
+
+    log('WALLET', `✅ Total de carteiras qualificadas encontradas: ${qualified.length}`);
+    return qualified;
+  } catch (err) {
+    log('WARN', `Erro ao carregar Leaderboard Híbrido: ${(err as Error).message}`);
+    return [];
+  }
+}
+
 
 function simulateTrade(profit: number, strategy: string, description: string) {
   if (!CONFIG.dryRun || !state.paper) return;
@@ -681,7 +748,7 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
 
   //const qualified: string[] = [];
   //const qualified = await conservativeQualifiedWallets(sdk);
-  const qualified = await smartHybridQualifiedWallets(sdk);
+  const qualified = await whalesQualifiedWallets(sdk);
 
   if (!qualified) {
     return;
@@ -790,34 +857,196 @@ async function setupArbitrage(_sdk: PolymarketSDK) {
 
   if (CONFIG.arbitrage.enabled) {
     state.arbitrage.status = 'scanning';
-    try {
-      const results = await arbService.scanMarkets(
-        { minVolume24h: CONFIG.arbitrage.minVolume24h },
-        CONFIG.arbitrage.profitThreshold
-      );
-      state.arbitrage.marketsScanned = results.length;
-      const opps = results.filter(r => r.arbType !== 'none');
+    const runArbScanLoop = async () => {
+      if (!arbService) return;
+      try {
+        const results = await arbService.scanMarkets(
+          { minVolume24h: CONFIG.arbitrage.minVolume24h },
+          CONFIG.arbitrage.profitThreshold
+        );
+        state.arbitrage.marketsScanned = results.length;
+        const opps = results.filter(r => r.arbType !== 'none');
 
-      if (opps.length > 0) {
-        state.activeArbMarket = opps[0].market.name;
-        state.arbitrage.currentMarket = opps[0].market.name;
-        state.arbitrage.status = 'monitoring';
-        await arbService.start(opps[0].market);
-        log('ARB', `A monitorizar mercado: ${opps[0].market.name}`);
-      } else {
+        if (opps.length > 0) {
+          state.activeArbMarket = opps[0].market.name;
+          state.arbitrage.currentMarket = opps[0].market.name;
+          state.arbitrage.status = 'monitoring';
+          await arbService.start(opps[0].market);
+          log('ARB', `A monitorizar mercado: ${opps[0].market.name}`);
+        } else {
+          state.arbitrage.status = 'idle';
+          log('ARB', 'Sem oportunidades de arbitragem no momento, continuando varredura...');
+        }
+        updateDashboard();
+      } catch (err) {
         state.arbitrage.status = 'idle';
-        log('ARB', 'Sem oportunidades de arbitragem no momento, continuando varredura...');
+        log('WARN', `Erro no scan de arbitragem: ${(err as Error).message}`);
+        updateDashboard();
       }
-      updateDashboard();
-    } catch (err) {
-      state.arbitrage.status = 'idle';
-      log('WARN', `Erro no scan de arbitragem: ${(err as Error).message}`);
-      updateDashboard();
-    }
+    };
+    runArbScanLoop();
+    setInterval(runArbScanLoop, 30000);
   }
 }
 
+let activeDipArbInstance: any = null;
+async function startDipArbService(sdk: PolymarketSDK, coin: 'ETH' | 'BTC' | 'SOL') {
+  log('ARB', `A iniciar nova instância limpa de DipArb para: ${coin}...`);
+
+  // 1. HARD RESET: Se já houver uma instância viva, mata-a por completo
+  if (sdk.dipArb) {
+    try {
+      // Tenta parar se o método existir de forma segura
+      if (typeof sdk.dipArb.stop === 'function') {
+        log('ARB', 'A invocar .stop() no serviço atual...');
+        await sdk.dipArb.stop();
+      }
+    } catch (e) {
+      log('WARN', `Aviso ao parar o serviço (ignorado): ${(e as Error).message}`);
+    }
+
+    // Remove obrigatoriamente todos os event listeners para evitar duplicações
+    if (typeof sdk.dipArb.removeAllListeners === 'function') {
+      sdk.dipArb.removeAllListeners();
+      log('ARB', 'Listeners anteriores limpidos com sucesso.');
+    }
+  }
+
+  // 2. CONFIGURAÇÃO DE PARÂMETROS
+  sdk.dipArb.updateConfig({
+    shares: CONFIG.dipArb.shares,
+    sumTarget: CONFIG.dipArb.sumTarget,
+    autoExecute: !CONFIG.dryRun,
+    debug: true,
+  });
+
+  // 3. REGISTO DE EVENTOS (Regista os listeners de novo na instância limpa)
+  sdk.dipArb.on('orderbookUpdate', (update: { upPrice: number; downPrice: number; sum: number }) => {
+    state.dipArb.upPrice = update.upPrice;
+    state.dipArb.downPrice = update.downPrice;
+    state.dipArb.sum = update.sum;
+    updateDashboard();
+  });
+
+  sdk.dipArb.on('started', (market: any) => {
+    log('ARB', `DipArb Ativo no mercado: ${market.name}`);
+    state.activeDipArbMarket = market.name;
+    state.dipArb.marketName = market.name;
+    state.dipArb.underlying = market.underlying || coin;
+    state.dipArb.duration = `${market.durationMinutes}m`;
+    state.dipArb.endTime = market.endTime ? new Date(market.endTime).getTime() : null;
+    state.dipArb.status = 'active';
+    updateDashboard();
+
+    dashboardEmitter.updateStrategyStatus('dipArb', 'active', market.name);
+  });
+
+  sdk.dipArb.on('signal', (s: {
+    type: 'leg1' | 'leg2';
+    dipSide?: string;
+    hedgeSide?: string;
+    currentPrice: number;
+    source?: string;
+    dropPercent?: number;
+  }) => {
+    const side = s.dipSide || s.hedgeSide || 'UP';
+    const signal: DipArbSignal = {
+      id: `da-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      timestamp: new Date().toISOString(),
+      type: s.type as DipArbSignal['type'],
+      side: side as 'UP' | 'DOWN',
+      price: s.currentPrice || 0,
+      change: s.dropPercent ? -s.dropPercent * 100 : 0,
+    };
+    state.dipArb.lastSignal = signal;
+    state.dipArb.signals.unshift(signal);
+    if (state.dipArb.signals.length > 20) {
+      state.dipArb.signals = state.dipArb.signals.slice(0, 20);
+    }
+    log('SIGNAL', `Sinal DipArb: ${s.type} ${side} @ ${s.currentPrice?.toFixed(3)}`);
+    updateDashboard();
+  });
+
+  sdk.dipArb.on('execution', (r: any) => {
+    if (r.success) {
+      const price = r.price ? r.price.toFixed(3) : '??';
+      const shares = r.shares ? r.shares.toFixed(1) : '??';
+      const market = state.activeDipArbMarket || 'unknown-market';
+
+      switch (r.leg) {
+        case 'leg1':
+          log('TRADE', `ABERTURA ${r.side} | ${shares} shares @ $${price} | ${market}`);
+          break;
+        case 'leg2':
+          log('TRADE', `COBERTURA ${r.side} | ${shares} shares @ $${price} | Lucro Travado`);
+          break;
+        case 'exit':
+          log('TRADE', `FECHO ${r.side} (Timeout Exit) | ${shares} shares @ $${price}`);
+          break;
+        case 'merge':
+          log('TRADE', `RESGATE | Posições combinadas por payout de $1.00 | ${market}`);
+          break;
+        default:
+          log('TRADE', `DipArb ${r.leg}: ${r.side} @ ${price}`);
+      }
+      recordTrade(0, 'dipArb');
+    } else {
+      log('WARN', `Execução DipArb Falhou (${r.leg}): ${r.error || 'Erro desconhecido'}`);
+    }
+  });
+
+  // 4. ARRANQUE COM TENTATIVAS (Blindagem contra falhas RPC momentâneas)
+  let market = null;
+  let attempts = 0;
+  while (!market && attempts < 3) {
+    try {
+      attempts++;
+      market = await sdk.dipArb.findAndStart({ coin: coin as any, preferDuration: '15m' });
+    } catch (err) {
+      log('WARN', `Tentativa ${attempts} falhou ao iniciar ${coin}: ${(err as Error).message}`);
+      await new Promise(resolve => setTimeout(resolve, 3000)); // Aguarda 3s antes de retentar
+    }
+  }
+
+  if (market) {
+    activeDipArbInstance = sdk.dipArb; // Guarda a referência ativa
+    log('ARB', `DipArb arrancou com sucesso para: ${market.name}`);
+  } else {
+    log('WARN', `Não foi possível iniciar o DipArb para ${coin} após 3 tentativas.`);
+  }
+
+  updateDashboard();
+}
+
 async function setupDipArb(sdk: PolymarketSDK) {
+
+  const coinsToRotate: ('ETH' | 'BTC' | 'SOL')[] = ['ETH', 'BTC', 'SOL'];
+  let coinIndex = 0;
+
+  // 1. Arranque inicial da primeira moeda
+  if (CONFIG.dipArb.enabled) {
+    await startDipArbService(sdk, coinsToRotate[coinIndex]);
+  }
+
+  // 2. Loop de controlo que destrói e recria de raiz quando o mercado acaba
+  setInterval(async () => {
+    const now = Date.now();
+    const endTime = state.dipArb.endTime;
+
+    if (endTime && now >= endTime - 5000) {
+      log('ARB', 'Mercado atual expirou. A executar reset total e a mudar de ativo...');
+
+      // Avança para a próxima moeda da lista
+      coinIndex = (coinIndex + 1) % coinsToRotate.length;
+      const nextCoin = coinsToRotate[coinIndex];
+
+      // Destrói tudo o que é antigo e arranca uma nova instância limpa
+      await startDipArbService(sdk, nextCoin);
+    }
+  }, 10000);
+}
+
+async function setupDipArb__(sdk: PolymarketSDK) {
   log('ARB', 'Configurando Serviço DipArb...');
 
   sdk.dipArb.updateConfig({
@@ -906,10 +1135,34 @@ async function setupDipArb(sdk: PolymarketSDK) {
     }
   });
 
-  sdk.dipArb.on('rotate', (e: { newMarket: string }) => {
+  /** 
+  sdk.dipArb.on('rotate', (e: { previousMarket: string; newMarket: string; marketDetails?: any }) => {
+    console.log("AQUIII ROTATE", e)
     state.activeDipArbMarket = e.newMarket;
     state.dipArb.marketName = e.newMarket;
     log('ARB', `DipArb rodou para o mercado: ${e.newMarket}`);
+    updateDashboard();
+  });
+  **/
+
+  sdk.dipArb.on('rotate', (e: { previousMarket: string; newMarket: string; marketDetails?: any }) => {
+    // Usa diretamente o nome e a slug que vieram no objeto de mercado!
+    const marketName = e.marketDetails?.name || 'Novo Mercado';
+    const marketSlug = e.marketDetails?.slug;
+
+    console.log("AQUIIIIII", e)
+
+    state.activeDipArbMarket = marketName;
+    state.dipArb.marketName = marketName;
+
+    // Recalcula o endTime exato pela slug instantaneamente
+    if (marketSlug) {
+      const slugParts = marketSlug.split('-');
+      const timestampSec = parseInt(slugParts[slugParts.length - 1], 10);
+      state.dipArb.endTime = !isNaN(timestampSec) ? timestampSec * 1000 : null;
+    }
+
+    log('ARB', `DipArb rodou para o mercado: ${marketName}`);
     updateDashboard();
   });
 

@@ -531,6 +531,12 @@ export class DipArbService extends EventEmitter {
       this.chainlinkSubscription = null;
     }
 
+    if (this.realtimeService) {
+      this.realtimeService.disconnect();
+    }
+
+     await new Promise(r => setTimeout(r, 2000 ));
+
     // Update stats
     this.stats.runningTimeMs = Date.now() - this.stats.startTime;
 

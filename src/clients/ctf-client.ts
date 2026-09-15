@@ -23,7 +23,7 @@
  * https://docs.polymarket.com/developers/CTF/overview
  */
 
-import { ethers, Contract, Wallet, BigNumber } from 'ethers';
+import { BigNumber, Contract, ethers, Wallet } from 'ethers';
 
 // ===== Contract Addresses (Polygon Mainnet) =====
 
@@ -180,7 +180,7 @@ export interface MarketResolution {
 const DEFAULT_MATIC_PRICE = 0.50;
 
 export class CTFClient {
-  private provider: ethers.providers.JsonRpcProvider;
+  private provider: ethers.providers.Provider;
   private wallet: Wallet;
   private ctfContract: Contract;
   private usdcContract: Contract;
@@ -190,15 +190,39 @@ export class CTFClient {
   private cachedMaticPrice: number = DEFAULT_MATIC_PRICE;
   private maticPriceLastUpdated: number = 0;
 
+
   constructor(config: CTFConfig) {
-    const rpcUrl = config.rpcUrl || 'https://polygon-rpc.com';
-    this.provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+    const defaultUrls = [
+      config.rpcUrl,
+      'https://polygon-rpc.com',
+      'https://polygon-bor-rpc.publicnode.com',
+      'https://rpc-mainnet.maticvigil.com'
+    ];
+
+    // Remove duplicados caso o config.rpcUrl coincida com algum da lista
+    const uniqueUrls = Array.from(new Set(defaultUrls));
+
+    const providers = uniqueUrls.map(url => new ethers.providers.JsonRpcProvider(url));
+
+    this.provider = new ethers.providers.FallbackProvider(
+      providers.map((p, index) => ({
+        provider: p,
+        priority: index + 1,
+        weight: 1,
+        stallTimeout: 2000,
+      })),
+      1 // Quorum de 1 (basta 1 RPC responder com sucesso)
+    );
     this.wallet = new Wallet(config.privateKey, this.provider);
     this.ctfContract = new Contract(CTF_CONTRACT, CTF_ABI, this.wallet);
     this.usdcContract = new Contract(USDC_CONTRACT, ERC20_ABI, this.wallet);
     this.gasPriceMultiplier = config.gasPriceMultiplier || 1.2;
     this.confirmations = config.confirmations || 1;
     this.txTimeout = config.txTimeout || 60000;
+
+
+
+
   }
 
   /**
