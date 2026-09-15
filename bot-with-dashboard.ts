@@ -46,7 +46,7 @@ let CONFIG = {
     maxConsecutiveLosses: 6,
     pauseOnBreachMinutes: 60,
 
-    monthlyMaxLossPct: 0.15,
+    monthlyMaxLossPct: 1, //0.15,
     maxDrawdownFromPeak: 0.25,
     totalMaxLossPct: 0.40,
 
