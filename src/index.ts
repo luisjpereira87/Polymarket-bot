@@ -233,6 +233,7 @@ import type { ArbitrageOpportunity, PolySDKOptions, ProcessedOrderbook, UnifiedM
 import { createUnifiedCache, type UnifiedCache } from './core/unified-cache.js';
 import { BinanceService } from './services/binance-service.js';
 import { DipArbService } from './services/dip-arb-service.js';
+import { DirectTradingService } from './services/direct-trading-service.js';
 import { MarketService } from './services/market-service.js';
 import { RealtimeServiceV2 } from './services/realtime-service-v2.js';
 import { SmartMoneyService } from './services/smart-money-service.js';
@@ -260,6 +261,7 @@ export class PolymarketSDK {
   public readonly smartMoney: SmartMoneyService;
   public readonly binance: BinanceService;
   public readonly dipArb: DipArbService;
+  public readonly directTrading: DirectTradingService;
 
   // Initialization state
   private _initialized = false;
@@ -311,6 +313,8 @@ export class PolymarketSDK {
       config.privateKey,
       config.chainId
     );
+
+    this.directTrading = new DirectTradingService(this.tradingService, this.markets, this.binance);
   }
 
   // ===== Static Factory Methods =====

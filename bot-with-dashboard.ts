@@ -119,7 +119,7 @@ let CONFIG = {
     enabled: process.env.TREND_ANALYSIS_ENABLED === 'true',
     symbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'] as const,
     interval: '15m' as const,
-    trendThreshold: 2,
+    trendThreshold: 0.3, //2,
   },
 
   directTrading: {
@@ -131,6 +131,7 @@ let CONFIG = {
     trailingStopPct: 0.10,
     maxHoldDays: 7,
     minRiskReward: 1.5,
+    minTradeValueUSD: 1.0,
   },
 
   dryRun: process.env.DRY_RUN !== 'false',
@@ -485,7 +486,7 @@ async function agressiveQualifiedWallets(sdk: PolymarketSDK) {
       const lastActive = new Date(profile.lastActiveAt).getTime();
       const now = Date.now();
       const hoursSinceLastActive = (now - lastActive) / (1000 * 60 * 60);
-      profile.winRate
+      const winRate = profile.winRate
 
       // Critério para Bots/HFT: Elevado número de trades, múltiplas posições e atividade recente (< 24h)
       if (
@@ -573,6 +574,43 @@ async function whalesQualifiedWallets(sdk: PolymarketSDK): Promise<string[]> {
   }
 }
 
+async function refreshWalletCache(sdk: PolymarketSDK) {
+  try {
+    log('WALLET', '🔄 A procurar novas carteiras...');
+
+    const qualified: string[] | undefined = await whalesQualifiedWallets(sdk);
+
+    if (!qualified || qualified.length === 0) {
+      log('WARN', '⚠️ A busca de carteiras não retornou resultados. A manter a cache atual.');
+      return;
+    }
+
+    // 1. Adicionar apenas as que ainda não existem (evita duplicados)
+    for (const wallet of qualified) {
+      if (!followedWalletsCache.includes(wallet)) {
+        followedWalletsCache.push(wallet);
+      }
+    }
+
+    // 2. Se ultrapassar o limite, remove as mais antigas do início da lista
+    if (followedWalletsCache.length > MAX_WALLETS_LIMIT) {
+      const excessCount = followedWalletsCache.length - MAX_WALLETS_LIMIT;
+      log('WALLET', `🧹 Limite excedido. A remover as ${excessCount} carteiras mais antigas...`);
+
+      // Remove do início (as mais antigas)
+      followedWalletsCache.splice(0, excessCount);
+    }
+
+    // 3. Atualiza o estado global
+    state.followedWallets = followedWalletsCache;
+    log('WALLET', `✅ Cache sincronizada. A seguir ${followedWalletsCache.length} carteiras.`);
+    updateDashboard();
+
+  } catch (err) {
+    log('WARN', `⚠️ Erro ao atualizar cache de carteiras: ${(err as Error).message}`);
+  }
+}
+
 
 function simulateTrade(profit: number, strategy: string, description: string) {
   if (!CONFIG.dryRun || !state.paper) return;
@@ -588,6 +626,8 @@ function simulateTrade(profit: number, strategy: string, description: string) {
 let arbService: ArbitrageService | null = null;
 let autoCopyTradingSubscription: { id: string; stop: () => void } | null = null;
 const liveMarketPrices = new Map<string, number>();
+const MAX_WALLETS_LIMIT = 15;
+let followedWalletsCache: string[] = [];
 
 
 let activeTradesProcessing = 0;
@@ -658,6 +698,7 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
     }
   }
 
+  /** 
   const sizeScale = CONFIG.smartMoney.sizeScale || 0.1;
   const maxSizePerTrade = CONFIG.smartMoney.maxSizePerTrade || 3.0; // Põe o teu teto máximo (ex: 3 ou o valor do config)
 
@@ -666,6 +707,30 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
 
   if (tradeCost > maxSizePerTrade) {
     tradeCost = maxSizePerTrade;
+    copySize = tradeCost / execPrice;
+  }
+
+  const execShares = copySize;
+  **/
+
+  let copySize = trade.size;
+  let tradeCost = 0;
+
+  if (trade.isSmartMoney) {
+    // 🐋 Apenas o Smart Money (Copy-Trading) usa escala e tetos máximos
+    const sizeScale = CONFIG.smartMoney.sizeScale || 0.1;
+    const maxSizePerTrade = CONFIG.smartMoney.maxSizePerTrade || 3.0;
+
+    copySize = trade.size * sizeScale;
+    tradeCost = copySize * trade.price;
+
+    if (tradeCost > maxSizePerTrade) {
+      tradeCost = maxSizePerTrade;
+      copySize = tradeCost / execPrice;
+    }
+  } else {
+    // 📈 Outras fontes (como o Direct Trading / Trend Following) usam o valor direto em USDC
+    tradeCost = trade.size;
     copySize = tradeCost / execPrice;
   }
 
@@ -742,13 +807,13 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
   updateDashboard();
 }
 
-async function initializeSmartMoney(sdk: PolymarketSDK) {
+async function initializeSmartMoney__(sdk: PolymarketSDK) {
 
   log('WALLET', 'Configurando Smart Money com filtros completos de qualidade...');
 
   //const qualified: string[] = [];
   //const qualified = await conservativeQualifiedWallets(sdk);
-  const qualified = await whalesQualifiedWallets(sdk);
+  const qualified = await agressiveQualifiedWallets(sdk);
 
   if (!qualified) {
     return;
@@ -785,6 +850,60 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
 
           processTradeExecution(sdk, trade, result);
 
+        } finally {
+          activeTradesProcessing--;
+        }
+      },
+      onError: (err) => log('ERROR', `❌ ${modeTag} Erro no motor de Copy Trading: ${err.message}`),
+    });
+  }
+}
+
+async function initializeSmartMoney(sdk: PolymarketSDK) {
+  log('WALLET', 'Configurando Smart Money com filtros completos de qualidade...');
+
+  const qualified = await whalesQualifiedWallets(sdk);
+
+  if (!qualified || qualified.length === 0) {
+    log('WARN', '⚠️ Nenhuma carteira qualificada encontrada.');
+    return;
+  }
+
+  // 1. Preenche a cache inicial garantindo o limite e sem duplicados
+  followedWalletsCache = [];
+  for (const wallet of qualified) {
+    if (!followedWalletsCache.includes(wallet) && followedWalletsCache.length < MAX_WALLETS_LIMIT) {
+      followedWalletsCache.push(wallet);
+    }
+  }
+
+  state.followedWallets = followedWalletsCache;
+  log('WALLET', `A seguir ${followedWalletsCache.length} carteiras qualificadas`);
+  updateDashboard();
+
+  // 2. Inicializar o Copy Trading do SDK
+  if (followedWalletsCache.length > 0) {
+    const isDryRun = CONFIG.dryRun;
+    const modeTag = isDryRun ? '🧪 [DRY_RUN]' : '🔴 [LIVE]';
+
+    log('TRADE', `${modeTag} A iniciar motor de Copy Trading no SDK (dryRun: ${isDryRun})...`);
+
+    autoCopyTradingSubscription = await sdk.smartMoney.startAutoCopyTrading({
+      targetAddresses: followedWalletsCache, // Usa a cache partilhada
+      sizeScale: CONFIG.smartMoney.sizeScale || 0.25,
+      maxSizePerTrade: CONFIG.smartMoney.maxSizePerTrade || 3.5,
+      maxSlippage: CONFIG.smartMoney.maxSlippage || 0.05,
+      minTradeSize: CONFIG.smartMoney.minTradeSize || 10,
+      delay: CONFIG.smartMoney.delay || 0,
+      isCanTrade: () => canTrade(),
+      positions: () => realPositions,
+      dryRun: isDryRun,
+      onTrade: async (trade, result) => {
+        try {
+          if (trade.marketSlug) {
+            await updatePricesCache(sdk, trade.marketSlug);
+          }
+          processTradeExecution(sdk, trade, result);
         } finally {
           activeTradesProcessing--;
         }
@@ -1305,105 +1424,23 @@ async function setupOnchain() {
   }
 }
 
-async function setupBinanceAnalysis(sdk: PolymarketSDK) {
-  if (!CONFIG.binance.enabled) return;
-  log('KLINE', 'Configurando análise de tendências via Binance...');
-
-  async function analyzeTrend(symbol: 'BTCUSDT' | 'ETHUSDT' | 'SOLUSDT'): Promise<'up' | 'down' | 'neutral'> {
-    try {
-      const klines = await sdk.binance.getKLines(symbol, CONFIG.binance.interval, { limit: 20 });
-      if (klines.length < 10) return 'neutral';
-
-      const recent = klines.slice(-5);
-      const older = klines.slice(-10, -5);
-
-      const recentAvg = recent.reduce((s, k) => s + k.close, 0) / recent.length;
-      const olderAvg = older.reduce((s, k) => s + k.close, 0) / older.length;
-
-      const change = (recentAvg - olderAvg) / olderAvg;
-
-      if (change > CONFIG.binance.trendThreshold / 100) return 'up';
-      if (change < -CONFIG.binance.trendThreshold / 100) return 'down';
-      return 'neutral';
-    } catch {
-      return 'neutral';
-    }
-  }
-
-  async function updateTrends() {
-    state.btcTrend = await analyzeTrend('BTCUSDT');
-    state.ethTrend = await analyzeTrend('ETHUSDT');
-    state.solTrend = await analyzeTrend('SOLUSDT');
-    log('TREND', `Tendências Binance: BTC:${state.btcTrend} ETH:${state.ethTrend} SOL:${state.solTrend}`);
-    updateDashboard();
-  }
-
-  await updateTrends();
-  setInterval(updateTrends, 5 * 60 * 1000);
-}
-
 async function setupDirectTrading(sdk: PolymarketSDK) {
-  log('INFO', 'Direct Trading pronto - aguardando execução');
-
-  async function checkTrendTrades() {
-    if (!CONFIG.directTrading.enabled) return;
-    if (!canTrade()) return;
-
-    try {
-      const trendingMarkets = await sdk.gammaApi.getTrendingMarkets(5);
-
-      for (const market of trendingMarkets) {
-        if (!market.conditionId) continue;
-
-        try {
-          const fullMarket = await sdk.getMarket(market.conditionId);
-          const yesToken = fullMarket.tokens.find(t => t.outcome === 'Yes');
-          const noToken = fullMarket.tokens.find(t => t.outcome === 'No');
-
-          if (!yesToken || !noToken) continue;
-
-          const isCryptoMarket = /btc|bitcoin|eth|ethereum|sol|solana/i.test(market.question || '');
-
-          if (isCryptoMarket && CONFIG.directTrading.trendFollowing) {
-            let trend: 'up' | 'down' | 'neutral' = 'neutral';
-            if (/btc|bitcoin/i.test(market.question || '')) trend = state.btcTrend;
-            else if (/eth|ethereum/i.test(market.question || '')) trend = state.ethTrend;
-            else if (/sol|solana/i.test(market.question || '')) trend = state.solTrend;
-
-            if (trend !== 'neutral') {
-              const targetToken = trend === 'up' ? yesToken : noToken;
-              const price = targetToken.price;
-
-              if (CONFIG.dryRun) {
-                simulateTrade(0, 'direct', `Sinal Direct Trading: ${market.question?.slice(0, 40)}... → ${trend.toUpperCase()} @ $${price.toFixed(2)}`);
-              } else {
-                const amountUsdc = 5;
-                log('SIGNAL', `Executando Direct Trade: ${trend.toUpperCase()} em ${market.question?.slice(0, 30)}...`);
-
-                sdk.tradingService.createMarketOrder({
-                  tokenId: targetToken.tokenId,
-                  side: 'BUY',
-                  amount: amountUsdc
-                }).then(res => {
-                  if (res.success) {
-                    log('TRADE', `✅ Direct Trade Executado: Compra de $${amountUsdc} em ${targetToken.outcome}`);
-                    recordTrade(0, 'direct');
-                  } else {
-                    log('WARN', `❌ Direct Trade falhou: ${res.errorMsg}`);
-                  }
-                });
-              }
-            }
-          }
-        } catch { /* ignora erros pontuais */ }
+  sdk.directTrading.startTradingLoop(
+    {
+      enabled: CONFIG.directTrading.enabled,
+      interval: CONFIG.binance.interval,
+      trendThreshold: CONFIG.binance.trendThreshold,
+      amount: CONFIG.directTrading.minTradeValueUSD || 5,
+      dryRun: CONFIG.dryRun,
+      checkIntervalMs: 5 * 60 * 1000
+    },
+    {
+      onTrade: async (trade, result) => {
+        // Aqui lidas com a execução através da tua função unificada que atualiza o dashboard e o portfólio
+        processTradeExecution(sdk, trade, result);
       }
-    } catch (err) {
-      log('WARN', `Erro no Direct Trading: ${(err as Error).message}`);
     }
-  }
-
-  setInterval(checkTrendTrades, 5 * 60 * 1000);
-  setTimeout(checkTrendTrades, 10000);
+  );
 }
 
 async function setupPortfolioManager(sdk: PolymarketSDK) {
@@ -1640,7 +1677,6 @@ async function main() {
 
   await setupOnchain();
   await setupSwap(sdk);
-  await setupBinanceAnalysis(sdk);
   await setupSmartMoney(sdk);
   await setupArbitrage(sdk);
   await setupDipArb(sdk);
@@ -1652,7 +1688,7 @@ async function main() {
   const TEN_MINUTES = 5 * 60 * 1000
   const THIRTY_MINUTES = 30 * 60 * 1000
 
-
+  /**
   setInterval(async () => {
     log('INFO', '⏰ A verificar rotação de carteiras de Smart Money...');
 
@@ -1673,6 +1709,18 @@ async function main() {
     log('INFO', '✅ Rotação de Smart Money concluída com sucesso.');
 
   }, TWO_HOURS_MS);
+
+  **/
+  setInterval(async () => {
+    log('INFO', '⏰ A verificar rotação de carteiras de Smart Money...');
+
+    await refreshWalletCache(sdk)
+    log('INFO', '✅ Rotação de Smart Money concluída com sucesso.');
+
+  }, TWO_HOURS_MS);
+
+
+
 
   // 2. Re-verificação de Arbitragem (A cada 10 minutos)
   /** 
