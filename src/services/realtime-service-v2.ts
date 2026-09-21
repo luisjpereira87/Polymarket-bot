@@ -202,6 +202,8 @@ export interface ActivityTrade {
   /** Transaction hash */
   transactionHash: string;
 
+  tokenId: string;
+
   // ========== 交易者信息 ==========
 
   /**
@@ -316,6 +318,14 @@ export interface EquityPriceHandlers {
   onError?: (error: Error) => void;
 }
 
+interface PendingTokenItem {
+  posKey: string;
+  position: any;
+  tokenId: string;
+  firstSeen: number;
+  retryCount: number;
+}
+
 // ============================================================================
 // RealtimeServiceV2 Implementation
 // ============================================================================
@@ -383,6 +393,7 @@ export class RealtimeServiceV2 extends EventEmitter {
   private priceCache: Map<string, PriceUpdate> = new Map();
   private bookCache: Map<string, OrderbookSnapshot> = new Map();
   private lastTradeCache: Map<string, LastTradeInfo> = new Map();
+  private pendingTokens = new Map<string, PendingTokenItem>();
 
   constructor(config: RealtimeServiceConfig = {}) {
     super();
@@ -703,6 +714,139 @@ export class RealtimeServiceV2 extends EventEmitter {
     return subscription;
   }
 
+  subscribeMarketsAtomic(tokenIds: string[], handlers: MarketDataHandlers = {}): MarketSubscription {
+    const subId = `market_${++this.subscriptionIdCounter}`;
+
+    // 1. Construir os filtros específicos apenas para os tokens desta chamada
+    const filterStr = JSON.stringify(tokenIds);
+    const subscriptions = [
+      { topic: 'clob_market', type: 'agg_orderbook', filters: filterStr },
+      { topic: 'clob_market', type: 'price_change', filters: filterStr },
+      { topic: 'clob_market', type: 'last_trade_price', filters: filterStr },
+      { topic: 'clob_market', type: 'tick_size_change', filters: filterStr },
+      { topic: 'clob_market', type: 'best_bid_ask', filters: filterStr },
+    ];
+
+    const subMsg = { subscriptions };
+
+    // 2. Registar o controlo de ACK individual para estes tokens
+    const sentAt = Date.now();
+    for (const tokenId of tokenIds) {
+      if (!this.pendingSubAck.has(tokenId)) {
+        this.pendingSubAck.set(tokenId, sentAt);
+      }
+    }
+
+    // 3. Enviar imediatamente de forma individual com proteção try/catch
+    if (this.client && this.connected) {
+      try {
+        this.logAlways('info', `WS sub sent (individual) {topic: clob_market, tokenCount: ${tokenIds.length}}`);
+        this.client.subscribe(subMsg);
+      } catch (err: any) {
+        const errorMsg = err?.message || String(err);
+        this.logAlways('error', `❌ Erro ao enviar subscrição WS para token(s): ${errorMsg}`);
+        handlers.onError?.(err);
+      }
+    } else {
+      this.logAlways('info', `⚠️ Tentativa de subscrever tokens sem ligação ativa ao WS.`);
+    }
+
+    // Guardar para reconexões automáticas associadas a este subId específico
+    this.subscriptionMessages.set(subId, subMsg);
+    this.subscriptionGenerations.set(subId, this.connectionGeneration);
+
+    // 4. Registar handlers filtrados estritamente para estes tokenIds
+    const orderbookHandler = (book: OrderbookSnapshot) => {
+      try {
+        if (tokenIds.includes(book.assetId)) {
+          handlers.onOrderbook?.(book);
+        }
+      } catch (err) {
+        console.error(`[RealtimeServiceV2] Erro no handler de orderbook para ${tokenIds}:`, err);
+      }
+    };
+
+    const priceChangeHandler = (change: PriceChange) => {
+      try {
+        if (tokenIds.includes(change.assetId)) {
+          handlers.onPriceChange?.(change);
+        }
+      } catch (err) {
+        console.error(`[RealtimeServiceV2] Erro no handler de priceChange:`, err);
+      }
+    };
+
+    const lastTradeHandler = (trade: LastTradeInfo) => {
+      try {
+        if (tokenIds.includes(trade.assetId)) {
+          handlers.onLastTrade?.(trade);
+        }
+      } catch (err) {
+        console.error(`[RealtimeServiceV2] Erro no handler de lastTrade:`, err);
+      }
+    };
+
+    const tickSizeHandler = (change: TickSizeChange) => {
+      try {
+        if (tokenIds.includes(change.assetId)) {
+          handlers.onTickSizeChange?.(change);
+        }
+      } catch (err) {
+        console.error(`[RealtimeServiceV2] Erro no handler de tickSizeChange:`, err);
+      }
+    };
+
+    const bestBidAskHandler = (bba: BestBidAsk) => {
+      try {
+        if (tokenIds.includes(bba.assetId)) {
+          handlers.onBestBidAsk?.(bba);
+        }
+      } catch (err) {
+        console.error(`[RealtimeServiceV2] Erro no handler de bestBidAsk:`, err);
+      }
+    };
+
+    this.on('orderbook', orderbookHandler);
+    this.on('priceChange', priceChangeHandler);
+    this.on('lastTrade', lastTradeHandler);
+    this.on('tickSizeChange', tickSizeHandler);
+    this.on('bestBidAsk', bestBidAskHandler);
+
+    const subscription: MarketSubscription = {
+      id: subId,
+      topic: 'clob_market',
+      type: '*',
+      tokenIds,
+      unsubscribe: () => {
+        this.off('orderbook', orderbookHandler);
+        this.off('priceChange', priceChangeHandler);
+        this.off('lastTrade', lastTradeHandler);
+        this.off('tickSizeChange', tickSizeHandler);
+        this.off('bestBidAsk', bestBidAskHandler);
+
+        for (const tokenId of tokenIds) {
+          this.pendingSubAck.delete(tokenId);
+        }
+
+        // Enviar o desinteresse (unsubscribe) limpo para estes tokens específicos
+        if (this.client && this.connected && tokenIds.length > 0) {
+          try {
+            this.client.unsubscribeMarket(tokenIds);
+          } catch (err) {
+            this.log(`unsubscribeMarket failed (non-fatal): ${err}`);
+          }
+        }
+
+        this.subscriptionMessages.delete(subId);
+        this.subscriptionGenerations.delete(subId);
+        this.subscriptions.delete(subId);
+      },
+    };
+
+    this.subscriptions.set(subId, subscription);
+    return subscription;
+  }
+
   /**
    * Schedule a merged market subscription update.
    * Debounces multiple rapid subscription changes into a single WebSocket message.
@@ -817,6 +961,18 @@ export class RealtimeServiceV2 extends EventEmitter {
           `CRITICAL: WS sub appears to have NO ACK ` +
           `{unacked_tokens: ${stale.length}/${this.pendingSubAck.size}, ` +
           `sample: [${sample}]}`);
+
+        // 🔴 AÇÃO CORRETIVA DE AUTO-RECUPERAÇÃO:
+        // Se detetarmos falha de ACK, limpamos o mapa de pendentes para evitar loops 
+        // e forçamos imediatamente o hard reset do canal de mercado para reviver o socket.
+        this.pendingSubAck.clear();
+
+        try {
+          this.logAlways('info', 'A acionar hard reset preventivo do canal devido a NO ACK...');
+          this.reconnectMarketChannel();
+        } catch (err) {
+          this.logAlways('error', `Falha ao tentar reconectar o canal de mercado: ${err}`);
+        }
       }
       // If there are still un-acked pending tokens (newer than 60s ago),
       // reschedule so we re-evaluate when they age out.
@@ -1147,6 +1303,7 @@ export class RealtimeServiceV2 extends EventEmitter {
                 outcome: trade.outcome,
                 transactionHash: trade.transactionHash,
                 timestamp: Number(trade.timestamp),
+                tokenId: trade.tokenId
               };
 
               if (!activityTrade.marketSlug || activityTrade.marketSlug === 'unknown-market') {
@@ -1418,6 +1575,136 @@ export class RealtimeServiceV2 extends EventEmitter {
           this.pricePollingInterval = null;
           console.log('[RealtimeServiceV2] 🛑 Polling REST de preços parado.');
         }
+      },
+    };
+  }
+
+  subscribePositionPriceWebSocket(
+    realPositions: Map<string, TradePositions>,
+    handlers: { onPriceUpdate?: (posKey: string, currentPrice: number, pnlPercent: number) => void } = {},
+    funderAddress?: string,
+    dryRun: boolean = false
+  ): Subscription {
+    console.log(`[RealtimeServiceV2] 🔌 A iniciar pipeline com subscrição consolidada e resiliência rigorosa (${dryRun ? 'MODO SIMULAÇÃO' : 'MODO REAL'})...`);
+
+    let activeMarketSub: any = null;
+    let lastSubscribedKey = '';
+    let isSyncing = false;
+
+    const syncSubscriptions = () => {
+      if (isSyncing) return;
+      isSyncing = true;
+
+      try {
+        const currentValidTokens = new Set<string>();
+        const currentMap = new Map<string, { posKey: string, position: any }>();
+
+        // 1. Mapeia posições ativas válidas do exterior
+        for (const [posKey, pos] of realPositions.entries()) {
+          const tokenId = (pos as any).tokenId || (pos as any).asset || (pos as any).assetId;
+          if (tokenId && typeof tokenId === 'string' && tokenId.length > 5) {
+            currentValidTokens.add(tokenId);
+            currentMap.set(tokenId, { posKey, position: pos });
+          }
+        }
+
+        const activeTokenList: string[] = Array.from(currentValidTokens);
+        activeTokenList.sort();
+        const currentSubKey = activeTokenList.join(',');
+
+        // 2. Se a composição da lista de tokens mudou, atualiza a subscrição consolidada
+        if (currentSubKey !== lastSubscribedKey) {
+          lastSubscribedKey = currentSubKey;
+
+          // Remove a subscrição anterior se existir
+          if (activeMarketSub) {
+            try {
+              activeMarketSub.unsubscribe();
+            } catch (e) { }
+            activeMarketSub = null;
+          }
+
+          // Força o reconnect preventivo
+          console.log(`[RealtimeServiceV2] 🔄 Alteração detetada. A efetuar reconnect preventivo do canal WS...`);
+          this.reconnectMarketChannel();
+
+          if (activeTokenList.length > 0) {
+            console.log(`[RealtimeServiceV2] 🔄 A aguardar estabilização do socket para subscrever ${activeTokenList.length} token(s)...`);
+
+            // Função recursiva/tolerante para garantir que só subscreve quando o canal estiver pronto ou após um teto máximo de espera
+            let attempts = 0;
+            const trySubscribing = () => {
+              // Verifica se o cliente está conectado ou dá um teto máximo de 10 tentativas (2 segundos)
+              if (this.isConnected() || attempts >= 10) {
+                activeMarketSub = this.subscribeMarkets(activeTokenList, {
+                  onOrderbook: (book: any) => {
+                    const bookTokenId = book?.assetId || book?.asset_id || book?.tokenId || book?.token_id;
+                    if (!bookTokenId) return;
+
+                    const target = currentMap.get(String(bookTokenId));
+                    if (!target) return;
+
+                    const { posKey, position } = target;
+                    const bids = book.bids || [];
+                    const asks = book.asks || [];
+
+                    let currentPrice = 0;
+                    if (bids.length > 0 && asks.length > 0) {
+                      currentPrice = (Number(bids[0].price) + Number(asks[0].price)) / 2;
+                    } else if (bids.length > 0) {
+                      currentPrice = Number(bids[0].price);
+                    } else if (asks.length > 0) {
+                      currentPrice = Number(asks[0].price);
+                    }
+
+                    if (currentPrice > 0) {
+                      const diff = currentPrice - position.avgEntryPrice;
+                      const pnlPercent = (diff / position.avgEntryPrice) * 100;
+                      console.log(`[RealtimeServiceV2] 📈 [WS Preço Unificado] ${posKey} | Entrada: $${position.avgEntryPrice.toFixed(4)} | Atual: $${currentPrice.toFixed(4)} | PnL: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%`);
+                      handlers.onPriceUpdate?.(posKey, currentPrice, pnlPercent);
+                    }
+                  },
+                  onError: (err: any) => {
+                    console.warn(`[RealtimeServiceV2] ⚠️ Erro no stream consolidado:`, err?.message || err);
+                  }
+                });
+              } else {
+                attempts++;
+                setTimeout(trySubscribing, 200);
+              }
+            };
+
+            // Inicia a verificação com um pequeno atraso inicial para o socket rasgar a conexão antiga
+            setTimeout(trySubscribing, 400);
+
+          } else {
+            console.log(`[RealtimeServiceV2] 📭 Sem tokens ativos para subscrever no momento.`);
+          }
+        }
+
+      } catch (error) {
+        console.error('[RealtimeServiceV2] Erro no pipeline unificado:', error);
+      } finally {
+        isSyncing = false;
+      }
+    };
+
+    syncSubscriptions();
+    const watcherInterval = setInterval(syncSubscriptions, 2500);
+
+    return {
+      id: `rtds_pipeline_strict_${Date.now()}`,
+      topic: 'positions-price-ws-strict',
+      type: '*',
+      unsubscribe: () => {
+        clearInterval(watcherInterval);
+        if (activeMarketSub) {
+          try {
+            activeMarketSub.unsubscribe();
+          } catch (e) { }
+          activeMarketSub = null;
+        }
+        console.log('[RealtimeServiceV2] 🛑 Pipeline estricto de monitorização parado.');
       },
     };
   }

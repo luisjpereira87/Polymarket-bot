@@ -890,7 +890,8 @@ export class SmartMoneyService {
     options: {
       takeProfitPercent?: number;
       stopLossPercent?: number;
-      maxTradeDurationMinutes?: number; // 1. Novo parâmetro para o timeout em minutos
+      maxTradeDurationMinutes?: number;
+      stopLossGracePeriodSeconds?: number; // 👈 Tempo de carência em segundos (ex: 30s)
       dryRun?: boolean;
       onPositionClosed?: (trade: SmartMoneyTrade, result: OrderResult, pnlPercent: number) => void;
       onPriceUpdate?: (posKey: string, currentPrice: number, pnlPercent: number) => void;
@@ -900,16 +901,32 @@ export class SmartMoneyService {
     const takeProfit = options.takeProfitPercent ?? 15.0;
     const stopLoss = options.stopLossPercent ?? -10.0;
     const maxDurationMs = options.maxTradeDurationMinutes ? options.maxTradeDurationMinutes * 60 * 1000 : null;
+    const gracePeriodMs = (options.stopLossGracePeriodSeconds ?? 30) * 1000; // 👈 30 segundos por defeito
     const dryRun = options.dryRun ?? false;
 
     const internalHandler = async (posKey: string, currentPrice: number, pnlPercent: number) => {
-      options.onPriceUpdate?.(posKey, currentPrice, pnlPercent);
-
       const position = realPositions.get(posKey);
       if (!position) return;
 
-      // 2. Verificar se o tempo limite foi atingido (se a opção estiver ativa)
-      const age = Date.now() - (position.timestamp || Date.now());
+      // 🛡️ DEFESA 1: Ignorar se o preço de entrada for inválido ou zero (evita Infinity%)
+      if (!position.avgEntryPrice || position.avgEntryPrice <= 0) {
+        return;
+      }
+
+      const now = Date.now();
+      const posTimestamp = position.timestamp || now;
+      const age = now - posTimestamp;
+
+      // 🛡️ DEFESA 2: Período de Graça / Carência inicial para evitar fechos prematuros em recém-abertas
+      const isWithinGracePeriod = age < gracePeriodMs;
+      if (isWithinGracePeriod) {
+        // Posição demasiado recente, ignora avaliações de saída nos primeiros segundos
+        options.onPriceUpdate?.(posKey, currentPrice, pnlPercent);
+        return;
+      }
+
+      options.onPriceUpdate?.(posKey, currentPrice, pnlPercent);
+
       const isTimeout = maxDurationMs !== null && age >= maxDurationMs;
 
       const marketInfo = await this.getMarketBySlug(position.marketSlug);
@@ -922,7 +939,7 @@ export class SmartMoneyService {
       }
 
       const isTakeProfit = pnlPercent >= takeProfit;
-      const isStopLoss = pnlPercent <= stopLoss;
+      const isStopLoss = pnlPercent <= stopLoss; // Já passou pelo grace period, logo o SL é legítimo
 
       if (isTakeProfit || isStopLoss || isTimeout) {
         let actionType = '🎯 Take-Profit';
@@ -932,8 +949,7 @@ export class SmartMoneyService {
         console.log(`💰 ${actionType} de ${pnlPercent.toFixed(1)}% (Idade: ${(age / 60000).toFixed(1)}m) atingido em ${posKey}! A fechar posição...`);
 
         const exitShares = position.size;
-        const exitValue = exitShares * currentPrice;
-        let result: OrderResult;
+        let result: OrderResult = { success: false, errorMsg: 'Not executed yet' };
 
         if (dryRun) {
           result = { success: true, orderId: `dry_run_exit_${Date.now()}` };
@@ -952,16 +968,41 @@ export class SmartMoneyService {
             return;
           }
 
-          result = await this.tradingService.createMarketOrder({
-            tokenId,
-            side: 'SELL',
-            amount: exitShares,
-            price: currentPrice * 0.98,
-            orderType: 'FOK',
-          });
+          let attempts = 0;
+          const maxAttempts = 3;
+
+          while (attempts < maxAttempts) {
+            attempts++;
+
+            const livePrice = currentPrice;
+
+            let slippageMultiplier = 0.98;
+            if (attempts === 2) slippageMultiplier = 0.93;
+            if (attempts === 3) slippageMultiplier = 0.85;
+
+            const rawTargetPrice = livePrice * slippageMultiplier;
+            const adjustedPrice = Math.max(0.01, Number(rawTargetPrice.toFixed(2)));
+
+            console.log(`[SmartMoneyService] 🔄 Tentativa ${attempts}/${maxAttempts} de fechar ${posKey} a preço ajustado: ${adjustedPrice}`);
+
+            result = await this.tradingService.createMarketOrder({
+              tokenId,
+              side: 'SELL',
+              amount: exitShares,
+              price: adjustedPrice,
+              orderType: 'FAK',
+            });
+
+            if (result && result.success) {
+              break;
+            }
+
+            console.warn(`[SmartMoneyService] ⚠️ Tentativa ${attempts}/${maxAttempts} de fechar ${posKey} falhou. A tentar novamente...`);
+            await new Promise(resolve => setTimeout(resolve, 600));
+          }
         }
 
-        if (result.success) {
+        if (result && result.success) {
           const exitTrade: SmartMoneyTrade = {
             traderAddress: position.traderAddress || 'SYSTEM_AUTO_EXIT',
             marketSlug: position.marketSlug,
@@ -990,7 +1031,7 @@ export class SmartMoneyService {
     this.priceHandlers.add(internalHandler);
 
     if (!this.priceSubscription) {
-      this.priceSubscription = this.realtimeService.subscribePositionPricePolling(realPositions, {
+      this.priceSubscription = this.realtimeService.subscribePositionPriceWebSocket(realPositions, {
         onPriceUpdate: (posKey, currentPrice, pnlPercent) => {
           for (const handler of this.priceHandlers) {
             handler(posKey, currentPrice, pnlPercent);
@@ -1010,7 +1051,6 @@ export class SmartMoneyService {
       },
     };
   }
-
 
   private async handleActivityTrade(
     trade: ActivityTrade,
@@ -1048,7 +1088,7 @@ export class SmartMoneyService {
       side: trade.side,
       size: trade.size,
       price: trade.price,
-      tokenId: trade.asset,
+      tokenId: trade.tokenId,
       outcome: trade.outcome,
       txHash: trade.transactionHash,
       timestamp: trade.timestamp,

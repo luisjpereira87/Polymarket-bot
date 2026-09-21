@@ -482,9 +482,19 @@ export class TradingService {
           console.error("DEBUG_CLOB_RESULT:", JSON.stringify(result, null, 2));
         }
 
+        /** 
         const success = result.success === true ||
           (result.success !== false &&
             (result.orderID !== undefined && result.orderID !== ''));
+
+        **/
+
+        // --- CORREÇÃO AQUI ---
+        // Garante que se houver um campo 'error' ou um status de erro (ex: 400), nunca pode ser considerado sucesso
+        const statusCode = result.status !== undefined ? Number(result.status) : 200;
+        // Se o status for 400 ou superior, consideramos imediatamente que houve erro
+        const hasError = statusCode >= 400 || result.success === false;
+        const success = !hasError && (result.success === true || (result.orderID !== undefined && result.orderID !== ''));
 
         return {
           success,

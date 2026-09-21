@@ -793,6 +793,12 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
 
         realPositions.delete(posKey);
 
+        // 🔴 LIMPEZA DA CACHE DE PREÇOS/MERCADO PARA EVITAR CONFLITOS EM CICLOS REPETIDOS (EX: 15MIN)
+        if (typeof liveMarketPrices !== 'undefined' && liveMarketPrices instanceof Map) {
+          console.log("ENTROU AQUI", posKey)
+          liveMarketPrices.delete(posKey);
+        }
+
         log('TRADE', `✅ [DRY_RUN] SELL: ${closedShares.toFixed(1)} shares | PnL: $${profit.toFixed(2)} | Novo Caixa: $${financialState.availableCash.toFixed(2)}`);
         recordTrade(profit, 'smartMoney');
       }
@@ -922,6 +928,7 @@ async function setupPriceMonitor(sdk: PolymarketSDK) {
     takeProfitPercent: TAKE_PROFIT_PCT,
     stopLossPercent: STOP_LOSS_PCT,
     maxTradeDurationMinutes: 24 * 60,
+    stopLossGracePeriodSeconds: 30,
     dryRun: CONFIG.dryRun,
     executeTradeHandler: (trade, result) => {
       processTradeExecution(sdk, trade, result);
@@ -1432,7 +1439,8 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
       trendThreshold: CONFIG.binance.trendThreshold,
       amount: CONFIG.directTrading.minTradeValueUSD || 5,
       dryRun: CONFIG.dryRun,
-      checkIntervalMs: 5 * 60 * 1000
+      checkIntervalMs: 5 * 60 * 1000,
+      isCanTrade: () => canTrade(),
     },
     {
       onTrade: async (trade, result) => {
