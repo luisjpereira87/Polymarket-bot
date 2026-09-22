@@ -133,9 +133,44 @@ export class DirectTradingService {
         const changePercent = ((recentAvg - olderAvg) / olderAvg) * 100;
         const threshold = config.trendThreshold;
 
+
+
         let trend: 'up' | 'down' | 'neutral' = 'neutral';
         if (changePercent > threshold) trend = 'up';
         else if (changePercent < -threshold) trend = 'down';
+
+        // 1. Calcular EMA 9 e EMA 21 para todo o histórico de velas
+        const ema9Values = this.calculateFullEMAArray(closePrices, 9);
+        const ema21Values = this.calculateFullEMAArray(closePrices, 21);
+
+        const currentEma9 = ema9Values[ema9Values.length - 1];
+        const currentEma21 = ema21Values[ema21Values.length - 1];
+        const previousEma9 = ema9Values[ema9Values.length - 2];
+        const previousEma21 = ema21Values[ema21Values.length - 2];
+
+        // 2. Calcular o Spread atual e anterior para ver se está a expandir
+        const currentSpread = Math.abs(currentEma9 - currentEma21);
+        const previousSpread = Math.abs(previousEma9 - previousEma21);
+        const isSpreadExpanding = currentSpread > previousSpread;
+
+        const currentClose = closePrices[closePrices.length - 1];
+
+        // 3. Validação da EMA 9 como linha de atenção (evitar entrar se o preço a violou/cruzou)
+        const isPriceRespectingEma9 = trend === 'up'
+            ? (currentClose > currentEma9 && currentEma9 > currentEma21)
+            : (currentClose < currentEma9 && currentEma9 < currentEma21);
+
+        // 4. Filtro de Lateralização por Spread Estagnado
+        if (!isSpreadExpanding && currentSpread < (currentClose * 0.001)) {
+            console.log('WARN', `⏳ [${coin}] Ignorado: Spread EMA 9/21 muito apertado ou a comprimir. Mercado lateral/indeciso.`);
+            return;
+        }
+
+        // 5. Filtro de Quebra da EMA 9 (Fator de atenção / Correção)
+        if (!isPriceRespectingEma9) {
+            console.log('WARN', `⏳ [${coin}] Ignorado: Preço ($${currentClose}) violou ou cruzou a EMA 9 ($${currentEma9.toFixed(2)}). Risco de correção de curto prazo.`);
+            return;
+        }
 
         console.log('KLINE', `📊 [${symbol}] Variação: ${changePercent.toFixed(4)}% | RSI: ${currentRsi.toFixed(1)} (EMA: ${rsiEma.toFixed(1)}) | Tendência: ${trend.toUpperCase()}`);
 
@@ -143,11 +178,11 @@ export class DirectTradingService {
 
         // 🛡️ FILTRO DE RSI: Validar se o momento técnico apoia a tendência indicada pela variação
         if (trend === 'up' && !isRsiBullish) {
-            console.log('WARN', `⏳ [${coin}] Sinal UP ignorado: RSI sobrecomprado extremo (${currentRsi.toFixed(1)}) sem suporte da EMA.`);
+            console.log('WARN', `⏳ [${coin}] Sinal UP ignorado: Variação positiva mas RSI (${currentRsi.toFixed(1)}) abaixo da EMA (${rsiEma.toFixed(1)}) - Falta de momentum comprador.`);
             return;
         }
         if (trend === 'down' && !isRsiBearish) {
-            console.log('WARN', `⏳ [${coin}] Sinal DOWN ignorado: RSI sobrevendido extremo (${currentRsi.toFixed(1)}) sem suporte da EMA.`);
+            console.log('WARN', `⏳ [${coin}] Sinal DOWN ignorado: Variação negativa mas RSI (${currentRsi.toFixed(1)}) acima da EMA (${rsiEma.toFixed(1)}) - Falta de momentum vendedor.`);
             return;
         }
 
@@ -296,5 +331,22 @@ export class DirectTradingService {
         }
 
         return Number(ema.toFixed(2));
+    }
+
+    private calculateFullEMAArray(values: number[], period: number): number[] {
+        if (values.length === 0) return [];
+        const k = 2 / (period + 1);
+        const emaArray: number[] = [];
+
+        let currentEma = values.slice(0, Math.min(period, values.length)).reduce((a, b) => a + b, 0) / Math.min(period, values.length);
+
+        for (let i = 0; i < values.length; i++) {
+            if (i >= period) {
+                currentEma = (values[i] * k) + (currentEma * (1 - k));
+            }
+            emaArray.push(Number(currentEma.toFixed(4)));
+        }
+
+        return emaArray;
     }
 }

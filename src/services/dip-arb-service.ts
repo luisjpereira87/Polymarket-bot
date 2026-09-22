@@ -328,7 +328,7 @@ export class DipArbService extends EventEmitter {
     }
 
     // Connect realtime service and wait for connection
-    this.realtimeService.connect();
+    await this.realtimeService.connect();
 
     // Wait for WebSocket connection (with timeout)
     await new Promise<void>((resolve) => {
@@ -349,6 +349,8 @@ export class DipArbService extends EventEmitter {
         this.log('WebSocket connected');
         resolve();
       });
+
+
     });
 
     // Subscribe to market orderbook
@@ -378,7 +380,7 @@ export class DipArbService extends EventEmitter {
       [chainlinkSymbol],
       {
         onPrice: (price: CryptoPrice) => {
-          this.log(`Received ${price.symbol} Price: $${price.price.toFixed(2)}`); // Use this.log for consistency
+          //this.log(`Received ${price.symbol} Price: $${price.price.toFixed(2)}`); // Use this.log for consistency
           this.handleChainlinkPriceUpdate(price);
         },
       }
@@ -535,7 +537,7 @@ export class DipArbService extends EventEmitter {
       this.realtimeService.disconnect();
     }
 
-     await new Promise(r => setTimeout(r, 2000 ));
+    await new Promise(r => setTimeout(r, 2000));
 
     // Update stats
     this.stats.runningTimeMs = Date.now() - this.stats.startTime;
@@ -1076,14 +1078,19 @@ export class DipArbService extends EventEmitter {
   private handleChainlinkPriceUpdate(price: CryptoPrice): void {
     if (!this.market) return;
 
-    // Only handle updates for our underlying (symbol format: ETH/USD)
-    const expectedSymbol = `${this.market.underlying}/USD`;
-    if (price.symbol !== expectedSymbol) return;
+    // Normaliza para maiúsculas para evitar falhas de case-sensitivity
+    const normalizedSymbol = price.symbol.toUpperCase();
+    const expectedSymbol = `${this.market.underlying.toUpperCase()}/USD`;
 
+    if (normalizedSymbol !== expectedSymbol) return;
+
+    /**
     if (this.config.debug) {
-      this.log(`Chainlink price update: ${price.symbol} = $${price.price.toFixed(2)}`);
+      this.log(`Chainlink price update: ${normalizedSymbol} = $${price.price.toFixed(2)}`);
     }
-
+    **/
+   
+    // Agora sim, atualiza as variáveis de estado para o heartbeat!
     this.currentUnderlyingPrice = price.price;
     this.lastPriceUpdate = Date.now();
 

@@ -1795,7 +1795,9 @@ export class RealtimeServiceV2 extends EventEmitter {
     }
 
     const handler = (price: CryptoPrice) => {
-      if (symbols.includes(price.symbol)) {
+      // Compara convertendo ambos para lowercase
+      const isMatch = symbols.some(s => s.toLowerCase() === price.symbol?.toLowerCase());
+      if (isMatch) {
         handlers.onPrice?.(price);
       }
     };
