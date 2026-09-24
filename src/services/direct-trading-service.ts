@@ -155,6 +155,7 @@ export class DirectTradingService {
 
         const currentClose = closePrices[closePrices.length - 1];
 
+        /**
         // 3. Validação da EMA 9 como linha de atenção (evitar entrar se o preço a violou/cruzou)
         const isPriceRespectingEma9 = trend === 'up'
             ? (currentClose > currentEma9 && currentEma9 > currentEma21)
@@ -171,7 +172,8 @@ export class DirectTradingService {
             console.log('WARN', `⏳ [${coin}] Ignorado: Preço ($${currentClose}) violou ou cruzou a EMA 9 ($${currentEma9.toFixed(2)}). Risco de correção de curto prazo.`);
             return;
         }
-
+        **/
+        
         console.log('KLINE', `📊 [${symbol}] Variação: ${changePercent.toFixed(4)}% | RSI: ${currentRsi.toFixed(1)} (EMA: ${rsiEma.toFixed(1)}) | Tendência: ${trend.toUpperCase()}`);
 
         if (trend === 'neutral') return;
