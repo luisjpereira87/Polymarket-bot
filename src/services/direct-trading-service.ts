@@ -173,7 +173,7 @@ export class DirectTradingService {
             return;
         }
         **/
-        
+
         console.log('KLINE', `📊 [${symbol}] Variação: ${changePercent.toFixed(4)}% | RSI: ${currentRsi.toFixed(1)} (EMA: ${rsiEma.toFixed(1)}) | Tendência: ${trend.toUpperCase()}`);
 
         if (trend === 'neutral') return;
@@ -185,6 +185,34 @@ export class DirectTradingService {
         }
         if (trend === 'down' && !isRsiBearish) {
             console.log('WARN', `⏳ [${coin}] Sinal DOWN ignorado: Variação negativa mas RSI (${currentRsi.toFixed(1)}) acima da EMA (${rsiEma.toFixed(1)}) - Falta de momentum vendedor.`);
+            return;
+        }
+
+        // 🕯️ FILTRO DE ANÁLISE DO CORPO E DIREÇÃO DO CANDLE CORRENTE
+        const currentKline = klines[klines.length - 1];
+        const candleOpen = Number(currentKline.open);
+        const candleClose = Number(currentKline.close);
+        const candleHigh = Number(currentKline.high);
+        const candleLow = Number(currentKline.low);
+
+        const bodySize = Math.abs(candleClose - candleOpen);
+        const totalRange = candleHigh - candleLow;
+
+        // 1. Evitar velas de indecisão (Dojis / corpos muito esmagados face ao pavio)
+        // O corpo deve ocupar pelo menos 25% do movimento total daquela vela para ter força
+        const minBodyRatio = 0.25;
+        if (totalRange > 0 && (bodySize / totalRange) < minBodyRatio) {
+            console.log('WARN', `⏳ [${coin}] Ignorado: Candle atual sem corpo expressivo (Doji/Indecisão). A aguardar força real.`);
+            return;
+        }
+
+        // 2. Validar se o corpo do candle está na direção correta do sinal
+        if (trend === 'up' && candleClose <= candleOpen) {
+            console.log('WARN', `⏳ [${coin}] Sinal UP ignorado: Candle atual está vermelho (Open: $${candleOpen} > Close: $${candleClose}).`);
+            return;
+        }
+        if (trend === 'down' && candleClose >= candleOpen) {
+            console.log('WARN', `⏳ [${coin}] Sinal DOWN ignorado: Candle atual está verde (Open: $${candleOpen} < Close: $${candleClose}).`);
             return;
         }
 
