@@ -1457,35 +1457,6 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
   // 🛡️ Modo Dry Run: Ignora a sincronização com a blockchain/API real para preservar posições virtuais locais
   if (CONFIG.dryRun) {
     log('INFO', '🛡️ Modo Dry Run ativo: Gestor de portfólio a operar exclusivamente com posições virtuais.');
-
-    setInterval(() => {
-      if (!CONFIG.dryRun) return;
-
-      for (const [posKey, pos] of realPositions.entries()) {
-        const cachedPrice = liveMarketPrices.get(posKey);
-
-        // Se o preço na cache atingiu os limites de resolução (0 ou 1)
-        if (cachedPrice !== undefined && (cachedPrice >= 0.99 || cachedPrice <= 0.01)) {
-          const closedShares = pos.size;
-          const profit = (cachedPrice - pos.avgEntryPrice) * closedShares;
-          const tradeProceeds = closedShares * cachedPrice;
-          const costBasis = closedShares * pos.avgEntryPrice;
-
-          // Libertar capital comprometido e devolver ao caixa
-          financialState.committedCapital = Math.max(0, (financialState.committedCapital || 0) - costBasis);
-          financialState.availableCash = (financialState.availableCash || 0) + tradeProceeds;
-
-          // Remover do mapa e limpar cache
-          realPositions.delete(posKey);
-          liveMarketPrices.delete(posKey);
-
-          log('TRADE', `🧹 [DRY_RUN_CLEANUP] Posição virtual ${posKey} resolvida a $${cachedPrice.toFixed(2)} | PnL: $${profit.toFixed(2)} | Caixa Atual: $${financialState.availableCash.toFixed(2)}`);
-          recordTrade(profit, 'smartMoney');
-          updateDashboard();
-        }
-      }
-    }, 5 * 60 * 1000); // ⏱️ Verifica a cada 5 minutos
-
     return;
   }
 

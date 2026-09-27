@@ -932,19 +932,22 @@ export class SmartMoneyService {
       const marketInfo = await this.getMarketBySlug(position.marketSlug);
       const isMarketClosed = marketInfo?.closed || currentPrice >= 0.99 || currentPrice <= 0.01;
 
-      if (isMarketClosed && !dryRun) {
+      /**
+      if (isMarketClosed) {
         console.log(`[SmartMoneyService] ℹ️ Mercado ${position.marketSlug} fechado/resolvido. A remover da monitorização.`);
         realPositions.delete(posKey);
         return;
       }
+      **/
 
       const isTakeProfit = pnlPercent >= takeProfit;
       const isStopLoss = pnlPercent <= stopLoss; // Já passou pelo grace period, logo o SL é legítimo
 
-      if (isTakeProfit || isStopLoss || isTimeout) {
+      if (isTakeProfit || isStopLoss || isTimeout || isMarketClosed) {
         let actionType = '🎯 Take-Profit';
         if (isStopLoss) actionType = '🛑 Stop-Loss';
         if (isTimeout) actionType = '⏰ Timeout (Tempo Limite)';
+        if (isMarketClosed) actionType = '🏁 Mercado Fechado / Resolvido';
 
         console.log(`💰 ${actionType} de ${pnlPercent.toFixed(1)}% (Idade: ${(age / 60000).toFixed(1)}m) atingido em ${posKey}! A fechar posição...`);
 
