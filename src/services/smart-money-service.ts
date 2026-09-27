@@ -932,7 +932,7 @@ export class SmartMoneyService {
       const marketInfo = await this.getMarketBySlug(position.marketSlug);
       const isMarketClosed = marketInfo?.closed || currentPrice >= 0.99 || currentPrice <= 0.01;
 
-      if (isMarketClosed) {
+      if (isMarketClosed && !dryRun) {
         console.log(`[SmartMoneyService] ℹ️ Mercado ${position.marketSlug} fechado/resolvido. A remover da monitorização.`);
         realPositions.delete(posKey);
         return;
