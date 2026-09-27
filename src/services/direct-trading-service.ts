@@ -34,7 +34,7 @@ export class DirectTradingService {
     /**
      * Inicia o serviço de Direct Trading aceitando parâmetros de execução e o callback de sinal
      */
-    public async startTradingLoop(
+    public async startTradingLoop__(
         config: DirectTradingServiceConfig,
         options: {
             onTrade: DirectTradingCallback;
@@ -73,6 +73,88 @@ export class DirectTradingService {
         return {
             unsubscribe: () => {
                 if (this.timer) {
+                    clearInterval(this.timer);
+                    this.timer = null;
+                    console.log('TREND', '🛑 Direct Trading Service cancelado via unsubscribe.');
+                }
+            }
+        };
+    }
+
+    public async startTradingLoop(
+        config: DirectTradingServiceConfig,
+        options: {
+            onTrade: DirectTradingCallback;
+        }
+    ) {
+        if (config.isCanTrade && !config.isCanTrade()) {
+            console.warn(`[SmartMoneyService] ⚠️ Sinal ignorado: canTrade() retornou falso.`);
+            return;
+        }
+
+        if (!config.enabled) {
+            console.log('TREND', 'Serviço de Direct Trading está desativado na configuração.');
+            return;
+        }
+
+        console.log('TREND', '🚀 A iniciar Direct Trading Service (Binance + Polymarket)...');
+
+        const executeCheck = async () => {
+            const coins: Array<'BTC' | 'ETH' | 'SOL'> = ['BTC', 'ETH', 'SOL'];
+
+            for (const coin of coins) {
+                try {
+                    await this.analyzeAndExecuteCoin(coin, config, options.onTrade);
+                } catch (err) {
+                    console.log('ERROR', `❌ Erro no ciclo de tendência para ${coin}: ${(err as Error).message}`);
+                }
+            }
+        };
+
+        const intervalMs = config.checkIntervalMs || 5 * 60 * 1000;
+
+        // 🛡️ CALCULO DE OFFSET: Calcular quanto falta para sair da "zona de perigo" (primeiros 3 min de cada bloco de 15m)
+        const getDelayToSafeMinute = () => {
+            const now = new Date();
+            const currentMinute = now.getMinutes();
+            const currentSecond = now.getSeconds();
+            const currentMs = now.getMilliseconds();
+
+            const minuteInBlock = currentMinute % 15;
+
+            // Se estivermos nos primeiros 3 minutos (ex: 0, 1, 2 | 15, 16, 17...), calculamos o atraso até ao minuto 3
+            if (minuteInBlock < 3) {
+                const targetMinute = (Math.floor(currentMinute / 15) * 15) + 3;
+                const targetDate = new Date(now);
+                targetDate.setMinutes(targetMinute, 0, 0);
+                const delay = targetDate.getTime() - now.getTime();
+                return delay > 0 ? delay : 0;
+            }
+            return 0; // Já estamos num minuto seguro, executa já
+        };
+
+        const initialDelay = getDelayToSafeMinute();
+        if (initialDelay > 0) {
+            console.log(`TREND', '⏳ [Loop] A aguardar ${(initialDelay / 1000).toFixed(0)}s para escapar à zona de viragem de 15m...`);
+        }
+
+        // Executa após o delay de segurança e depois arranca o intervalo regular
+        this.timer = setTimeout(async () => {
+            await executeCheck();
+            this.timer = setInterval(executeCheck, intervalMs);
+        }, initialDelay > 0 ? initialDelay : 0);
+
+        // Se executou imediatamente no arranque e quisermos garantir que o primeiro corre já:
+        if (initialDelay === 0) {
+            await executeCheck();
+            this.timer = setInterval(executeCheck, intervalMs);
+        }
+
+        // Retorna o objeto com o método unsubscribe para destruir/parar a subscrição
+        return {
+            unsubscribe: () => {
+                if (this.timer) {
+                    clearTimeout(this.timer); // Limpa tanto o timeout inicial como o interval
                     clearInterval(this.timer);
                     this.timer = null;
                     console.log('TREND', '🛑 Direct Trading Service cancelado via unsubscribe.');
@@ -233,6 +315,17 @@ export class DirectTradingService {
 
         const market = markets[0];
         if (!market.conditionId) return;
+
+        const nowMs = Date.now();
+
+        // 🛡️ NOVO: Validar se o mercado já iniciou efetivamente
+        if (market.startDate) {
+            const startTimeMs = new Date(market.startDate).getTime();
+            if (nowMs < startTimeMs) {
+                console.log('WARN', `⏳ [${coin}] Ignorado: O mercado ainda não começou (Início em ${new Date(startTimeMs).toLocaleTimeString()}). A evitar candle fantasma.`);
+                return;
+            }
+        }
 
         if (market.endDate) {
             const endTimeMs = new Date(market.endDate).getTime();
