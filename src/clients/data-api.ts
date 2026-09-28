@@ -50,7 +50,7 @@ export interface Position {
   // Status fields (from API)
   redeemable?: boolean;
   mergeable?: boolean;
-  endDate?: string;
+  endDate?: Date;
   negativeRisk?: boolean;
   tokenId: string;
 }
@@ -926,7 +926,8 @@ export class DataApiClient {
         // Status fields
         redeemable: p.redeemable !== undefined ? Boolean(p.redeemable) : undefined,
         mergeable: p.mergeable !== undefined ? Boolean(p.mergeable) : undefined,
-        endDate: p.endDate !== undefined ? String(p.endDate) : undefined,
+        //endDate: p.endDate !== undefined ? String(p.endDate) : undefined,
+        endDate: p.endDate !== undefined && p.endDate !== null ? new Date(String(p.endDate)) : undefined,
         negativeRisk: p.negativeRisk !== undefined ? Boolean(p.negativeRisk) : undefined,
         tokenId: String(p.asset || p.tokenId || ''),
       };

@@ -752,6 +752,16 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
       financialState.availableCash = currentAvailableCash - tradeCost;
       financialState.committedCapital = (financialState.committedCapital || 0) + tradeCost;
 
+      // No normalizePositions ou na criação da posição:
+      const parsedEndDate = trade.endDate ? new Date(String(trade.endDate)) : undefined;
+
+      console.log('📅 DEBUG CREATE POSITION:', {
+        rawEndDate: trade.endDate,
+        parsedDateObject: parsedEndDate,
+        localTimeString: parsedEndDate?.toLocaleTimeString(),
+        utcString: parsedEndDate?.toISOString()
+      });
+
       // Registar em realPositions (ou simulatedPositions, conforme preferires manter)
       const existing = realPositions.get(posKey);
       if (existing) {
@@ -772,7 +782,8 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
           avgEntryPrice: execPrice,
           timestamp: Date.now(),
           traderAddress: trade.traderAddress,
-          tokenId: trade.tokenId || ''
+          tokenId: trade.tokenId || '',
+          endDate: trade.endDate
         });
       }
 
@@ -795,7 +806,6 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
 
         // 🔴 LIMPEZA DA CACHE DE PREÇOS/MERCADO PARA EVITAR CONFLITOS EM CICLOS REPETIDOS (EX: 15MIN)
         if (typeof liveMarketPrices !== 'undefined' && liveMarketPrices instanceof Map) {
-          console.log("ENTROU AQUI", posKey)
           liveMarketPrices.delete(posKey);
         }
 
@@ -1276,8 +1286,6 @@ async function setupDipArb__(sdk: PolymarketSDK) {
     const marketName = e.marketDetails?.name || 'Novo Mercado';
     const marketSlug = e.marketDetails?.slug;
 
-    console.log("AQUIIIIII", e)
-
     state.activeDipArbMarket = marketName;
     state.dipArb.marketName = marketName;
 
@@ -1441,10 +1449,16 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
       dryRun: CONFIG.dryRun,
       checkIntervalMs: 5 * 60 * 1000,
       isCanTrade: () => canTrade(),
+      positions: () => realPositions,
     },
     {
       onTrade: async (trade, result) => {
         // Aqui lidas com a execução através da tua função unificada que atualiza o dashboard e o portfólio
+
+        if (trade.marketSlug) {
+          await updatePricesCache(sdk, trade.marketSlug);
+        }
+
         processTradeExecution(sdk, trade, result);
       }
     }
@@ -1476,6 +1490,7 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
       const outcomeSuffix = outcome ? `-${outcome}` : '';
       const posKey = `${marketSlug}${outcomeSuffix}`;
       const tokenId = p.asset || p.tokenId;
+      const endDate = p.endDate !== undefined && p.endDate !== null ? new Date(String(p.endDate)) : new Date();
 
       if (size > 0 && marketSlug) {
         realPositions.set(posKey, {
@@ -1486,7 +1501,8 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
           avgEntryPrice: avgPrice,
           timestamp: Date.now(),
           traderAddress: p.proxyWallet || targetWalletAddress,
-          tokenId: tokenId
+          tokenId: tokenId,
+          endDate: endDate
         });
       }
     }
@@ -1552,7 +1568,8 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
               avgEntryPrice: avgPrice,
               timestamp: Date.now(),
               traderAddress: p.proxyWallet || targetWalletAddress,
-              tokenId: tokenId
+              tokenId: tokenId,
+              endDate: p.endDate
             });
           }
         }

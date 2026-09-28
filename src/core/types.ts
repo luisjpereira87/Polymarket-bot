@@ -601,4 +601,5 @@ export interface TradePositions {
   timestamp: number;
   traderAddress?: string;
   tokenId: string;
+  endDate: Date;
 }

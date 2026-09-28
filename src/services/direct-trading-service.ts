@@ -1,4 +1,4 @@
-import { SmartMoneyTrade } from '../index.js';
+import { SmartMoneyTrade, TradePositions } from '../index.js';
 import { BinanceService } from './binance-service.js';
 import { MarketService } from './market-service.js';
 import { TradingService } from './trading-service.js';
@@ -11,6 +11,7 @@ export interface DirectTradingServiceConfig {
     dryRun?: boolean;         // Flag para saber se simula ou executa a sério
     checkIntervalMs?: number; // ex: 5 * 60 * 1000
     isCanTrade: () => boolean;
+    positions: () => Map<string, TradePositions>
 }
 
 export type DirectTradingCallback = (trade: any, result: any) => Promise<void> | void;
@@ -113,16 +114,11 @@ export class DirectTradingService {
 
         const intervalMs = config.checkIntervalMs || 5 * 60 * 1000;
 
-        // 🛡️ CALCULO DE OFFSET: Calcular quanto falta para sair da "zona de perigo" (primeiros 3 min de cada bloco de 15m)
         const getDelayToSafeMinute = () => {
             const now = new Date();
             const currentMinute = now.getMinutes();
-            const currentSecond = now.getSeconds();
-            const currentMs = now.getMilliseconds();
-
             const minuteInBlock = currentMinute % 15;
 
-            // Se estivermos nos primeiros 3 minutos (ex: 0, 1, 2 | 15, 16, 17...), calculamos o atraso até ao minuto 3
             if (minuteInBlock < 3) {
                 const targetMinute = (Math.floor(currentMinute / 15) * 15) + 3;
                 const targetDate = new Date(now);
@@ -130,31 +126,36 @@ export class DirectTradingService {
                 const delay = targetDate.getTime() - now.getTime();
                 return delay > 0 ? delay : 0;
             }
-            return 0; // Já estamos num minuto seguro, executa já
+            return 0;
+        };
+
+        const startInterval = () => {
+            // Garante que limpa qualquer timer anterior antes de criar um novo
+            if (this.timer) {
+                clearTimeout(this.timer);
+                clearInterval(this.timer);
+            }
+            this.timer = setInterval(executeCheck, intervalMs);
         };
 
         const initialDelay = getDelayToSafeMinute();
+
         if (initialDelay > 0) {
-            console.log(`TREND', '⏳ [Loop] A aguardar ${(initialDelay / 1000).toFixed(0)}s para escapar à zona de viragem de 15m...`);
+            console.log('TREND', `⏳ [Loop] A aguardar ${(initialDelay / 1000).toFixed(0)}s para escapar à zona de viragem de 15m...`);
+            this.timer = setTimeout(async () => {
+                await executeCheck();
+                startInterval(); // Arranca o intervalo regular após o delay inicial
+            }, initialDelay);
+        } else {
+            // Executa já e arranca o intervalo regular
+            await executeCheck();
+            startInterval();
         }
 
-        // Executa após o delay de segurança e depois arranca o intervalo regular
-        this.timer = setTimeout(async () => {
-            await executeCheck();
-            this.timer = setInterval(executeCheck, intervalMs);
-        }, initialDelay > 0 ? initialDelay : 0);
-
-        // Se executou imediatamente no arranque e quisermos garantir que o primeiro corre já:
-        if (initialDelay === 0) {
-            await executeCheck();
-            this.timer = setInterval(executeCheck, intervalMs);
-        }
-
-        // Retorna o objeto com o método unsubscribe para destruir/parar a subscrição
         return {
             unsubscribe: () => {
                 if (this.timer) {
-                    clearTimeout(this.timer); // Limpa tanto o timeout inicial como o interval
+                    clearTimeout(this.timer);
                     clearInterval(this.timer);
                     this.timer = null;
                     console.log('TREND', '🛑 Direct Trading Service cancelado via unsubscribe.');
@@ -302,7 +303,7 @@ export class DirectTradingService {
         const markets = await this.marketService.scanCryptoShortTermMarkets({
             coin: coin,
             duration: '15m',
-            minMinutesUntilEnd: 2,
+            minMinutesUntilEnd: 5,
             maxMinutesUntilEnd: 60,
             limit: 1,
             sortBy: 'endDate'
@@ -332,7 +333,8 @@ export class DirectTradingService {
             const nowMs = Date.now();
             const minutesRemaining = (endTimeMs - nowMs) / (1000 * 60);
 
-            if (!isNaN(minutesRemaining) && minutesRemaining <= 5) {
+            // Se faltarem menos de 5 minutos para o mercado fechar, rejeita imediatamente
+            if (!isNaN(minutesRemaining) && minutesRemaining < 5) {
                 console.log('WARN', `⏳ [${coin}] Ignorado: Faltam apenas ${minutesRemaining.toFixed(1)}m para o mercado fechar (Zona de pânico).`);
                 return;
             }
@@ -348,7 +350,33 @@ export class DirectTradingService {
             return;
         }
 
-        const tokenPrice = Number(targetToken.price || 0);
+        // 🛡️ Obter o preço real diretamente do outcomePrices do market
+        const tokenIndex = fullMarket.tokens ? fullMarket.tokens.findIndex((t: any) => t.tokenId === targetToken.tokenId) : -1;
+
+        let rawPrice = targetToken.price; // Fallback
+        if (market.outcomePrices && tokenIndex !== -1 && market.outcomePrices[tokenIndex] !== undefined) {
+            rawPrice = market.outcomePrices[tokenIndex];
+        }
+
+        const tokenPrice = Number(rawPrice || 0);
+
+        // 🛡️ FILTRO ANTI-DUPLICAÇÃO (Igual ao Smart Money)
+        const outcomeName = targetToken.outcome || 'Yes';
+        const posKey = `${market.slug}-${outcomeName}`;
+
+        // Invocar a função para obter o Map de posições
+        const currentPositions = typeof config.positions === 'function' ? config.positions() : null;
+        console.log('🔍 DEBUG POSIÇÕES ATIVAS:', {
+            procurandoPosKey: posKey,
+            chavesExistentesNoMapa: currentPositions ? Array.from(currentPositions.keys()) : 'Mapa vazio/nulo'
+        });
+        if (currentPositions && currentPositions.has(posKey)) {
+            console.log('WARN', `⏳ [${coin}] Sinal ignorado (Anti-Duplicação): Já tens posição ativa em ${posKey}`);
+            return;
+        }
+
+        console.log("PREÇO price: " + targetToken.price + " outcomePrices: " + market.outcomePrices);
+        //const tokenPrice = Number(targetToken.price || 0);
 
         // Validações de teto máximo e piso mínimo (0.25 a 0.75)
         if (tokenPrice > 0.75) {
@@ -361,19 +389,28 @@ export class DirectTradingService {
         }
 
         const amountUsdc = config.amount || 5;
-        const execShares = amountUsdc / targetToken.price;
+        const execShares = amountUsdc / tokenPrice;
+
+        const rawEndDate = market.endDate || fullMarket.endDate;
+        const validEndDate = rawEndDate ? new Date(rawEndDate) : new Date(Date.now() + 15 * 60 * 1000);
+        console.log('🔍 DEBUG ENDDATE SOURCES:', {
+            fullMarketEndDate: fullMarket?.endDate,
+            scanMarketEndDate: market?.endDate,
+            chosenEndDate: validEndDate
+        });
 
         const syntheticTrade: SmartMoneyTrade = {
             traderAddress: `TrendFollowing-${coin}`,
             marketSlug: market.slug,
             side: 'BUY',
             size: execShares,
-            price: targetToken.price,
+            price: tokenPrice,
             tokenId: targetToken.tokenId,
             conditionId: market.conditionId,
             traderName: `Trend Bot (${coin})`,
             timestamp: Date.now(),
-            isSmartMoney: false
+            isSmartMoney: false,
+            endDate: validEndDate
         };
 
         const isDryRun = config.dryRun ?? false;

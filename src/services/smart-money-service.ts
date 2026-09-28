@@ -125,6 +125,7 @@ export interface SmartMoneyTrade {
   timestamp: number;
   isSmartMoney: boolean;
   smartMoneyInfo?: SmartMoneyWallet;
+  endDate: Date;
 }
 
 /**
@@ -929,9 +930,17 @@ export class SmartMoneyService {
 
       const isTimeout = maxDurationMs !== null && age >= maxDurationMs;
 
+      /**
       const marketInfo = await this.getMarketBySlug(position.marketSlug);
       const isMarketClosed = marketInfo?.closed || currentPrice >= 0.99 || currentPrice <= 0.01;
+      **/
 
+      // 🛡️ SOLUÇÃO CORRETA: Validar se o mercado chegou ao fim com base no endDate guardado ou preço resolvido
+      const marketEndDate = (position as any).endDate;
+      const isMarketExpired = marketEndDate && now >= marketEndDate;
+      const isPriceResolved = currentPrice >= 0.99 || currentPrice <= 0.01;
+      
+      const isMarketClosed = isMarketExpired || isPriceResolved;
       /**
       if (isMarketClosed) {
         console.log(`[SmartMoneyService] ℹ️ Mercado ${position.marketSlug} fechado/resolvido. A remover da monitorização.`);
@@ -1014,7 +1023,8 @@ export class SmartMoneyService {
             size: position.size,
             price: currentPrice,
             timestamp: Date.now(),
-            isSmartMoney: true
+            isSmartMoney: true,
+            endDate: position.endDate
           };
 
           if (options.executeTradeHandler) {
@@ -1097,6 +1107,7 @@ export class SmartMoneyService {
       timestamp: trade.timestamp,
       isSmartMoney,
       smartMoneyInfo: this.smartMoneyCache.get(traderAddress),
+      endDate: trade.endDate
     };
 
     for (const handler of this.tradeHandlers) {

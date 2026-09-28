@@ -203,6 +203,7 @@ export interface ActivityTrade {
   transactionHash: string;
 
   tokenId: string;
+  endDate: Date;
 
   // ========== 交易者信息 ==========
 
@@ -1303,7 +1304,8 @@ export class RealtimeServiceV2 extends EventEmitter {
                 outcome: trade.outcome,
                 transactionHash: trade.transactionHash,
                 timestamp: Number(trade.timestamp),
-                tokenId: trade.tokenId
+                tokenId: trade.tokenId,
+                endDate: trade.endDate
               };
 
               if (!activityTrade.marketSlug || activityTrade.marketSlug === 'unknown-market') {
