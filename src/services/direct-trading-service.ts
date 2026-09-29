@@ -222,6 +222,7 @@ export class DirectTradingService {
         if (changePercent > threshold) trend = 'up';
         else if (changePercent < -threshold) trend = 'down';
 
+        /** 
         // 1. Calcular EMA 9 e EMA 21 para todo o histórico de velas
         const ema9Values = this.calculateFullEMAArray(closePrices, 9);
         const ema21Values = this.calculateFullEMAArray(closePrices, 21);
@@ -237,7 +238,7 @@ export class DirectTradingService {
         const isSpreadExpanding = currentSpread > previousSpread;
 
         const currentClose = closePrices[closePrices.length - 1];
-
+        **/
         /**
         // 3. Validação da EMA 9 como linha de atenção (evitar entrar se o preço a violou/cruzou)
         const isPriceRespectingEma9 = trend === 'up'
@@ -378,16 +379,13 @@ export class DirectTradingService {
 
         // Invocar a função para obter o Map de posições
         const currentPositions = typeof config.positions === 'function' ? config.positions() : null;
-        console.log('🔍 DEBUG POSIÇÕES ATIVAS:', {
-            procurandoPosKey: posKey,
-            chavesExistentesNoMapa: currentPositions ? Array.from(currentPositions.keys()) : 'Mapa vazio/nulo'
-        });
+
         if (currentPositions && currentPositions.has(posKey)) {
             console.log('WARN', `⏳ [${coin}] Sinal ignorado (Anti-Duplicação): Já tens posição ativa em ${posKey}`);
             return;
         }
 
-        console.log("PREÇO price: " + targetToken.price + " outcomePrices: " + market.outcomePrices);
+        //console.log("PREÇO price: " + targetToken.price + " outcomePrices: " + market.outcomePrices);
         //const tokenPrice = Number(targetToken.price || 0);
 
         // Validações de teto máximo e piso mínimo (0.25 a 0.75)
@@ -506,79 +504,25 @@ export class DirectTradingService {
         return Number(ema.toFixed(2));
     }
 
-    private calculateFullEMAArray(values: number[], period: number): number[] {
-        if (values.length === 0) return [];
-        const k = 2 / (period + 1);
-        const emaArray: number[] = [];
-
-        let currentEma = values.slice(0, Math.min(period, values.length)).reduce((a, b) => a + b, 0) / Math.min(period, values.length);
-
-        for (let i = 0; i < values.length; i++) {
-            if (i >= period) {
-                currentEma = (values[i] * k) + (currentEma * (1 - k));
-            }
-            emaArray.push(Number(currentEma.toFixed(4)));
-        }
-
-        return emaArray;
-    }
-
-    private isMarketInValidWindow__(market: any, coin: string): boolean {
-        let endTimeMs = 0;
-
-        // 1. Tentar extrair o timestamp do slug (ex: 'eth-updown-15m-1790638200')
-        if (market.slug) {
-            const parts = market.slug.split('-');
-            const potentialTimestamp = Number(parts[parts.length - 1]);
-            if (!isNaN(potentialTimestamp) && potentialTimestamp > 1700000000) {
-                endTimeMs = potentialTimestamp * 1000;
-            }
-        }
-
-        // 2. Fallback para o endDate da API se o slug falhar
-        if (!endTimeMs && market.endDate) {
-            endTimeMs = new Date(market.endDate).getTime();
-        }
-
-        if (!endTimeMs || isNaN(endTimeMs)) {
-            console.log('WARN', `⚠️ [${coin}] Impossível determinar a data de fecho do mercado (${market.slug}).`);
-            return false;
-        }
-
-        const nowMs = Date.now();
-        const startTimeMs = endTimeMs - (15 * 60 * 1000); // 15 minutos antes
-
-        // Validação 1: O mercado ainda não começou
-        if (nowMs < startTimeMs) {
-            console.log('WARN', `⏳ [${coin}] Ignorado: O mercado ainda não começou (Início estimado em ${new Date(startTimeMs).toLocaleTimeString()}).`);
-            return false;
-        }
-
-        // Validação 2: Menos de 5 minutos para fechar (Zona de pânico)
-        const minutesRemaining = (endTimeMs - nowMs) / (1000 * 60);
-        if (minutesRemaining < 5) {
-            console.log('WARN', `⏳ [${coin}] Ignorado: Faltam apenas ${minutesRemaining.toFixed(1)}m para o mercado fechar.`);
-            return false;
-        }
-
-        return true;
-    }
 
     private isMarketInValidWindow(market: any, coin: string): boolean {
+        let startTimeMs = 0;
         let endTimeMs = 0;
 
-        // 1. Tentar extrair o timestamp do slug (ex: 'eth-updown-15m-1790638200')
+        // 1. Tentar extrair o timestamp do slug (ex: 'eth-updown-15m-1790708400' -> isto é o INÍCIO)
         if (market.slug) {
             const parts = market.slug.split('-');
             const potentialTimestamp = Number(parts[parts.length - 1]);
             if (!isNaN(potentialTimestamp) && potentialTimestamp > 1700000000) {
-                endTimeMs = potentialTimestamp * 1000;
+                startTimeMs = potentialTimestamp * 1000;
+                endTimeMs = startTimeMs + (15 * 60 * 1000); // 15 minutos depois = FIM correto!
             }
         }
 
         // 2. Fallback para o endDate da API se o slug falhar
         if (!endTimeMs && market.endDate) {
             endTimeMs = new Date(market.endDate).getTime();
+            startTimeMs = endTimeMs - (15 * 60 * 1000);
         }
 
         if (!endTimeMs || isNaN(endTimeMs)) {
@@ -587,7 +531,6 @@ export class DirectTradingService {
         }
 
         const nowMs = Date.now();
-        const startTimeMs = endTimeMs - (15 * 60 * 1000); // 15 minutos antes
 
         // Validação 1: O mercado ainda não começou
         if (nowMs < startTimeMs) {

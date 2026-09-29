@@ -1331,8 +1331,19 @@ export class MarketService {
     const maxEndTime = nowMs + maxMinutesUntilEnd * 60 * 1000;
 
     const filteredMarkets = allMarkets.filter((market) => {
-      const endTime = market.endDate ? new Date(market.endDate).getTime() : 0;
-      return endTime >= minEndTime && endTime <= maxEndTime;
+      if (!market.endDate) return false;
+
+      const endTime = new Date(market.endDate).getTime();
+
+      // Validação pura por milissegundos:
+      const isValidTime = endTime >= minEndTime && endTime <= maxEndTime;
+
+      /** 
+      if (isValidTime) {
+        console.log("PASSOU:", market.slug, "Faltam minutos:", Math.floor((endTime - nowMs) / 1000 / 60));
+      }
+      **/
+      return isValidTime;
     });
 
     // Sort by preference

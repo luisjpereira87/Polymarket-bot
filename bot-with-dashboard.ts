@@ -1448,7 +1448,7 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
       trendThreshold: CONFIG.binance.trendThreshold,
       amount: CONFIG.directTrading.minTradeValueUSD || 5,
       dryRun: CONFIG.dryRun,
-      checkIntervalMs: 5 * 60 * 1000,
+      checkIntervalMs: 2 * 60 * 1000,
       isCanTrade: () => canTrade(),
       positions: () => realPositions,
     },
@@ -1610,49 +1610,58 @@ async function startExpirationWatchdog(sdk: PolymarketSDK, intervalMs: number = 
     for (const [posKey, position] of realPositions.entries()) {
       if (!position.endDate) continue;
 
-      const endTimeMs = new Date(position.endDate).getTime();
+      // 🛡 Blindagem: Garantir conversão segura para milissegundos
+      const endTimeMs = typeof position.endDate === 'number'
+        ? position.endDate
+        : new Date(position.endDate).getTime();
+
+      if (isNaN(endTimeMs)) {
+        console.log('WARN', `⚠️ [WATCHDOG] Data de fecho inválida para a posição ${posKey}`);
+        continue;
+      }
 
       // Se o mercado já passou da data de fecho
-      if (!isNaN(endTimeMs) && nowMs >= endTimeMs) {
+      if (nowMs >= endTimeMs) {
         console.log(`⏰ [WATCHDOG] O mercado da posição ${posKey} expirou. A verificar resultado...`);
 
-        let finalPrice = 0; // Por defeito 0 se não encontrar
+        let finalPrice = 0;
+        let marketResolved = false;
 
         try {
-          // Obter o mercado atualizado (ajusta conforme o método que usas para ir buscar os tokens)
           const fullMarket = await sdk.markets.getMarket(position.marketSlug);
 
           if (fullMarket && fullMarket.tokens) {
-            // Encontrar o token correspondente à nossa posição
             const targetToken = fullMarket.tokens.find((t: MarketToken) =>
               t.tokenId === position.tokenId || t.outcome === position.outcome
             );
 
             if (targetToken) {
-              // Se o mercado já foi resolvido e temos a flag winner
               if (targetToken.winner === true) {
-                finalPrice = 1.00; // Venceu
+                finalPrice = 1.00;
+                marketResolved = true;
               } else if (targetToken.winner === false) {
-                finalPrice = 0.00; // Perdeu
-              } else {
-                // Fallback para o preço atual do token se ainda não tiver a flag winner explícita
-                finalPrice = targetToken.price >= 0.5 ? 1.00 : 0.00;
+                finalPrice = 0.00;
+                marketResolved = true;
               }
             }
           }
         } catch (err) {
-          console.log('WARN', `⚠️ [WATCHDOG] Falha ao consultar o token para ${posKey}: ${(err as Error).message}`);
-          // Fallback de segurança usando a cache ou o preço de entrada
-          finalPrice = position.avgEntryPrice >= 0.5 ? 1.00 : 0.00;
+          console.log('WARN', `⚠️️ [WATCHDOG] Falha ao consultar o token para ${posKey}: ${(err as Error).message}`);
         }
 
-        // Criar o trade sintético de SELL com o preço de liquidação oficial
+        // Se a API ainda não marcou o winner, saltamos este ciclo e tentamos no próximo
+        // para evitar liquidar com base em preços flutuantes de último minuto
+        if (!marketResolved) {
+          console.log(`⏳ [WATCHDOG] Posição ${posKey} expirada mas mercado ainda não liquidado na API. A tentar no próximo ciclo...`);
+          continue;
+        }
+
         const expiredSellTrade: SmartMoneyTrade = {
           traderAddress: position.traderAddress || 'Watchdog-Expiry',
           marketSlug: position.marketSlug,
           side: 'SELL',
           size: position.size,
-          price: finalPrice, // 👈 $1.00 ou $0.00 baseado no winner/price
+          price: finalPrice,
           tokenId: position.tokenId,
           traderName: 'Watchdog (Auto-Close)',
           timestamp: nowMs,
@@ -1661,8 +1670,11 @@ async function startExpirationWatchdog(sdk: PolymarketSDK, intervalMs: number = 
           outcome: position.outcome
         };
 
-        // Processar o fecho limpo através da função standard
         processTradeExecution(sdk, expiredSellTrade, { success: true });
+
+        // Remover a posição do mapa para não repetir o ciclo
+        realPositions.delete(posKey);
+
         console.log(`🏁 [WATCHDOG] Posição ${posKey} liquidada por expiração. Resultado: $${finalPrice.toFixed(2)}`);
       }
     }
