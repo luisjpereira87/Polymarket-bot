@@ -303,7 +303,7 @@ export class DirectTradingService {
         const markets = await this.marketService.scanCryptoShortTermMarkets({
             coin: coin,
             duration: '15m',
-            minMinutesUntilEnd: 5,
+            minMinutesUntilEnd: 2,
             maxMinutesUntilEnd: 60,
             limit: 1,
             sortBy: 'endDate'
