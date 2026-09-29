@@ -319,6 +319,7 @@ export class DirectTradingService {
 
         const nowMs = Date.now();
 
+        /**
        console.log('🔍 DEBUG STARTDATE:', {
             startDateRaw: market.startDate,
             startTimeMs: market.startDate ? new Date(market.startDate).getTime() : 'N/A',
@@ -332,8 +333,13 @@ export class DirectTradingService {
                 console.log('WARN', `⏳ [${coin}] Ignorado: O mercado ainda não começou (Início em ${new Date(startTimeMs).toLocaleTimeString()}). A evitar candle fantasma.`);
                 return;
             }
+        }**/
+
+        if (!this.isMarketInValidWindow(market, coin)) {
+            return;
         }
 
+        /**
         if (market.endDate) {
             const endTimeMs = new Date(market.endDate).getTime();
             const nowMs = Date.now();
@@ -344,7 +350,7 @@ export class DirectTradingService {
                 console.log('WARN', `⏳ [${coin}] Ignorado: Faltam apenas ${minutesRemaining.toFixed(1)}m para o mercado fechar (Zona de pânico).`);
                 return;
             }
-        }
+        }**/
 
         const fullMarket = await this.marketService.getMarket(market.conditionId);
         const yesToken = fullMarket.tokens.find((t: any) => t.outcome === 'Up' || t.outcome === 'Yes');
@@ -515,5 +521,46 @@ export class DirectTradingService {
         }
 
         return emaArray;
+    }
+
+    private isMarketInValidWindow(market: any, coin: string): boolean {
+        let endTimeMs = 0;
+
+        // 1. Tentar extrair o timestamp do slug (ex: 'eth-updown-15m-1790638200')
+        if (market.slug) {
+            const parts = market.slug.split('-');
+            const potentialTimestamp = Number(parts[parts.length - 1]);
+            if (!isNaN(potentialTimestamp) && potentialTimestamp > 1700000000) {
+                endTimeMs = potentialTimestamp * 1000;
+            }
+        }
+
+        // 2. Fallback para o endDate da API se o slug falhar
+        if (!endTimeMs && market.endDate) {
+            endTimeMs = new Date(market.endDate).getTime();
+        }
+
+        if (!endTimeMs || isNaN(endTimeMs)) {
+            console.log('WARN', `⚠️ [${coin}] Impossível determinar a data de fecho do mercado (${market.slug}).`);
+            return false;
+        }
+
+        const nowMs = Date.now();
+        const startTimeMs = endTimeMs - (15 * 60 * 1000); // 15 minutos antes
+
+        // Validação 1: O mercado ainda não começou
+        if (nowMs < startTimeMs) {
+            console.log('WARN', `⏳ [${coin}] Ignorado: O mercado ainda não começou (Início estimado em ${new Date(startTimeMs).toLocaleTimeString()}).`);
+            return false;
+        }
+
+        // Validação 2: Menos de 5 minutos para fechar (Zona de pânico)
+        const minutesRemaining = (endTimeMs - nowMs) / (1000 * 60);
+        if (minutesRemaining < 5) {
+            console.log('WARN', `⏳ [${coin}] Ignorado: Faltam apenas ${minutesRemaining.toFixed(1)}m para o mercado fechar.`);
+            return false;
+        }
+
+        return true;
     }
 }
