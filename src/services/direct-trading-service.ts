@@ -324,7 +324,8 @@ export class DirectTradingService {
         console.log('🔍 DEBUG STARTDATE SOURCES:', {
             fullMarketStartDate: fullMarket?.startDate,
             scanMarketStartDate: market?.startDate,
-            chosenStartDate: validStartDate
+            chosenStartDate: validStartDate,
+            nowMs: Date.now()
         });
 
         // 🛡️ NOVO: Validar se o mercado já iniciou efetivamente
