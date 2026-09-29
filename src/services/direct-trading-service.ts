@@ -319,6 +319,14 @@ export class DirectTradingService {
 
         const nowMs = Date.now();
 
+        const rawStartDate = market.startDate || fullMarket.startDate;
+        const validStartDate = rawStartDate ? new Date(rawStartDate) : new Date(Date.now() + 15 * 60 * 1000);
+        console.log('🔍 DEBUG STARTDATE SOURCES:', {
+            fullMarketStartDate: fullMarket?.startDate,
+            scanMarketStartDate: market?.startDate,
+            chosenStartDate: validStartDate
+        });
+
         // 🛡️ NOVO: Validar se o mercado já iniciou efetivamente
         if (market.startDate) {
             const startTimeMs = new Date(market.startDate).getTime();
@@ -410,7 +418,8 @@ export class DirectTradingService {
             traderName: `Trend Bot (${coin})`,
             timestamp: Date.now(),
             isSmartMoney: false,
-            endDate: validEndDate
+            endDate: validEndDate,
+            outcome: targetToken.outcome
         };
 
         const isDryRun = config.dryRun ?? false;
