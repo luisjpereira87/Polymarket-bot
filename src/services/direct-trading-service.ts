@@ -319,12 +319,9 @@ export class DirectTradingService {
 
         const nowMs = Date.now();
 
-        const rawStartDate = market.startDate || fullMarket.startDate;
-        const validStartDate = rawStartDate ? new Date(rawStartDate) : new Date(Date.now() + 15 * 60 * 1000);
-        console.log('🔍 DEBUG STARTDATE SOURCES:', {
-            fullMarketStartDate: fullMarket?.startDate,
-            scanMarketStartDate: market?.startDate,
-            chosenStartDate: validStartDate,
+       console.log('🔍 DEBUG STARTDATE:', {
+            startDateRaw: market.startDate,
+            startTimeMs: market.startDate ? new Date(market.startDate).getTime() : 'N/A',
             nowMs: Date.now()
         });
 
