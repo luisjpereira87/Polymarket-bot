@@ -13,6 +13,7 @@ import { dashboardEmitter, startDashboard } from './src/dashboard/index.js';
 import type { BotConfig, BotState, DipArbSignal, LogLevel, SmartMoneySignal } from './src/dashboard/types.js';
 import {
   ArbitrageService,
+  MarketToken,
   OnchainService,
   OrderResult,
   PolymarketSDK,
@@ -1601,6 +1602,73 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
   }, 30 * 1000);
 }
 
+
+async function startExpirationWatchdog(sdk: PolymarketSDK, intervalMs: number = 60 * 1000) {
+  setInterval(async () => {
+    const nowMs = Date.now();
+
+    for (const [posKey, position] of realPositions.entries()) {
+      if (!position.endDate) continue;
+
+      const endTimeMs = new Date(position.endDate).getTime();
+
+      // Se o mercado já passou da data de fecho
+      if (!isNaN(endTimeMs) && nowMs >= endTimeMs) {
+        console.log(`⏰ [WATCHDOG] O mercado da posição ${posKey} expirou. A verificar resultado...`);
+
+        let finalPrice = 0; // Por defeito 0 se não encontrar
+
+        try {
+          // Obter o mercado atualizado (ajusta conforme o método que usas para ir buscar os tokens)
+          const fullMarket = await sdk.markets.getMarket(position.marketSlug);
+
+          if (fullMarket && fullMarket.tokens) {
+            // Encontrar o token correspondente à nossa posição
+            const targetToken = fullMarket.tokens.find((t: MarketToken) =>
+              t.tokenId === position.tokenId || t.outcome === position.outcome
+            );
+
+            if (targetToken) {
+              // Se o mercado já foi resolvido e temos a flag winner
+              if (targetToken.winner === true) {
+                finalPrice = 1.00; // Venceu
+              } else if (targetToken.winner === false) {
+                finalPrice = 0.00; // Perdeu
+              } else {
+                // Fallback para o preço atual do token se ainda não tiver a flag winner explícita
+                finalPrice = targetToken.price >= 0.5 ? 1.00 : 0.00;
+              }
+            }
+          }
+        } catch (err) {
+          console.log('WARN', `⚠️ [WATCHDOG] Falha ao consultar o token para ${posKey}: ${(err as Error).message}`);
+          // Fallback de segurança usando a cache ou o preço de entrada
+          finalPrice = position.avgEntryPrice >= 0.5 ? 1.00 : 0.00;
+        }
+
+        // Criar o trade sintético de SELL com o preço de liquidação oficial
+        const expiredSellTrade: SmartMoneyTrade = {
+          traderAddress: position.traderAddress || 'Watchdog-Expiry',
+          marketSlug: position.marketSlug,
+          side: 'SELL',
+          size: position.size,
+          price: finalPrice, // 👈 $1.00 ou $0.00 baseado no winner/price
+          tokenId: position.tokenId,
+          traderName: 'Watchdog (Auto-Close)',
+          timestamp: nowMs,
+          isSmartMoney: false,
+          endDate: position.endDate,
+          outcome: position.outcome
+        };
+
+        // Processar o fecho limpo através da função standard
+        processTradeExecution(sdk, expiredSellTrade, { success: true });
+        console.log(`🏁 [WATCHDOG] Posição ${posKey} liquidada por expiração. Resultado: $${finalPrice.toFixed(2)}`);
+      }
+    }
+  }, intervalMs);
+}
+
 // ============================================================================
 // MAIN
 // ============================================================================
@@ -1707,6 +1775,7 @@ async function main() {
   await setupDipArb(sdk);
 
   await setupPriceMonitor(sdk);
+  await startExpirationWatchdog(sdk);
 
   // 2. Atualiza a lista de carteiras do Smart Money automaticamente a cada 2 horas
   const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
