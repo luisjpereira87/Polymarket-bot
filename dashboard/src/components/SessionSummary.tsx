@@ -5,6 +5,7 @@ interface SessionSummaryProps {
 }
 
 export function SessionSummary({ state }: SessionSummaryProps) {
+  /** 
   const trades = state?.tradesExecuted ?? 0;
   const totalPnL = state?.totalPnL ?? 0;
   const avgProfit = trades > 0 ? totalPnL / trades : 0;
@@ -18,6 +19,20 @@ export function SessionSummary({ state }: SessionSummaryProps) {
   const arbProfit = state?.arbProfit ?? 0;
   const smartMoneyTrades = state?.smartMoneyTrades ?? 0;
   const dipArbTrades = state?.dipArbTrades ?? 0;
+  **/
+  
+  const wins = state?.wins ?? 0;
+  const losses = state?.losses ?? 0;
+  const trades = wins + losses;
+
+  const totalPnL = state?.totalPnL ?? 0;
+  const avgProfit = trades > 0 ? totalPnL / trades : 0;
+  const winRate = trades > 0 ? (wins / trades) * 100 : 0;
+
+  const arbProfit = state?.arbProfit ?? 0;
+  const smartMoneyTrades = state?.smartMoneyTrades ?? 0;
+  const dipArbTrades = state?.dipArbTrades ?? 0;
+
 
   return (
     <div className="panel">
@@ -31,7 +46,7 @@ export function SessionSummary({ state }: SessionSummaryProps) {
       </div>
 
       <div className="panel-body">
-        {/* Win/Loss Stats */}
+        {/* Win/Loss Stats (Reais) */}
         <div className="grid grid-cols-4 gap-4 mb-6">
           <div className="text-center">
             <div className="text-3xl font-bold font-mono text-green-400 glow-text-green">
@@ -63,14 +78,14 @@ export function SessionSummary({ state }: SessionSummaryProps) {
         <div className="mb-6">
           <div className="flex justify-between text-xs text-gray-500 mb-2">
             <span>Win Rate Distribution</span>
-            <span>{wins}W - {losses}L</span>
+            <span>{wins}W - {losses}L (Streak W: {state?.consecutiveWins ?? 0} | L: {state?.consecutiveLosses ?? 0})</span>
           </div>
           <div className="h-3 rounded-full bg-gray-800 overflow-hidden flex">
-            <div 
+            <div
               className="h-full progress-gradient-green transition-all duration-500"
               style={{ width: `${winRate}%` }}
             />
-            <div 
+            <div
               className="h-full progress-gradient-red transition-all duration-500"
               style={{ width: `${100 - winRate}%` }}
             />

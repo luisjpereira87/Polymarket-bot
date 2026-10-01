@@ -29,7 +29,10 @@ export interface BotState {
   dailyPnL: number;
   totalPnL: number;
   consecutiveLosses: number;
+  consecutiveWins: number;
   tradesExecuted: number;
+  wins: number;
+  losses: number;
   isPaused: boolean;
   pauseUntil: number;
   smartMoneyTrades: number;

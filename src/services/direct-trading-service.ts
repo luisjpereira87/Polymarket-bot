@@ -101,6 +101,16 @@ export class DirectTradingService {
         console.log('TREND', '🚀 A iniciar Direct Trading Service (Binance + Polymarket)...');
 
         const executeCheck = async () => {
+            const now = new Date();
+            const currentMinute = now.getMinutes();
+            const minuteInBlock = currentMinute % 15;
+
+            // Proteção extra: se o ciclo disparar dentro dos primeiros 3 minutos, salta fora!
+            if (minuteInBlock < 3) {
+                console.log('TREND', `⏳ [Safety] Minuto ${currentMinute} (${minuteInBlock}m do bloco). Demasiado cedo, a ignorar ciclo para evitar abertura...`);
+                return;
+            }
+
             const coins: Array<'BTC' | 'ETH' | 'SOL'> = ['BTC', 'ETH', 'SOL'];
 
             for (const coin of coins) {
@@ -403,11 +413,11 @@ export class DirectTradingService {
 
         const rawEndDate = market.endDate || fullMarket.endDate;
         const validEndDate = rawEndDate ? new Date(rawEndDate) : new Date(Date.now() + 15 * 60 * 1000);
-        console.log('🔍 DEBUG ENDDATE SOURCES:', {
+        /**console.log('🔍 DEBUG ENDDATE SOURCES:', {
             fullMarketEndDate: fullMarket?.endDate,
             scanMarketEndDate: market?.endDate,
             chosenEndDate: validEndDate
-        });
+        });**/
 
         const syntheticTrade: SmartMoneyTrade = {
             traderAddress: `TrendFollowing-${coin}`,

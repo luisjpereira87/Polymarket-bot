@@ -48,8 +48,8 @@ let CONFIG = {
     pauseOnBreachMinutes: 60,
 
     monthlyMaxLossPct: 1, //0.15,
-    maxDrawdownFromPeak: 0.25,
-    totalMaxLossPct: 0.40,
+    maxDrawdownFromPeak: 1,//0.25,
+    totalMaxLossPct: 1,//0.40,
 
     enableDynamicSizing: true,
     minPositionPct: 0.01,
@@ -162,6 +162,8 @@ const state: BotState = {
   totalPnL: 0,
   consecutiveLosses: 0,
   consecutiveWins: 0,
+  wins: 0,
+  losses: 0,
   tradesExecuted: 0,
   isPaused: false,
   pauseUntil: 0,
@@ -251,6 +253,10 @@ function updateDashboard() {
 }
 
 function canTrade(): boolean {
+  return true;
+}
+
+function canTrade__(): boolean {
   if (state.permanentlyHalted) {
     log('ERROR', '🛑 Trading permanentemente interrompido - limite total de perda atingido');
     return false;
@@ -342,9 +348,11 @@ function recordTrade(profit: number, strategy: string) {
   if (profit < 0) {
     state.consecutiveLosses++;
     state.consecutiveWins = 0;
+    state.losses++;
   } else if (profit > 0) {
     state.consecutiveLosses = 0;
     state.consecutiveWins++;
+    state.wins++;
   }
 
   if (strategy === 'smartMoney') state.smartMoneyTrades++;
@@ -933,8 +941,8 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
 async function setupPriceMonitor(sdk: PolymarketSDK) {
   // Subescreve à monitorização de preços passando o mapa local de posições
 
-  const TAKE_PROFIT_PCT = CONFIG.risk?.takeProfitPercent || 15;
-  const STOP_LOSS_PCT = CONFIG.risk?.stopLossPercent || -10;
+  const TAKE_PROFIT_PCT = CONFIG.risk?.takeProfitPercent || 100.0;
+  const STOP_LOSS_PCT = CONFIG.risk?.stopLossPercent || -50.0;
   sdk.smartMoney.subscribePositionPricesWithExecution(realPositions, {
     takeProfitPercent: TAKE_PROFIT_PCT,
     stopLossPercent: STOP_LOSS_PCT,
@@ -1335,8 +1343,6 @@ async function setupDipArb__(sdk: PolymarketSDK) {
 let swapService: SwapService | null = null;
 
 async function updateBalances(sdk: PolymarketSDK) {
-  //await sdk.tradingService.getPolymarketBalances()
-
   if (CONFIG.dryRun) {
     const totalUsdc = CONFIG.capital.totalUsd || 250
     state.usdcEBalance = totalUsdc + state.totalPnL;
@@ -1345,10 +1351,10 @@ async function updateBalances(sdk: PolymarketSDK) {
     return;
   }
 
-
   if (!swapService) return;
   try {
     const balances = await swapService.getBalances();
+    const polymarketBalances = await sdk.tradingService.getPolymarketBalances()
     let changed = false;
 
     for (const b of balances) {
@@ -1357,7 +1363,7 @@ async function updateBalances(sdk: PolymarketSDK) {
         if (state.maticBalance !== val) { state.maticBalance = val; changed = true; }
       }
       if (b.symbol === 'USDC') {
-        const val = parseFloat(b.balance);
+        const val = Number(polymarketBalances.freeBalance) + Number(polymarketBalances.positionsBalance)
         if (state.usdcBalance !== val) { state.usdcBalance = val; changed = true; }
       }
       if (b.symbol === 'USDC_E') {
@@ -1366,9 +1372,30 @@ async function updateBalances(sdk: PolymarketSDK) {
       }
     }
 
-    if (changed) updateDashboard();
+    // Guardar os valores novos no state e verificar se houve alteração nas métricas
+    const newWins = Number(polymarketBalances.wins);
+    const newLosses = Number(polymarketBalances.losses);
+    const newPnL = Number(polymarketBalances.pnlBalance);
+
+    if (state.wins !== newWins || state.losses !== newLosses || state.totalPnL !== newPnL) {
+      changed = true;
+    }
+
+    state.dailyPnL = newPnL;
+    state.monthlyPnL = newPnL;
+    state.totalPnL = newPnL;
+    state.consecutiveLosses = Number(polymarketBalances.consecutiveLosses);
+    state.consecutiveWins = Number(polymarketBalances.consecutiveWins);
+    state.losses = newLosses;
+    state.wins = newWins;
+    state.tradesExecuted = newWins + newLosses;
+
+    // Força o update sempre que houver mudança nos saldos OU nas estatísticas de jogo/PnL
+    if (changed) {
+      updateDashboard();
+    }
   } catch (err) {
-    // Ignora falhas temporárias
+    console.warn(`[Balances] Erro ao atualizar saldos e estatísticas: ${err}`);
   }
 }
 
@@ -1448,7 +1475,7 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
       trendThreshold: CONFIG.binance.trendThreshold,
       amount: CONFIG.directTrading.minTradeValueUSD || 5,
       dryRun: CONFIG.dryRun,
-      checkIntervalMs: 5 * 60 * 1000,
+      checkIntervalMs: 3 * 60 * 1000,
       isCanTrade: () => canTrade(),
       positions: () => realPositions,
     },
@@ -1464,6 +1491,32 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
       }
     }
   );
+}
+
+function parseEndDate(rawEndDate: any, marketSlug?: string): Date {
+  // 1. PRIORIDADE MÁXIMA: Tentar extrair o timestamp do slug (ex: btc-updown-15m-1790774100)
+  // Como os mercados de 15m têm sempre o timestamp no nome, isto é 100% determinístico.
+  if (marketSlug) {
+    const match = marketSlug.match(/-(\d{10})(?:-|$)/);
+    if (match && match[1]) {
+      const timestampSec = Number(match[1]);
+      // Validação rápida para garantir que o número é realista (ex: maior que o ano 2020)
+      if (timestampSec > 1577836800) {
+        return new Date((timestampSec + 900) * 1000);
+      }
+    }
+  }
+
+  // 2. SEGUNDA OPÇÃO: Se o slug falhar, tentamos o endDate da API (com validação rigorosa)
+  if (rawEndDate !== undefined && rawEndDate !== null && rawEndDate !== '') {
+    const parsed = new Date(rawEndDate);
+    if (!isNaN(parsed.getTime()) && parsed.getFullYear() > 2023) {
+      return parsed;
+    }
+  }
+
+  // 3. FALLBACK ABSOLUTO: 15 minutos a partir de agora
+  return new Date(Date.now() + 15 * 60 * 1000);
 }
 
 async function setupPortfolioManager(sdk: PolymarketSDK) {
@@ -1491,7 +1544,7 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
       const outcomeSuffix = outcome ? `-${outcome}` : '';
       const posKey = `${marketSlug}${outcomeSuffix}`;
       const tokenId = p.asset || p.tokenId;
-      const endDate = p.endDate !== undefined && p.endDate !== null ? new Date(String(p.endDate)) : new Date();
+      const endDate = parseEndDate(p.endDate, marketSlug);
 
       if (size > 0 && marketSlug) {
         realPositions.set(posKey, {
@@ -1559,6 +1612,7 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
               existing.size = size;
               existing.avgEntryPrice = avgPrice;
               existing.tokenId = tokenId;
+              existing.endDate = parseEndDate(p.endDate, marketSlug);
             }
           } else {
             realPositions.set(posKey, {
@@ -1570,7 +1624,7 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
               timestamp: Date.now(),
               traderAddress: p.proxyWallet || targetWalletAddress,
               tokenId: tokenId,
-              endDate: p.endDate
+              endDate: parseEndDate(p.endDate, marketSlug)
             });
           }
         }

@@ -160,6 +160,10 @@ export interface PolymarketBalances {
   freeBalance: string;
   positionsBalance: string;
   pnlBalance: string;
+  wins: number;
+  losses: number;
+  consecutiveLosses: number;
+  consecutiveWins: number;
 }
 
 // ============================================================================
@@ -730,8 +734,8 @@ export class TradingService {
   getFunderAddress(): string {
     return this.funderAddress || '';
   }
-
-  async getPolymarketBalances(): Promise<PolymarketBalances> {
+  /**
+  async getPolymarketBalances__(): Promise<PolymarketBalances> {
     const proxyWallet = this.funderAddress;
 
     // 1. Buscar saldo livre, posições ativas e estatísticas globais em paralelo
@@ -778,6 +782,110 @@ export class TradingService {
       freeBalance: freeCash.toFixed(2),
       positionsBalance: totalCurrentValue.toFixed(2),
       pnlBalance: totalCombinedPnl.toFixed(2)
+    };
+  }
+  **/
+  async getPolymarketBalances(): Promise<PolymarketBalances & { wins?: number; losses?: number; consecutiveLosses?: number }> {
+    const proxyWallet = this.funderAddress;
+
+    // 1. Buscar saldo livre, posições ativas, estatísticas globais e atividade recente otimizada em paralelo
+    const [balanceResponse, positionsRes, statsRes, activityRes] = await Promise.all([
+      this.getBalanceAllowance('COLLATERAL'),
+      fetch(`https://data-api.polymarket.com/positions?user=${proxyWallet}`),
+      fetch(`https://data-api.polymarket.com/v2/user-stats?user=${proxyWallet}`),
+      fetch(`https://data-api.polymarket.com/v2/activity?user=${proxyWallet}&limit=500&exclude_deposits_withdrawals=true`)
+    ]);
+
+    const freeCash = (Number(balanceResponse?.balance) || 0) / 1e6;
+    const apiPositions = await positionsRes.json();
+    const userStats = (await statsRes.json()) as any;
+
+    let totalCurrentValue = 0;
+    let unrealizedPnl = 0;
+
+    if (Array.isArray(apiPositions)) {
+      for (const pos of apiPositions) {
+        totalCurrentValue += Number(pos.currentValue) || 0;
+        unrealizedPnl += Number(pos.cashPnl) || 0;
+      }
+    }
+
+    const realizedPnl = Number(userStats?.data?.all_time_pnl?.realized_pnl) || 0;
+    const totalCombinedPnl = realizedPnl + unrealizedPnl;
+    const totalPortfolioValue = freeCash + totalCurrentValue;
+
+    // 2. Processar a atividade para calcular Wins, Losses e Derrotas Consecutivas por fluxo de caixa (slug)
+    let wins = 0;
+    let losses = 0;
+    let consecutiveLosses = 0;
+    let consecutiveWins = 0;
+
+    try {
+      const activityData = (await activityRes.json()) as any;
+      const items = activityData?.data || activityData;
+
+      if (Array.isArray(items) && items.length > 0) {
+        // Como a API devolve DESC por defeito, ordenamos cronologicamente de forma ascendente (antigo -> recente) para calcular bem os streaks
+        const sortedItems = [...items].sort((a: any, b: any) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
+
+        const marketNetFlow = new Map<string, number>();
+        const marketTimestamps = new Map<string, number>();
+
+        for (const item of sortedItems) {
+          const slug = item.slug || item.event_slug;
+          if (!slug) continue;
+
+          const currentFlow = marketNetFlow.get(slug) || 0;
+          const usdcSize = Number(item.usdc_size) || 0;
+          const timestamp = Number(item.timestamp || 0);
+
+          marketTimestamps.set(slug, timestamp);
+
+          if (item.side === 'BUY') {
+            marketNetFlow.set(slug, currentFlow - usdcSize);
+          } else if (item.side === 'SELL' || item.type === 'REDEEM') {
+            marketNetFlow.set(slug, currentFlow + usdcSize);
+          }
+        }
+
+        const sortedMarkets = Array.from(marketNetFlow.entries()).sort((a, b) => {
+          const timeA = marketTimestamps.get(a[0]) || 0;
+          const timeB = marketTimestamps.get(b[0]) || 0;
+          return timeA - timeB;
+        });
+
+        for (const [slug, netFlow] of sortedMarkets) {
+          const isWin = netFlow > 0;
+
+          if (isWin) {
+            wins++;
+            consecutiveWins++;
+            consecutiveLosses = 0; // Reseta o streak de perdas na vitória
+          } else {
+            losses++;
+            consecutiveLosses++; // Incrementa o streak de perdas
+            consecutiveWins = 0;
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`[Stats] Não foi possível calcular o histórico de vitórias/derrotas através da atividade: ${err}`);
+    }
+
+    //console.log(`💵 Saldo Livre: $${freeCash.toFixed(2)}`);
+    //console.log(`📈 Valor Atual das Posições: $${totalCurrentValue.toFixed(2)}`);
+    //console.log(`💰 Património Total: $${totalPortfolioValue.toFixed(2)}`);
+    //console.log(`📊 PnL Consolidado: $${totalCombinedPnl.toFixed(2)}`);
+    //console.log(`🏆 Vitórias: ${wins} | ❌ Derrotas: ${losses} | 📉 Ganhos Consecutivos: ${consecutiveWins} | 📉 Perdas Consecutivas: ${consecutiveLosses}`);
+
+    return {
+      freeBalance: freeCash.toFixed(2),
+      positionsBalance: totalCurrentValue.toFixed(2),
+      pnlBalance: totalCombinedPnl.toFixed(2),
+      wins,
+      losses,
+      consecutiveLosses,
+      consecutiveWins
     };
   }
 }

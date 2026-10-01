@@ -602,4 +602,5 @@ export interface TradePositions {
   traderAddress?: string;
   tokenId: string;
   endDate: Date;
+  lockedFloor?: number;
 }

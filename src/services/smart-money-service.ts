@@ -899,8 +899,8 @@ export class SmartMoneyService {
       executeTradeHandler?: (trade: SmartMoneyTrade, result: OrderResult) => void;
     } = {}
   ): Promise<{ id: string; unsubscribe: () => void }> {
-    const takeProfit = options.takeProfitPercent ?? 15.0;
-    const stopLoss = options.stopLossPercent ?? -10.0;
+    const takeProfit = options.takeProfitPercent ?? 100.0;
+    const stopLoss = options.stopLossPercent ?? -50.0;
     const maxDurationMs = options.maxTradeDurationMinutes ? options.maxTradeDurationMinutes * 60 * 1000 : null;
     const gracePeriodMs = (options.stopLossGracePeriodSeconds ?? 30) * 1000; // 👈 30 segundos por defeito
     const dryRun = options.dryRun ?? false;
@@ -939,7 +939,7 @@ export class SmartMoneyService {
       const marketEndDate = (position as any).endDate;
       const isMarketExpired = marketEndDate && now >= marketEndDate;
       const isPriceResolved = currentPrice >= 0.99 || currentPrice <= 0.01;
-      
+
       const isMarketClosed = isMarketExpired || isPriceResolved;
       /**
       if (isMarketClosed) {
@@ -949,11 +949,52 @@ export class SmartMoneyService {
       }
       **/
 
-      const isTakeProfit = pnlPercent >= takeProfit;
+      const timeRemainingSec = marketEndDate ? (marketEndDate - now) / 1000 : null;
+
+      /** 
+      console.log(`[DEBUG-CHECK] Pos: ${posKey} | Preço Atual: ${currentPrice} | PnL: ${pnlPercent.toFixed(2)}% | Idade: ${(age / 1000).toFixed(1)}s | ` +
+        `endDate: ${marketEndDate} | Restam: ${timeRemainingSec !== null ? timeRemainingSec.toFixed(1) : 'N/A'}s | ` +
+        `TP Target: ${takeProfit}% | SL Target: ${stopLoss}%`);**/
+
+      //const isTakeProfit = pnlPercent >= takeProfit;
+      //const isStopLoss = pnlPercent <= stopLoss; // Já passou pelo grace period, logo o SL é legítimo
+
+      // 📈 GESTÃO DE PATAMARES EM ESCADA (TRAILING FLOOR)
+      if (position.lockedFloor === undefined) {
+        position.lockedFloor = -1; // -1 significa: nenhum piso trancado ainda (o SL de -50% comanda)
+      }
+
+      // Atualizar o piso com base no PnL atual atingido
+      if (pnlPercent >= 100 && position.lockedFloor < 75) {
+        position.lockedFloor = 75;
+        console.log(`🚀 [Escada] ${posKey} atingiu 100%! Piso de lucro trancado nos 75%.`);
+      } else if (pnlPercent >= 75 && position.lockedFloor < 50) {
+        position.lockedFloor = 50;
+        console.log(`📈 [Escada] ${posKey} atingiu 75%! Piso de lucro trancado nos 50%.`);
+      } else if (pnlPercent >= 50 && position.lockedFloor < 25) {
+        position.lockedFloor = 25;
+        console.log(`📈 [Escada] ${posKey} atingiu 50%! Piso de lucro trancado nos 25%.`);
+      } else if (pnlPercent >= 25 && position.lockedFloor < 0) {
+        position.lockedFloor = 0; // Breakeven (0% - adeus risco de perder dinheiro!)
+        console.log(`🛡 [Escada] ${posKey} atingiu 25%! Piso seguro trancado no Breakeven (0%).`);
+      }
+
+      // Condições de saída finais:
+      // 1. Take Profit absoluto (teto máximo configurado)
+      const isTakeProfitTarget = pnlPercent >= takeProfit;
+
+      // 2. Trailing Trigger: Se já trancámos algum piso (>= 0) e o PnL caiu abaixo desse piso
+      const isFloorTriggered = position.lockedFloor >= 0 && pnlPercent <= position.lockedFloor;
+
+      // 3. Stop Loss Clássico: Só atua se NENHUM piso foi trancado ainda (< 0) e bateu no limite de perda (-50%)
+      //const isStopLoss = position.lockedFloor < 0 && pnlPercent <= stopLoss;
       const isStopLoss = pnlPercent <= stopLoss; // Já passou pelo grace period, logo o SL é legítimo
 
-      if (isTakeProfit || isStopLoss || isTimeout || isMarketClosed) {
+      const shouldExit = isTakeProfitTarget || isFloorTriggered || isStopLoss || isTimeout || isMarketClosed;
+
+      if (shouldExit) {
         let actionType = '🎯 Take-Profit';
+        if (isFloorTriggered) actionType = `🛡️ Trailing Escada (Fecho no piso de +${position.lockedFloor}%)`; // 👈 Adicionar isto para saberes exatamente qual o patamar que fechou
         if (isStopLoss) actionType = '🛑 Stop-Loss';
         if (isTimeout) actionType = '⏰ Timeout (Tempo Limite)';
         if (isMarketClosed) actionType = '🏁 Mercado Fechado / Resolvido';
