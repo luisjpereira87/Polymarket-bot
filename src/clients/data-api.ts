@@ -55,7 +55,7 @@ export interface Position {
   tokenId: string;
 }
 
-export interface Activity {
+export interface Activity__ {
   // Transaction type
   type: 'TRADE' | 'SPLIT' | 'MERGE' | 'REDEEM' | 'REWARD' | 'CONVERSION';
   side: 'BUY' | 'SELL';
@@ -80,6 +80,39 @@ export interface Activity {
   slug?: string;
 
   // Trader info (from API - returned as "name")
+  name?: string;
+}
+
+export interface Activity {
+  // Identificação única do registo
+  id?: string;
+  transactionHash: string;
+  proxyWallet: string;
+
+  // Transaction type & side
+  type: 'TRADE' | 'SPLIT' | 'MERGE' | 'REDEEM' | 'REWARD' | 'CONVERSION' | 'TIP';
+  side?: 'BUY' | 'SELL';
+
+  // Trade / Volume data (mapeado da v2)
+  size: number;
+  price: number;
+  usdcSize?: number;
+
+  // Market identifiers
+  asset: string;
+  conditionId: string;
+  outcome?: string;
+  outcomeIndex?: number;
+
+  // Transaction info (v2 usa block_timestamp em segundos)
+  timestamp: number;
+
+  // Market metadata (from API v2)
+  title?: string;
+  slug?: string;
+  icon?: string;
+
+  // Trader info
   name?: string;
 }
 
@@ -252,6 +285,31 @@ export interface ActivityParams {
   sortDirection?: 'ASC' | 'DESC';
 }
 
+export interface ActivityV2Params {
+  /** Maximum number of results (0-500, default: 100) */
+  limit?: number;
+  /** Pagination offset (0-10000) */
+  offset?: number;
+  /** Start timestamp (Unix seconds) - filter activities after this time */
+  start?: number;
+  /** End timestamp (Unix seconds) - filter activities before this time */
+  end?: number;
+  /** Activity type filter */
+  type?: 'TRADE' | 'SPLIT' | 'MERGE' | 'REDEEM' | 'REWARD' | 'CONVERSION';
+  /** Trade side filter */
+  side?: 'BUY' | 'SELL';
+  /** Market condition IDs to filter */
+  market?: string[];
+  /** Event IDs to filter */
+  eventId?: number[];
+  /** Sort field */
+  sortBy?: 'TIMESTAMP' | 'TOKENS' | 'CASH';
+  /** Sort direction */
+  sortDirection?: 'ASC' | 'DESC';
+
+  cursor?: string;
+}
+
 /**
  * Positions query parameters
  * @see https://docs.polymarket.com/developers/misc-endpoints/data-api-get-positions
@@ -277,6 +335,35 @@ export interface PositionsParams {
   sortBy?: 'CURRENT' | 'INITIAL' | 'TOKENS' | 'CASHPNL' | 'PERCENTPNL' | 'TITLE' | 'RESOLVING' | 'PRICE' | 'AVGPRICE';
   /** Sort direction */
   sortDirection?: 'ASC' | 'DESC';
+}
+
+export interface PositionsV2Params {
+  /** Maximum number of results (0-500, default: 100) */
+  limit?: number;
+  /** Pagination offset (0-10000) */
+  offset?: number;
+  /** Market condition IDs to filter */
+  market?: string[];
+  /** Event IDs to filter */
+  eventId?: number[];
+  /** Minimum position size to include (default: 1) */
+  sizeThreshold?: number;
+  /** Only return redeemable positions */
+  redeemable?: boolean;
+  /** Only return mergeable positions */
+  mergeable?: boolean;
+  /** Search by title */
+  title?: string;
+  /** Sort field */
+  sortBy?: 'CURRENT' | 'INITIAL' | 'TOKENS' | 'CASHPNL' | 'PERCENTPNL' | 'TITLE' | 'RESOLVING' | 'PRICE' | 'AVGPRICE';
+  /** Sort direction */
+  sortDirection?: 'ASC' | 'DESC';
+
+  cursor?: string;
+
+  status?: string;
+
+  includeArchived?: string;
 }
 
 /**
@@ -413,7 +500,7 @@ export class DataApiClient {
    * const redeemable = await client.getPositions(address, { redeemable: true });
    * ```
    */
-  async getPositions(address: string, params?: PositionsParams): Promise<Position[]> {
+  async getPositions__(address: string, params?: PositionsParams): Promise<Position[]> {
     return this.rateLimiter.execute(ApiType.DATA_API, async () => {
       const query = new URLSearchParams({ user: address });
 
@@ -445,6 +532,43 @@ export class DataApiClient {
         );
       const data = (await response.json()) as unknown[];
       return this.normalizePositions(data);
+    });
+  }
+
+  async getPositions(address: string, params?: PositionsV2Params): Promise<Position[]> {
+    return this.rateLimiter.execute(ApiType.DATA_API, async () => {
+      const query = new URLSearchParams({ user: address });
+
+      // Parâmetros de paginação e filtros suportados pela v2
+      if (params?.limit !== undefined) query.set('limit', String(params.limit));
+      if (params?.cursor) query.set('cursor', params.cursor);
+      if (params?.status) query.set('status', params.status); // OPEN, CLOSED, REDEEMABLE, etc.
+
+      if (params?.sortBy) query.set('sortBy', params.sortBy);
+      if (params?.sortDirection) query.set('sortDirection', params.sortDirection);
+
+      if (params?.market) {
+        params.market.forEach((m) => query.append('market', m));
+      }
+      if (params?.eventId) {
+        params.eventId.forEach((id) => query.append('eventId', String(id)));
+      }
+
+      if (params?.title) query.set('title', params.title);
+      if (params?.includeArchived !== undefined) query.set('include_archived', String(params.includeArchived));
+
+      const response = await fetch(`${DATA_API_BASE}/v2/positions?${query}`);
+      if (!response.ok)
+        throw PolymarketError.fromHttpError(
+          response.status,
+          await response.json().catch(() => null)
+        );
+
+      // CORREÇÃO CRUCIAL: A v2 devolve um envelope { data: [...], pagination: {...} }
+      const responseJson = (await response.json()) as { data: unknown[]; pagination?: { next_cursor?: string } };
+
+      const rawData = responseJson.data || [];
+      return this.normalizePositions(rawData);
     });
   }
 
@@ -521,7 +645,7 @@ export class DataApiClient {
    * const page2 = await client.getActivity(address, { offset: 100, limit: 100 });
    * ```
    */
-  async getActivity(address: string, params?: ActivityParams): Promise<Activity[]> {
+  async getActivity__(address: string, params?: ActivityParams): Promise<Activity[]> {
     return this.rateLimiter.execute(ApiType.DATA_API, async () => {
       const query = new URLSearchParams({ user: address });
 
@@ -555,6 +679,50 @@ export class DataApiClient {
         );
       const data = (await response.json()) as unknown[];
       return this.normalizeActivities(data);
+    });
+  }
+
+  async getActivity(address: string, params?: ActivityV2Params): Promise<Activity[]> {
+    return this.rateLimiter.execute(ApiType.DATA_API, async () => {
+      const query = new URLSearchParams({ user: address });
+
+      // Basic params
+      query.set('limit', String(params?.limit ?? 100));
+
+      // P0: offset, start, end (time filtering and pagination)
+      if (params?.offset !== undefined) query.set('offset', String(params.offset));
+      if (params?.start !== undefined) query.set('start', String(params.start));
+      if (params?.end !== undefined) query.set('end', String(params.end));
+      if (params?.cursor) query.set('cursor', params.cursor); // Se usares paginação por cursor na activity
+
+      // P1: type, side, market, eventId
+      if (params?.type) query.set('type', params.type);
+      if (params?.side) query.set('side', params.side);
+      if (params?.market) {
+        params.market.forEach((m) => query.append('market', m));
+      }
+      if (params?.eventId) {
+        params.eventId.forEach((id) => query.append('eventId', String(id)));
+      }
+
+      // P2: sortBy, sortDirection
+      if (params?.sortBy) query.set('sortBy', params.sortBy);
+      if (params?.sortDirection) query.set('sortDirection', params.sortDirection);
+
+      const response = await fetch(`${DATA_API_BASE}/v2/activity?${query}`);
+      if (!response.ok)
+        throw PolymarketError.fromHttpError(
+          response.status,
+          await response.json().catch(() => null)
+        );
+
+      // CORREÇÃO: Extrair o array do envelope da v2
+      const responseJson = (await response.json()) as { data: unknown[]; pagination?: any } | unknown[];
+
+      // Suporta caso venha encapsulado em { data: [...] } ou diretamente como array
+      const rawData = Array.isArray(responseJson) ? responseJson : (responseJson.data || []);
+
+      return this.normalizeActivities(rawData);
     });
   }
 
@@ -737,7 +905,7 @@ export class DataApiClient {
    * const page2 = await client.fetchLeaderboard({ timePeriod: 'WEEK', limit: 20, offset: 20 });
    * ```
    */
-  async fetchLeaderboard(params?: LeaderboardParams): Promise<LeaderboardResult> {
+  async fetchLeaderboard__(params?: LeaderboardParams): Promise<LeaderboardResult> {
     const {
       timePeriod = 'ALL',
       orderBy = 'PNL',
@@ -774,6 +942,62 @@ export class DataApiClient {
 
         const data = (await response.json()) as unknown[];
         const entries = this.normalizeLeaderboardEntries(data);
+
+        return {
+          entries,
+          hasMore: entries.length === limit,
+          request: { offset, limit },
+        };
+      });
+    });
+  }
+
+  async fetchLeaderboard(params?: LeaderboardParams): Promise<LeaderboardResult> {
+    const {
+      timePeriod = 'all', // 👈 Garantir minúsculas por defeito conforme a doc
+      orderBy = 'PNL',
+      category = 'overall', // 👈 Garantir minúsculas por defeito
+      limit = 50,
+      offset = 0,
+      user,
+      userName,
+    } = params || {};
+
+    const cacheKey = `leaderboard:${timePeriod}:${orderBy}:${category}:${offset}:${limit}:${user || ''}`;
+
+    return this.cache.getOrSet(cacheKey, CACHE_TTL.LEADERBOARD, async () => {
+      const query = new URLSearchParams();
+
+      if (user) {
+        query.set('user', user);
+      } else {
+        query.set('time_period', timePeriod.toLowerCase()); // Garante minúsculas (day, week, month, all)
+        query.set('sort_by', orderBy.toUpperCase());         // PNL ou VOLUME
+        query.set('category', category.toLowerCase());     // overall ou categoria
+        query.set('limit', String(limit));
+        if (offset > 0) query.set('offset', String(offset));
+      }
+
+      const requestUrl = `${DATA_API_BASE}/v2/leaderboard?${query}`;
+      console.log('🔍 URL exato enviado para a v2:', requestUrl); // 👈 Vamos ver isto nos logs
+
+      return this.rateLimiter.execute(ApiType.DATA_API, async () => {
+        const response = await fetch(requestUrl);
+        if (!response.ok) {
+          const errorBody = await response.text();
+          console.error('❌ Corpo do erro enviado pela API:', errorBody); // 👈 Vamos ver o motivo exato do 400
+          throw PolymarketError.fromHttpError(
+            response.status,
+            JSON.parse(errorBody || '{}')
+          );
+        }
+
+        const jsonResponse = (await response.json()) as any;
+        const rawEntries = Array.isArray(jsonResponse)
+          ? jsonResponse
+          : (jsonResponse.data || [jsonResponse]);
+
+        const entries = this.normalizeLeaderboardEntries(rawEntries);
 
         return {
           entries,
@@ -877,7 +1101,7 @@ export class DataApiClient {
 
   // ===== Data Normalization =====
 
-  private normalizePositions(data: unknown[]): Position[] {
+  private normalizePositions__(data: unknown[]): Position[] {
     if (!Array.isArray(data)) return [];
     return data.map((item) => {
       const p = item as Record<string, unknown>;
@@ -934,6 +1158,38 @@ export class DataApiClient {
     });
   }
 
+  private normalizePositions(data: any[]): Position[] {
+    return data.map((item) => ({
+      proxyWallet: item.proxy_wallet,
+      asset: item.token_id, // ou item.asset dependendo do teu tipo
+      conditionId: item.condition_id || '',
+      outcome: item.outcome || '',
+      outcomeIndex: item.outcome_index ?? 0,
+      size: Number(item.current_size ?? item.total_size ?? 0),
+      avgPrice: Number(item.avg_price ?? 0),
+      curPrice: Number(item.current_price ?? 0),
+      totalBought: Number(item.total_cost_usdc ?? 0),
+      initialValue: Number(item.entry_cost_usdc ?? 0),
+      currentValue: Number(item.current_value ?? 0),
+      cashPnl: Number(item.total_pnl ?? item.unrealized_pnl ?? 0),
+      percentPnl: Number(item.percent_pnl ?? 0),
+      realizedPnl: Number(item.realized_pnl ?? 0),
+      percentRealizedPnl: Number(item.percent_realized_pnl ?? 0),
+      title: item.title || '',
+      slug: item.slug || '',
+      icon: item.icon || '',
+      eventId: item.event_id,
+      eventSlug: item.event_slug,
+      oppositeOutcome: item.opposite_outcome,
+      oppositeAsset: item.opposite_token_id,
+      redeemable: Boolean(item.redeemable),
+      mergeable: Boolean(item.mergeable),
+      endDate: item.end_date ? new Date(item.end_date) : undefined,
+      negativeRisk: Boolean(item.negative_risk),
+      tokenId: item.token_id || '',
+    }));
+  }
+
   private normalizeClosedPositions(data: unknown[]): ClosedPosition[] {
     if (!Array.isArray(data)) return [];
     return data.map((item) => {
@@ -964,8 +1220,8 @@ export class DataApiClient {
       };
     });
   }
-
-  private normalizeActivities(data: unknown[]): Activity[] {
+  /**
+  private normalizeActivities__(data: unknown[]): Activity[] {
     if (!Array.isArray(data)) return [];
     return data.map((item) => {
       const a = item as Record<string, unknown>;
@@ -999,6 +1255,37 @@ export class DataApiClient {
 
         // Trader info
         name: a.name !== undefined ? String(a.name) : undefined,
+      };
+    });
+  }
+  **/
+  private normalizeActivities(data: any[]): Activity[] {
+    return data.map((item) => {
+      // Trata o timestamp independentemente de vir em block_timestamp ou timestamp
+      let rawTimestamp = item.block_timestamp || item.timestamp;
+
+      let timestampMs = Date.now();
+      if (rawTimestamp) {
+        // Se o timestamp for menor que 10^12, está em segundos; multiplicamos por 1000
+        timestampMs = rawTimestamp < 10000000000 ? rawTimestamp * 1000 : new Date(rawTimestamp).getTime();
+      }
+
+      return {
+        id: item.id || item.transaction_hash || '',
+        proxyWallet: item.proxy_wallet || item.user,
+        timestamp: timestampMs, // Se o teu tipo espera o número em ms, ou podes guardar já como Date se preferires
+        type: item.type || 'TRADE',
+        side: item.side || '',
+        market: item.market || item.condition_id || '',
+        conditionId: item.condition_id || item.conditionId || '',
+        asset: item.asset || item.token_id || '',
+        size: Number(item.size || item.shares || item.amount || 0),
+        price: Number(item.price || 0),
+        usdcSize: Number(item.usdc_size || item.uscl_amount || item.amount_usd || 0),
+        transactionHash: item.transaction_hash || item.txHash || '',
+        title: item.title || '',
+        slug: item.slug || '',
+        icon: item.icon || '',
       };
     });
   }
@@ -1061,7 +1348,7 @@ export class DataApiClient {
       const e = item as Record<string, unknown>;
       return {
         // Wallet identifier
-        address: String(e.proxyWallet || e.address || ''),
+        address: String(e.proxyWallet || e.address || e.user_id || ''),
 
         // Ranking data
         rank: typeof e.rank === 'number' ? e.rank : parseInt(String(e.rank), 10) || 0,

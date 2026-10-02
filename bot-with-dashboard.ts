@@ -529,7 +529,8 @@ async function whalesQualifiedWallets(sdk: PolymarketSDK): Promise<string[]> {
     }
 
     // 2. Obter o leaderboard focado em lucro (PnL)
-    const leaderboard = await sdk.wallets.getLeaderboardByPeriod('week', CONFIG.smartMoney.topN * 3, 'pnl');
+    const leaderboard = await sdk.wallets.getLeaderboardByPeriod('week', CONFIG.smartMoney.topN, 'pnl');
+    //console.log("AQUIII", leaderboard)
     log('WALLET', `📊 Leaderboard obtido: ${leaderboard.length} carteiras para analisar.`);
 
     for (const entry of leaderboard) {
@@ -556,20 +557,28 @@ async function whalesQualifiedWallets(sdk: PolymarketSDK): Promise<string[]> {
       // 🪵 Log de diagnóstico para sabermos porque é que foi aceite ou rejeitado
       log('INFO', `Wallet ${entry.address.slice(0, 8)} -> PnL: $${totalPnL} | WR: ${(winRate * 100).toFixed(1)}% | Score: ${smartScore} | Trades: ${trades} | Horas inativo: ${hoursSinceLastActive.toFixed(0)}h`);
 
-      // 🛡️ Filtros temporariamente mais tolerantes para testes (evita bloqueio total)
-      const minRequiredPnL = 10000;           //baixado temporariamente para $10k para teste(podes subir depois para 100000)
-      const minWinRate = 0.45;                // Tolerância maior para grandes traders
-      const minSmartScore = 20;               // Evita rejeitar perfis sem score calculado
+      // 🛡️ Filtros flexíveis: Mega Baleias ou Traders Altamente Eficazes (Menor Capital)
+      const minRequiredPnL = 2500;            // Baixado para $2,5k para apanhar quem está a crescer
+      const eliteWinRate = 0.65;              // Se tiver um win rate muito alto, exigimos menos PnL absoluto
+      const standardWinRate = 0.45;
+      const minTrades = 30;                   // Garante que tem histórico suficiente (evita sorte de 1 ou 2 trades)
+      const minSmartScore = 20;
+      const isRecentlyActive = hoursSinceLastActive <= 168; // 7 dias
 
-      const isProfitable = totalPnL >= minRequiredPnL;
-      const hasReasonableWinRate = winRate >= minWinRate;
-      const isRecentlyActive = hoursSinceLastActive <= 168; // Alargado para 7 dias para testes
+      // Critério A: É uma baleia consolidada (PnL alto + Win Rate decente)
+      const isClassicWhale = totalPnL >= minRequiredPnL && winRate >= standardWinRate;
 
-      if (isProfitable && hasReasonableWinRate && isRecentlyActive) {
+      // Critério B: É um trader de alta precisão/eficácia (Win Rate de elite + histórico consistente, mesmo com PnL mais modesto)
+      const isHighPrecisionTrader = totalPnL > 0 && winRate >= eliteWinRate && trades >= minTrades;
+
+      const isProfitableOrEfficient = isClassicWhale || isHighPrecisionTrader;
+      const hasEnoughTrades = trades >= minTrades;
+
+      if (isProfitableOrEfficient && hasEnoughTrades && isRecentlyActive) {
         qualified.push(entry.address);
-        log('WALLET', `🐋 Mega Baleia Qualificada: ${entry.address.slice(0, 10)}... (PnL: $${Number(totalPnL).toLocaleString()} | WR: ${(winRate * 100).toFixed(0)}% | Trades: ${trades})`);
+        log('WALLET', `🐋 Trader Qualificado: ${entry.address.slice(0, 10)}... (PnL: $${Number(totalPnL).toLocaleString()} | WR: ${(winRate * 100).toFixed(0)}% | Trades: ${trades})`);
       } else {
-        log('INFO', `❌ Rejeitada: PnLOK=${isProfitable}, WROK=${hasReasonableWinRate}, ActiveOK=${isRecentlyActive}`);
+        log('INFO', `❌ Rejeitada: Proficient=${isProfitableOrEfficient}, TradesOK=${hasEnoughTrades}, ActiveOK=${isRecentlyActive}`);
       }
 
       await new Promise(r => setTimeout(r, 250)); // Respeitar rate limits da SDK

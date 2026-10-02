@@ -10,16 +10,16 @@
  */
 
 import {
-  DataApiClient,
-  Position,
   Activity,
+  DataApiClient,
+  LeaderboardCategory,
   LeaderboardEntry,
+  LeaderboardOrderBy,
   LeaderboardResult,
   LeaderboardTimePeriod,
-  LeaderboardOrderBy,
-  LeaderboardCategory,
+  Position,
 } from '../clients/data-api.js';
-import { SubgraphClient, OrderFilledEvent } from '../clients/subgraph.js';
+import { OrderFilledEvent, SubgraphClient } from '../clients/subgraph.js';
 import type { UnifiedCache } from '../core/unified-cache.js';
 import { CACHE_TTL } from '../core/unified-cache.js';
 
@@ -32,7 +32,7 @@ export type TimePeriod = 'day' | 'week' | 'month' | 'all';
 export type LeaderboardSortBy = 'volume' | 'pnl';
 
 // Re-export API types for convenience
-export type { LeaderboardTimePeriod, LeaderboardOrderBy, LeaderboardCategory };
+export type { LeaderboardCategory, LeaderboardOrderBy, LeaderboardTimePeriod };
 
 /**
  * Collateral Asset ID (USDC)
@@ -88,7 +88,7 @@ export interface UserPeriodStats {
   positions: Map<string, TokenPosition>;  // 各 token 持仓
 }
 
-export interface PeriodLeaderboardEntry {
+export interface  PeriodLeaderboardEntry {
   address: string;
   rank: number;
   // Core metrics from official API
@@ -245,7 +245,7 @@ export class WalletService {
       this.dataApi.getPositions(address),
       this.dataApi.getActivity(address, { limit: 100 }),
     ]);
-
+    //console.log("AQUII", activities)
     const totalPnL = positions.reduce((sum, p) => sum + (p.cashPnl || 0), 0);
     const realizedPnL = positions.reduce((sum, p) => sum + (p.realizedPnl || 0), 0);
     const unrealizedPnL = totalPnL - realizedPnL;

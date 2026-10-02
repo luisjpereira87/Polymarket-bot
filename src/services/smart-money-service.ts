@@ -1545,7 +1545,7 @@ export class SmartMoneyService {
 
       recentTrades: recentTrades.map(t => ({
         timestamp: t.timestamp,
-        side: t.side,
+        side: (t.side === 'BUY' || t.side === 'SELL') ? t.side : 'BUY',
         size: t.size,
         price: t.price,
         usdcSize: t.usdcSize,
