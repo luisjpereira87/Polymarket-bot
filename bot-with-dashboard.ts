@@ -1491,11 +1491,11 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
     {
       onTrade: async (trade, result) => {
         // Aqui lidas com a execução através da tua função unificada que atualiza o dashboard e o portfólio
-
+        /**
         if (trade.marketSlug) {
           await updatePricesCache(sdk, trade.marketSlug);
         }
-
+        **/
         processTradeExecution(sdk, trade, result);
       }
     }
