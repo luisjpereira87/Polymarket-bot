@@ -14,6 +14,25 @@ export interface DirectTradingServiceConfig {
     positions: () => Map<string, TradePositions>
 }
 
+export interface OrderBookValidationResult {
+    isValid: boolean;
+    averageExecutionPrice: number;
+    maxPriceTouched: number;
+    totalShares: number;
+    reason?: string;
+}
+
+interface ClobOrderBookResponse {
+    market?: string;
+    asset_id?: string;
+    bids?: Array<{ price: string; size: string }>;
+    asks?: Array<{ price: string; size: string }>;
+    min_order_size?: string;
+    tick_size?: string;
+    neg_risk?: boolean;
+    last_trade_price?: string;
+}
+
 export type DirectTradingCallback = (trade: any, result: any) => Promise<void> | void;
 
 export class DirectTradingService {
@@ -105,8 +124,8 @@ export class DirectTradingService {
             const currentMinute = now.getMinutes();
             const minuteInBlock = currentMinute % 15;
 
-            // Proteção extra: se o ciclo disparar dentro dos primeiros 3 minutos, salta fora!
-            if (minuteInBlock < 3) {
+            // Proteção extra: se o ciclo disparar dentro dos primeiros 1 minutos, salta fora!
+            if (minuteInBlock < 1) {
                 console.log('TREND', `⏳ [Safety] Minuto ${currentMinute} (${minuteInBlock}m do bloco). Demasiado cedo, a ignorar ciclo para evitar abertura...`);
                 return;
             }
@@ -376,12 +395,13 @@ export class DirectTradingService {
         // 🛡️ Obter o preço real diretamente do outcomePrices do market
         const tokenIndex = fullMarket.tokens ? fullMarket.tokens.findIndex((t: any) => t.tokenId === targetToken.tokenId) : -1;
 
+        /** 
         let rawPrice = targetToken.price; // Fallback
         if (market.outcomePrices && tokenIndex !== -1 && market.outcomePrices[tokenIndex] !== undefined) {
             rawPrice = market.outcomePrices[tokenIndex];
-        }
+        }**/
 
-        const tokenPrice = Number(rawPrice || 0);
+        //const tokenPrice = Number(rawPrice || 0);
 
         // 🛡️ FILTRO ANTI-DUPLICAÇÃO (Igual ao Smart Money)
         const outcomeName = targetToken.outcome || 'Yes';
@@ -399,6 +419,7 @@ export class DirectTradingService {
         //const tokenPrice = Number(targetToken.price || 0);
 
         // Validações de teto máximo e piso mínimo (0.25 a 0.75)
+        /**
         if (tokenPrice > 0.75) {
             console.log('WARN', `⏳ [${coin}] Ignorado: Preço do token já está muito alto (${tokenPrice.toFixed(2)} > 0.75). Rácio risco/recompensa desfavorável.`);
             return;
@@ -410,6 +431,23 @@ export class DirectTradingService {
 
         const amountUsdc = config.amount || 5;
         const execShares = amountUsdc / tokenPrice;
+        **/
+
+        // 🛡️ VALIDAR LIVRO DE ORDENS REAL (Anti-Slippage)
+        const amountUsdc = config.amount || 5;
+        const validation = await this.validateOrderBookSlippage(targetToken.tokenId, amountUsdc, 0.75, 0.25);
+
+        if (!validation.isValid) {
+            console.log('WARN', `⏳ [${coin}] Sinal ignorado (Slippage/Livro): ${validation.reason}`);
+            return;
+        }
+
+        console.log(`✅ [${coin}] Livro validado com sucesso! Preço Médio Estimado: ${validation.averageExecutionPrice.toFixed(2)} (Máx tocado: ${validation.maxPriceTouched})`);
+
+        // O execShares passa a ser o calculado de forma precisa pelo livro de ordens
+        const execShares = validation.totalShares;
+        const tokenPrice = validation.averageExecutionPrice;
+
 
         const rawEndDate = market.endDate || fullMarket.endDate;
         const validEndDate = rawEndDate ? new Date(rawEndDate) : new Date(Date.now() + 15 * 60 * 1000);
@@ -562,5 +600,79 @@ export class DirectTradingService {
         }
 
         return true;
+    }
+
+    /**
+ * Simula o consumo do livro de ordens (Order Book) para um determinado montante em USDC,
+ * validando se a ordem respeita os limites de preço (teto e piso).
+ */
+    private async validateOrderBookSlippage(
+        tokenId: string,
+        amountUsdc: number,
+        maxAllowedPrice: number = 0.75,
+        minAllowedPrice: number = 0.25
+    ): Promise<OrderBookValidationResult> {
+        try {
+            const response = await fetch(`https://clob.polymarket.com/book?token_id=${tokenId}`);
+            if (!response.ok) {
+                return { isValid: false, averageExecutionPrice: 0, maxPriceTouched: 0, totalShares: 0, reason: 'Erro ao contactar a API do CLOB' };
+            }
+
+            // Fazemos o cast explícito para a interface ClobOrderBookResponse
+            const bookData = (await response.json()) as ClobOrderBookResponse;
+
+            if (!bookData || !bookData.asks || bookData.asks.length === 0) {
+                return { isValid: false, averageExecutionPrice: 0, maxPriceTouched: 0, totalShares: 0, reason: 'Livro de ordens sem asks disponíveis' };
+            }
+
+            let remainingUsdc = amountUsdc;
+            let totalShares = 0;
+            let maxPriceTouched = 0;
+
+            // Ordenar os asks por preço ascendente
+            const sortedAsks = [...bookData.asks].sort((a, b) => Number(a.price) - Number(b.price));
+
+            for (const ask of sortedAsks) {
+                const askPrice = Number(ask.price);
+                const askSize = Number(ask.size);
+                const costAtThisLevel = askPrice * askSize;
+
+                if (remainingUsdc <= costAtThisLevel) {
+                    const sharesNeeded = remainingUsdc / askPrice;
+                    totalShares += sharesNeeded;
+                    maxPriceTouched = Math.max(maxPriceTouched, askPrice);
+                    remainingUsdc = 0;
+                    break;
+                } else {
+                    remainingUsdc -= costAtThisLevel;
+                    totalShares += askSize;
+                    maxPriceTouched = Math.max(maxPriceTouched, askPrice);
+                }
+            }
+
+            if (remainingUsdc > 0) {
+                return { isValid: false, averageExecutionPrice: 0, maxPriceTouched, totalShares, reason: `Liquidez insuficiente no livro para preencher os $${amountUsdc}` };
+            }
+
+            const averageExecutionPrice = amountUsdc / totalShares;
+
+            if (maxPriceTouched > maxAllowedPrice) {
+                return { isValid: false, averageExecutionPrice, maxPriceTouched, totalShares, reason: `Pior preço necessário no livro (${maxPriceTouched.toFixed(2)}) excede o teto de ${maxAllowedPrice}` };
+            }
+
+            if (averageExecutionPrice < minAllowedPrice) {
+                return { isValid: false, averageExecutionPrice, maxPriceTouched, totalShares, reason: `Preço médio (${averageExecutionPrice.toFixed(2)}) abaixo do piso de ${minAllowedPrice}` };
+            }
+
+            return {
+                isValid: true,
+                averageExecutionPrice,
+                maxPriceTouched,
+                totalShares
+            };
+
+        } catch (error) {
+            return { isValid: false, averageExecutionPrice: 0, maxPriceTouched: 0, totalShares: 0, reason: `Exceção ao validar order book: ${(error as Error).message}` };
+        }
     }
 }
