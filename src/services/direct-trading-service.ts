@@ -148,7 +148,7 @@ export class DirectTradingService {
             const currentMinute = now.getMinutes();
             const minuteInBlock = currentMinute % 15;
 
-            if (minuteInBlock < 3) {
+            if (minuteInBlock < 1) {
                 const targetMinute = (Math.floor(currentMinute / 15) * 15) + 3;
                 const targetDate = new Date(now);
                 targetDate.setMinutes(targetMinute, 0, 0);
