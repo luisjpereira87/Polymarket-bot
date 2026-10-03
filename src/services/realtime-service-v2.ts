@@ -1304,7 +1304,7 @@ export class RealtimeServiceV2 extends EventEmitter {
                 outcome: trade.outcome,
                 transactionHash: trade.transactionHash,
                 timestamp: Number(trade.timestamp),
-                tokenId: trade.tokenId,
+                tokenId: trade.asset || trade.tokenId || '',
                 endDate: trade.endDate
               };
 

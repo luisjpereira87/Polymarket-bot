@@ -218,7 +218,7 @@ export type LeaderboardTimePeriod = 'DAY' | 'WEEK' | 'MONTH' | 'ALL';
 /**
  * Ordering criteria for leaderboard
  */
-export type LeaderboardOrderBy = 'PNL' | 'VOL';
+export type LeaderboardOrderBy = 'PNL' | 'VOLUME';
 
 /**
  * Market category for leaderboard filtering

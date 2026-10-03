@@ -235,6 +235,7 @@ import { BinanceService } from './services/binance-service.js';
 import { DipArbService } from './services/dip-arb-service.js';
 import { DirectTradingService } from './services/direct-trading-service.js';
 import { MarketService } from './services/market-service.js';
+import { OrderbookService } from './services/orderbook-service.js';
 import { RealtimeServiceV2 } from './services/realtime-service-v2.js';
 import { SmartMoneyService } from './services/smart-money-service.js';
 import { TradingService } from './services/trading-service.js';
@@ -262,6 +263,7 @@ export class PolymarketSDK {
   public readonly binance: BinanceService;
   public readonly dipArb: DipArbService;
   public readonly directTrading: DirectTradingService;
+  public readonly orderbook: OrderbookService;
 
   // Initialization state
   private _initialized = false;
@@ -295,10 +297,12 @@ export class PolymarketSDK {
     this.binance = new BinanceService(this.rateLimiter, this.cache);
     this.markets = new MarketService(this.gammaApi, this.dataApi, this.rateLimiter, this.cache, undefined, this.binance);
     this.realtime = new RealtimeServiceV2();
+    this.orderbook = new OrderbookService();
     this.smartMoney = new SmartMoneyService(
       this.wallets,
       this.realtime,
       this.tradingService,
+      this.orderbook,
       {},  // default config
       this.gammaApi,
       this.dataApi  // pass dataApi for report generation
@@ -314,7 +318,7 @@ export class PolymarketSDK {
       config.chainId
     );
 
-    this.directTrading = new DirectTradingService(this.tradingService, this.markets, this.binance);
+    this.directTrading = new DirectTradingService(this.tradingService, this.markets, this.binance, this.orderbook);
   }
 
   // ===== Static Factory Methods =====

@@ -429,7 +429,7 @@ export class WalletService {
 
     // Map sortBy to API's orderBy format
     const orderByMap: Record<LeaderboardSortBy, LeaderboardOrderBy> = {
-      volume: 'VOL',
+      volume: 'VOLUME',
       pnl: 'PNL',
     };
 
@@ -503,7 +503,7 @@ export class WalletService {
 
     // Map sortBy to API's orderBy format
     const orderByMap: Record<LeaderboardSortBy, LeaderboardOrderBy> = {
-      volume: 'VOL',
+      volume: 'VOLUME',
       pnl: 'PNL',
     };
 

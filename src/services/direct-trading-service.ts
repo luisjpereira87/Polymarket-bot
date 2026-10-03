@@ -1,6 +1,7 @@
 import { SmartMoneyTrade, TradePositions } from '../index.js';
 import { BinanceService } from './binance-service.js';
 import { MarketService } from './market-service.js';
+import { OrderbookService } from './orderbook-service.js';
 import { TradingService } from './trading-service.js';
 
 export interface DirectTradingServiceConfig {
@@ -39,68 +40,24 @@ export class DirectTradingService {
     private marketService: MarketService;
     private tradingService: TradingService;
     private binanceService: BinanceService;
+    private orderbookService: OrderbookService;
     private timer: NodeJS.Timeout | null = null;
 
     constructor(
         tradingService: TradingService,
         marketService: MarketService,
-        binanceService: BinanceService
+        binanceService: BinanceService,
+        orderbookService: OrderbookService
     ) {
         this.tradingService = tradingService;
         this.marketService = marketService;
         this.binanceService = binanceService;
+        this.orderbookService = orderbookService;
     }
 
     /**
      * Inicia o serviço de Direct Trading aceitando parâmetros de execução e o callback de sinal
      */
-    public async startTradingLoop__(
-        config: DirectTradingServiceConfig,
-        options: {
-            onTrade: DirectTradingCallback;
-        }
-    ) {
-        if (config.isCanTrade && !config.isCanTrade()) {
-            console.warn(`[SmartMoneyService] ⚠️ Sinal ignorado: canTrade() retornou falso.`);
-            return;
-        }
-
-        if (!config.enabled) {
-            console.log('TREND', 'Serviço de Direct Trading está desativado na configuração.');
-            return;
-        }
-
-        console.log('TREND', '🚀 A iniciar Direct Trading Service (Binance + Polymarket)...');
-
-        const executeCheck = async () => {
-            const coins: Array<'BTC' | 'ETH' | 'SOL'> = ['BTC', 'ETH', 'SOL'];
-
-            for (const coin of coins) {
-                try {
-                    await this.analyzeAndExecuteCoin(coin, config, options.onTrade);
-                } catch (err) {
-                    console.log('ERROR', `❌ Erro no ciclo de tendência para ${coin}: ${(err as Error).message}`);
-                }
-            }
-        };
-
-        // Executa imediatamente e depois periodicamente
-        await executeCheck();
-        const intervalMs = config.checkIntervalMs || 5 * 60 * 1000;
-        this.timer = setInterval(executeCheck, intervalMs);
-
-        // Retorna o objeto com o método unsubscribe para destruir/parar a subscrição
-        return {
-            unsubscribe: () => {
-                if (this.timer) {
-                    clearInterval(this.timer);
-                    this.timer = null;
-                    console.log('TREND', '🛑 Direct Trading Service cancelado via unsubscribe.');
-                }
-            }
-        };
-    }
-
     public async startTradingLoop(
         config: DirectTradingServiceConfig,
         options: {
@@ -245,47 +202,9 @@ export class DirectTradingService {
         const changePercent = ((recentAvg - olderAvg) / olderAvg) * 100;
         const threshold = config.trendThreshold;
 
-
-
         let trend: 'up' | 'down' | 'neutral' = 'neutral';
         if (changePercent > threshold) trend = 'up';
         else if (changePercent < -threshold) trend = 'down';
-
-        /** 
-        // 1. Calcular EMA 9 e EMA 21 para todo o histórico de velas
-        const ema9Values = this.calculateFullEMAArray(closePrices, 9);
-        const ema21Values = this.calculateFullEMAArray(closePrices, 21);
-
-        const currentEma9 = ema9Values[ema9Values.length - 1];
-        const currentEma21 = ema21Values[ema21Values.length - 1];
-        const previousEma9 = ema9Values[ema9Values.length - 2];
-        const previousEma21 = ema21Values[ema21Values.length - 2];
-
-        // 2. Calcular o Spread atual e anterior para ver se está a expandir
-        const currentSpread = Math.abs(currentEma9 - currentEma21);
-        const previousSpread = Math.abs(previousEma9 - previousEma21);
-        const isSpreadExpanding = currentSpread > previousSpread;
-
-        const currentClose = closePrices[closePrices.length - 1];
-        **/
-        /**
-        // 3. Validação da EMA 9 como linha de atenção (evitar entrar se o preço a violou/cruzou)
-        const isPriceRespectingEma9 = trend === 'up'
-            ? (currentClose > currentEma9 && currentEma9 > currentEma21)
-            : (currentClose < currentEma9 && currentEma9 < currentEma21);
-
-        // 4. Filtro de Lateralização por Spread Estagnado
-        if (!isSpreadExpanding && currentSpread < (currentClose * 0.001)) {
-            console.log('WARN', `⏳ [${coin}] Ignorado: Spread EMA 9/21 muito apertado ou a comprimir. Mercado lateral/indeciso.`);
-            return;
-        }
-
-        // 5. Filtro de Quebra da EMA 9 (Fator de atenção / Correção)
-        if (!isPriceRespectingEma9) {
-            console.log('WARN', `⏳ [${coin}] Ignorado: Preço ($${currentClose}) violou ou cruzou a EMA 9 ($${currentEma9.toFixed(2)}). Risco de correção de curto prazo.`);
-            return;
-        }
-        **/
 
         console.log('KLINE', `📊 [${symbol}] Variação: ${changePercent.toFixed(4)}% | RSI: ${currentRsi.toFixed(1)} (EMA: ${rsiEma.toFixed(1)}) | Tendência: ${trend.toUpperCase()}`);
 
@@ -347,40 +266,9 @@ export class DirectTradingService {
         const market = markets[0];
         if (!market.conditionId) return;
 
-        const nowMs = Date.now();
-
-        /**
-       console.log('🔍 DEBUG STARTDATE:', {
-            startDateRaw: market.startDate,
-            startTimeMs: market.startDate ? new Date(market.startDate).getTime() : 'N/A',
-            nowMs: Date.now()
-        });
-
-        // 🛡️ NOVO: Validar se o mercado já iniciou efetivamente
-        if (market.startDate) {
-            const startTimeMs = new Date(market.startDate).getTime();
-            if (nowMs < startTimeMs) {
-                console.log('WARN', `⏳ [${coin}] Ignorado: O mercado ainda não começou (Início em ${new Date(startTimeMs).toLocaleTimeString()}). A evitar candle fantasma.`);
-                return;
-            }
-        }**/
-
         if (!this.isMarketInValidWindow(market, coin)) {
             return;
         }
-
-        /**
-        if (market.endDate) {
-            const endTimeMs = new Date(market.endDate).getTime();
-            const nowMs = Date.now();
-            const minutesRemaining = (endTimeMs - nowMs) / (1000 * 60);
-
-            // Se faltarem menos de 5 minutos para o mercado fechar, rejeita imediatamente
-            if (!isNaN(minutesRemaining) && minutesRemaining < 5) {
-                console.log('WARN', `⏳ [${coin}] Ignorado: Faltam apenas ${minutesRemaining.toFixed(1)}m para o mercado fechar (Zona de pânico).`);
-                return;
-            }
-        }**/
 
         const fullMarket = await this.marketService.getMarket(market.conditionId);
         const yesToken = fullMarket.tokens.find((t: any) => t.outcome === 'Up' || t.outcome === 'Yes');
@@ -395,14 +283,6 @@ export class DirectTradingService {
         // 🛡️ Obter o preço real diretamente do outcomePrices do market
         const tokenIndex = fullMarket.tokens ? fullMarket.tokens.findIndex((t: any) => t.tokenId === targetToken.tokenId) : -1;
 
-        /** 
-        let rawPrice = targetToken.price; // Fallback
-        if (market.outcomePrices && tokenIndex !== -1 && market.outcomePrices[tokenIndex] !== undefined) {
-            rawPrice = market.outcomePrices[tokenIndex];
-        }**/
-
-        //const tokenPrice = Number(rawPrice || 0);
-
         // 🛡️ FILTRO ANTI-DUPLICAÇÃO (Igual ao Smart Money)
         const outcomeName = targetToken.outcome || 'Yes';
         const posKey = `${market.slug}-${outcomeName}`;
@@ -415,27 +295,9 @@ export class DirectTradingService {
             return;
         }
 
-        //console.log("PREÇO price: " + targetToken.price + " outcomePrices: " + market.outcomePrices);
-        //const tokenPrice = Number(targetToken.price || 0);
-
-        // Validações de teto máximo e piso mínimo (0.25 a 0.75)
-        /**
-        if (tokenPrice > 0.75) {
-            console.log('WARN', `⏳ [${coin}] Ignorado: Preço do token já está muito alto (${tokenPrice.toFixed(2)} > 0.75). Rácio risco/recompensa desfavorável.`);
-            return;
-        }
-        if (tokenPrice < 0.25) {
-            console.log('WARN', `⏳ [${coin}] Ignorado: Preço do token demasiado baixo (${tokenPrice.toFixed(2)} < 0.25). Risco de iliquidez ou movimento tardio.`);
-            return;
-        }
-
-        const amountUsdc = config.amount || 5;
-        const execShares = amountUsdc / tokenPrice;
-        **/
-
         // 🛡️ VALIDAR LIVRO DE ORDENS REAL (Anti-Slippage)
         const amountUsdc = config.amount || 5;
-        const validation = await this.validateOrderBookSlippage(targetToken.tokenId, amountUsdc, 0.75, 0.25);
+        const validation = await this.orderbookService.validateOrderBookSlippage(targetToken.tokenId, amountUsdc, 0.75, 0.25);
 
         if (!validation.isValid) {
             console.log('WARN', `⏳ [${coin}] Sinal ignorado (Slippage/Livro): ${validation.reason}`);
@@ -451,11 +313,6 @@ export class DirectTradingService {
 
         const rawEndDate = market.endDate || fullMarket.endDate;
         const validEndDate = rawEndDate ? new Date(rawEndDate) : new Date(Date.now() + 15 * 60 * 1000);
-        /**console.log('🔍 DEBUG ENDDATE SOURCES:', {
-            fullMarketEndDate: fullMarket?.endDate,
-            scanMarketEndDate: market?.endDate,
-            chosenEndDate: validEndDate
-        });**/
 
         const syntheticTrade: SmartMoneyTrade = {
             traderAddress: `TrendFollowing-${coin}`,
@@ -606,7 +463,7 @@ export class DirectTradingService {
  * Simula o consumo do livro de ordens (Order Book) para um determinado montante em USDC,
  * validando se a ordem respeita os limites de preço (teto e piso).
  */
-    private async validateOrderBookSlippage(
+    /**private async validateOrderBookSlippage(
         tokenId: string,
         amountUsdc: number,
         maxAllowedPrice: number = 0.75,
@@ -674,5 +531,5 @@ export class DirectTradingService {
         } catch (error) {
             return { isValid: false, averageExecutionPrice: 0, maxPriceTouched: 0, totalShares: 0, reason: `Exceção ao validar order book: ${(error as Error).message}` };
         }
-    }
+    }**/
 }

@@ -29,6 +29,7 @@
 import type { ClosedPosition, DataApiClient, Position } from '../clients/data-api.js';
 import { TradePositions } from '../core/types.js';
 import { createUnifiedCache, GammaApiClient, GammaMarket, RateLimiter } from '../index.js';
+import { OrderbookService } from './orderbook-service.js';
 import { ActivityTrade, RealtimeServiceV2 } from './realtime-service-v2.js';
 import type { OrderResult, TradingService } from './trading-service.js';
 import type { PeriodLeaderboardEntry, TimePeriod, WalletService } from './wallet-service.js';
@@ -687,6 +688,7 @@ export class SmartMoneyService {
   private walletService: WalletService;
   private realtimeService: RealtimeServiceV2;
   private tradingService: TradingService;
+  private orderbookService: OrderbookService;
   private dataApi: DataApiClient | null;
   private config: Required<SmartMoneyServiceConfig>;
   private rateLimiter: RateLimiter;
@@ -704,6 +706,7 @@ export class SmartMoneyService {
     walletService: WalletService,
     realtimeService: RealtimeServiceV2,
     tradingService: TradingService,
+    orderbookService: OrderbookService,
     config: SmartMoneyServiceConfig = {},
     gammaApiClient: GammaApiClient,
     dataApi?: DataApiClient
@@ -711,6 +714,7 @@ export class SmartMoneyService {
     this.walletService = walletService;
     this.realtimeService = realtimeService;
     this.tradingService = tradingService;
+    this.orderbookService = orderbookService;
     this.dataApi = dataApi ?? null;
     this.rateLimiter = new RateLimiter();
 
@@ -1134,6 +1138,31 @@ export class SmartMoneyService {
     const isSmartMoney = this.smartMoneySet.has(traderAddress);
     if (options.smartMoneyOnly && !isSmartMoney) return;
 
+    // Token ID com suporte a fallback para asset (conforme vimos anteriormente)
+    const tokenId = trade.tokenId || (trade as any).asset;
+    if (!tokenId) {
+      return;
+    }
+
+    // 🛡️ VALIDAÇÃO DO ORDERBOOK À NASCENA (Bloqueia antes de notificar handlers)
+    if (trade.side === 'BUY') {
+      const estimatedUsdc = trade.size * trade.price;
+      const maxAllowedPrice = 0.75; // Podes ajustar conforme a tua config
+      const minAllowedPrice = 0.25;
+
+      const bookValidation = await this.orderbookService.validateOrderBookSlippage(
+        tokenId,
+        estimatedUsdc,
+        maxAllowedPrice,
+        minAllowedPrice
+      );
+
+      if (!bookValidation.isValid) {
+        console.log(`[SmartMoneyService] 🚫 Sinal descartado na origem (${trade.marketSlug || 'mercado desconhecido'}): ${bookValidation.reason}`);
+        return; // Descarta imediatamente, nenhum handler recebe este trade!
+      }
+    }
+
     const smartMoneyTrade: SmartMoneyTrade = {
       traderAddress,
       traderName: trade.trader?.name,
@@ -1188,7 +1217,7 @@ export class SmartMoneyService {
    * sub.stop();
    * ```
    */
-  async startAutoCopyTrading(options: AutoCopyTradingOptions): Promise<AutoCopyTradingSubscription> {
+  async startAutoCopyTrading__(options: AutoCopyTradingOptions): Promise<AutoCopyTradingSubscription> {
     const startTime = Date.now();
 
     // Build target list
@@ -1234,7 +1263,7 @@ export class SmartMoneyService {
     const subscription = this.subscribeSmartMoneyTrades(
       async (trade: SmartMoneyTrade) => {
         stats.tradesDetected++;
-        //console.log('EVENTO BRUTO RECEBIDO:', trade)
+
         try {
           // Check target
           if (!targetAddresses.includes(trade.traderAddress.toLowerCase())) {
@@ -1290,24 +1319,6 @@ export class SmartMoneyService {
             return;
           }
 
-          /** 
-          // Calculate size
-          let copySize = trade.size * sizeScale;
-          let copyValue = copySize * trade.price;
-
-          // Enforce max size
-          if (copyValue > maxSizePerTrade) {
-            copySize = maxSizePerTrade / trade.price;
-            copyValue = maxSizePerTrade;
-          }
-
-          // Polymarket minimum order is $1
-          const MIN_ORDER_SIZE = 1;
-          if (copyValue < MIN_ORDER_SIZE) {
-            stats.tradesSkipped++;
-            return;
-          }
-          **/
           // Delay
           if (delay > 0) {
             await new Promise(resolve => setTimeout(resolve, delay));
@@ -1320,15 +1331,19 @@ export class SmartMoneyService {
             return;
           }
 
+          const usdcAmount = copyValue;
+
           // Price with slippage
           const slippagePrice = trade.side === 'BUY'
             ? trade.price * (1 + maxSlippage)
             : trade.price * (1 - maxSlippage);
 
-          const usdcAmount = copyValue; // Already calculated above
+          //const usdcAmount = copyValue; // Already calculated above
 
           // Execute
           let result: OrderResult;
+
+          trade.isSmartMoney = true;
 
           if (dryRun) {
             result = { success: true, orderId: `dry_run_${Date.now()}` };
@@ -1366,6 +1381,197 @@ export class SmartMoneyService {
 
     return {
       id: subscription.id,
+      targetAddresses,
+      startTime,
+      isActive: true,
+      stats,
+      stop: () => subscription.unsubscribe(),
+      getStats: () => ({ ...stats }),
+    };
+  }
+
+  /**
+   * Inicia o copy trading de forma limpa e direta
+   */
+  async startAutoCopyTrading(options: AutoCopyTradingOptions): Promise<AutoCopyTradingSubscription> {
+    const startTime = Date.now();
+
+    // 1. Resolver a lista de endereços alvo
+    let targetAddresses: string[] = [];
+    if (options.targetAddresses?.length) {
+      targetAddresses = options.targetAddresses.map(a => a.toLowerCase());
+    }
+    if (options.topN && options.topN > 0) {
+      const smartMoneyList = await this.getSmartMoneyList(options.topN);
+      targetAddresses = [...new Set([...targetAddresses, ...smartMoneyList.map(w => w.address)])];
+    }
+    if (targetAddresses.length === 0) {
+      throw new Error('No target addresses. Use targetAddresses or topN.');
+    }
+
+    // 2. Configurações e Estatísticas
+    const stats: AutoCopyTradingStats = {
+      startTime,
+      tradesDetected: 0,
+      tradesExecuted: 0,
+      tradesSkipped: 0,
+      tradesFailed: 0,
+      totalUsdcSpent: 0,
+    };
+
+    const sizeScale = options.sizeScale ?? 0.1;
+    const maxSizePerTrade = options.maxSizePerTrade ?? 50;
+    const maxSlippage = options.maxSlippage ?? 0.03;
+    const orderType = options.orderType ?? 'FOK';
+    const minTradeSize = options.minTradeSize ?? 10;
+    const dryRun = options.dryRun ?? false;
+
+    // 3. Subscrição direta ao RealtimeService com o callback unificado
+    const subscription = this.realtimeService.subscribeAllActivity({
+      onTrade: async (activityTrade: ActivityTrade) => {
+        try {
+          // --- PASSO A: Validar Endereço e Dados Básicos ---
+          const rawAddress = activityTrade.trader?.address;
+          if (!rawAddress) return;
+          const traderAddress = rawAddress.toLowerCase();
+
+          if (!targetAddresses.includes(traderAddress)) return;
+
+          if (activityTrade.size * activityTrade.price < minTradeSize) {
+            stats.tradesSkipped++;
+            return;
+          }
+
+          if (options.sideFilter && activityTrade.side !== options.sideFilter) {
+            stats.tradesSkipped++;
+            return;
+          }
+
+          if (options.isCanTrade && !options.isCanTrade() && activityTrade.side === 'BUY') {
+            stats.tradesSkipped++;
+            return;
+          }
+
+          // --- PASSO B: Extrair Token ID ---
+          const tokenId = activityTrade.tokenId || (activityTrade as any).asset;
+          if (!tokenId) {
+            stats.tradesSkipped++;
+            return;
+          }
+
+          // --- PASSO C: Cálculos de Tamanho e Dimensão ---
+          let copySize = activityTrade.size * sizeScale;
+          let copyValue = copySize * activityTrade.price;
+
+          if (copyValue > maxSizePerTrade) {
+            copyValue = maxSizePerTrade;
+            copySize = copyValue / activityTrade.price;
+          }
+
+          const usdcAmount = copyValue;
+          const MIN_ORDER_SIZE = 1;
+          if (usdcAmount < MIN_ORDER_SIZE || usdcAmount < minTradeSize) {
+            stats.tradesSkipped++;
+            return;
+          }
+
+          // --- PASSO D: Filtro Anti-Duplicação ---
+          if (activityTrade.side === 'BUY' && options.positions) {
+            const marketSlug = activityTrade.marketSlug || (activityTrade as any).market;
+            const outcomeSuffix = activityTrade.outcome ? `-${activityTrade.outcome}` : '';
+            const posKey = `${marketSlug}${outcomeSuffix}`;
+
+            if (options.positions().has(posKey)) {
+              stats.tradesSkipped++;
+              return;
+            }
+          }
+
+          // --- PASSO E: Validação de Orderbook (Slippage / Profundidade) ---
+          if (activityTrade.side === 'BUY') {
+            const bookValidation = await this.orderbookService.validateOrderBookSlippage(
+              tokenId,
+              usdcAmount,
+              0.75, // maxAllowedPrice
+              0.25  // minAllowedPrice
+            );
+
+            if (!bookValidation.isValid) {
+              stats.tradesSkipped++;
+              console.log(`[SmartMoneyService] 🚫 Sinal descartado (${activityTrade.marketSlug}): ${bookValidation.reason}`);
+              return;
+            }
+          }
+
+          // A partir daqui, o sinal é oficial e válido!
+          stats.tradesDetected++;
+
+          // --- PASSO F: Execução (Dry Run ou Real) ---
+          if (options.delay && options.delay > 0) {
+            await new Promise(resolve => setTimeout(resolve, options.delay));
+          }
+
+          let result: OrderResult;
+          const smartMoneyTrade: SmartMoneyTrade = {
+            traderAddress,
+            traderName: activityTrade.trader?.name,
+            conditionId: activityTrade.conditionId,
+            marketSlug: activityTrade.marketSlug,
+            side: activityTrade.side,
+            size: activityTrade.size,
+            price: activityTrade.price,
+            tokenId,
+            outcome: activityTrade.outcome,
+            txHash: activityTrade.transactionHash,
+            timestamp: activityTrade.timestamp,
+            isSmartMoney: true,
+            smartMoneyInfo: this.smartMoneyCache.get(traderAddress),
+            endDate: activityTrade.endDate,
+          };
+
+          if (dryRun) {
+            result = { success: true, orderId: `dry_run_${Date.now()}` };
+            console.log('[DRY RUN]', {
+              trader: traderAddress.slice(0, 8),
+              side: activityTrade.side,
+              market: activityTrade.marketSlug,
+              copy: { size: copySize.toFixed(2), usdc: usdcAmount.toFixed(2) },
+            });
+          } else {
+            const slippagePrice = activityTrade.side === 'BUY'
+              ? activityTrade.price * (1 + maxSlippage)
+              : activityTrade.price * (1 - maxSlippage);
+
+            result = await this.tradingService.createMarketOrder({
+              tokenId,
+              side: activityTrade.side,
+              amount: usdcAmount,
+              price: slippagePrice,
+              orderType,
+            });
+          }
+
+          if (result.success) {
+            stats.tradesExecuted++;
+            stats.totalUsdcSpent += usdcAmount;
+          } else {
+            stats.tradesFailed++;
+          }
+
+          options.onTrade?.(smartMoneyTrade, result);
+
+        } catch (error) {
+          stats.tradesFailed++;
+          options.onError?.(error instanceof Error ? error : new Error(String(error)));
+        }
+      },
+      onError: (error) => {
+        console.error('[SmartMoneyService] Subscription error:', error);
+      },
+    }, targetAddresses);
+
+    return {
+      id: `smart_money_${Date.now()}`,
       targetAddresses,
       startTime,
       isActive: true,

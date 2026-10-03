@@ -480,7 +480,8 @@ async function agressiveQualifiedWallets(sdk: PolymarketSDK) {
       }
     }
 
-    const leaderboard = await sdk.wallets.getLeaderboardByPeriod('week', CONFIG.smartMoney.topN * 3, 'volume');
+    //const leaderboard = await sdk.wallets.getLeaderboardByPeriod('week', CONFIG.smartMoney.topN * 3, 'volume');
+    const leaderboard = await sdk.wallets.getLeaderboardByPeriod('week', CONFIG.smartMoney.topN, 'volume');
 
     for (const entry of leaderboard) {
       if (!CONFIG.smartMoney.enabled && qualified.length === 0) break;
@@ -716,21 +717,6 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
     }
   }
 
-  /** 
-  const sizeScale = CONFIG.smartMoney.sizeScale || 0.1;
-  const maxSizePerTrade = CONFIG.smartMoney.maxSizePerTrade || 3.0; // Põe o teu teto máximo (ex: 3 ou o valor do config)
-
-  let copySize = trade.size * sizeScale;
-  let tradeCost = copySize * trade.price;
-
-  if (tradeCost > maxSizePerTrade) {
-    tradeCost = maxSizePerTrade;
-    copySize = tradeCost / execPrice;
-  }
-
-  const execShares = copySize;
-  **/
-
   let copySize = trade.size;
   let tradeCost = 0;
 
@@ -773,13 +759,14 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
       // No normalizePositions ou na criação da posição:
       const parsedEndDate = trade.endDate ? new Date(String(trade.endDate)) : undefined;
 
+      /** 
       console.log('📅 DEBUG CREATE POSITION:', {
         rawEndDate: trade.endDate,
         parsedDateObject: parsedEndDate,
         localTimeString: parsedEndDate?.toLocaleTimeString(),
         utcString: parsedEndDate?.toISOString()
       });
-
+      **/
       // Registar em realPositions (ou simulatedPositions, conforme preferires manter)
       const existing = realPositions.get(posKey);
       if (existing) {
@@ -803,6 +790,7 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
           tokenId: trade.tokenId || '',
           endDate: trade.endDate
         });
+        console.log(realPositions);
       }
 
       log('TRADE', `✅ [DRY_RUN] BUY: ${execShares.toFixed(1)} shares @ $${execPrice.toFixed(3)} | Caixa Restante: $${financialState.availableCash.toFixed(2)}`);
@@ -839,58 +827,6 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
   }
 
   updateDashboard();
-}
-
-async function initializeSmartMoney__(sdk: PolymarketSDK) {
-
-  log('WALLET', 'Configurando Smart Money com filtros completos de qualidade...');
-
-  //const qualified: string[] = [];
-  //const qualified = await conservativeQualifiedWallets(sdk);
-  const qualified = await agressiveQualifiedWallets(sdk);
-
-  if (!qualified) {
-    return;
-  }
-
-  state.followedWallets = qualified;
-  log('WALLET', `A seguir ${qualified.length} carteiras qualificadas`);
-  updateDashboard();
-
-  // 3. Inicializar o Copy Trading do SDK (passando a flag dryRun dinamicamente)
-  if (qualified.length > 0) {
-    const isDryRun = CONFIG.dryRun; // passa a flag do teu CONFIG para o SDK
-    const modeTag = isDryRun ? '🧪 [DRY_RUN]' : '🔴 [LIVE]';
-
-    log('TRADE', `${modeTag} A iniciar motor de Copy Trading no SDK (dryRun: ${isDryRun})...`);
-
-
-    autoCopyTradingSubscription = await sdk.smartMoney.startAutoCopyTrading({
-      targetAddresses: qualified,
-      sizeScale: CONFIG.smartMoney.sizeScale || 0.25,
-      maxSizePerTrade: CONFIG.smartMoney.maxSizePerTrade || 3.5,
-      maxSlippage: CONFIG.smartMoney.maxSlippage || 0.05,
-      minTradeSize: CONFIG.smartMoney.minTradeSize || 10,
-      delay: CONFIG.smartMoney.delay || 0,
-      isCanTrade: () => canTrade(),
-      positions: () => realPositions,
-      dryRun: isDryRun, // 👈 O SDK simula se for true, executa ordens reais se for false
-      onTrade: async (trade, result) => {
-        try {
-
-          if (trade.marketSlug) {
-            await updatePricesCache(sdk, trade.marketSlug);
-          }
-
-          processTradeExecution(sdk, trade, result);
-
-        } finally {
-          activeTradesProcessing--;
-        }
-      },
-      onError: (err) => log('ERROR', `❌ ${modeTag} Erro no motor de Copy Trading: ${err.message}`),
-    });
-  }
 }
 
 async function initializeSmartMoney(sdk: PolymarketSDK) {
@@ -934,9 +870,11 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
       dryRun: isDryRun,
       onTrade: async (trade, result) => {
         try {
+          /** 
           if (trade.marketSlug) {
             await updatePricesCache(sdk, trade.marketSlug);
           }
+          **/
           processTradeExecution(sdk, trade, result);
         } finally {
           activeTradesProcessing--;
