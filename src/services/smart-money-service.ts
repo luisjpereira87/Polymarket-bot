@@ -163,6 +163,7 @@ export interface AutoCopyTradingOptions {
   /** Callbacks */
   onTrade?: (trade: SmartMoneyTrade, result: OrderResult) => void;
   onError?: (error: Error) => void;
+  minWhaleOrderValueUSD?: number;
 }
 
 /**
@@ -1429,6 +1430,7 @@ export class SmartMoneyService {
     const orderType = options.orderType ?? 'FOK';
     const minTradeSize = options.minTradeSize ?? 10;
     const dryRun = options.dryRun ?? false;
+    const minWhaleValue = options.minWhaleOrderValueUSD ?? 500; // Valor mínimo configurável (default: 500 USDC)
 
     // 3. Subscrição direta ao RealtimeService com o callback unificado
     const subscription = this.realtimeService.subscribeAllActivity({
@@ -1441,8 +1443,12 @@ export class SmartMoneyService {
 
           if (!targetAddresses.includes(traderAddress)) return;
 
-          if (activityTrade.size * activityTrade.price < minTradeSize) {
+          // 🐋 FILTRO DE CONVICÇÃO DA BALEIA (Ignora testes / ordens residuais)
+          const totalOrderValueUSD = activityTrade.size * activityTrade.price;
+
+          if (totalOrderValueUSD < minWhaleValue) {
             stats.tradesSkipped++;
+            // Opcional: console.log(`[SmartMoneyService] ⏭️ Ordem ignorada (Abaixo do teto de baleia): ${totalOrderValueUSD.toFixed(2)} USDC`);
             return;
           }
 

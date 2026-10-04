@@ -83,6 +83,7 @@ let CONFIG = {
     maxSlippage: 0.05,         // Subido de 0.03 para 0.05 (Evita rejeitar trades por ligeira variação de preço)
     minTradeSize: 1.0,         // 🚨 CRÍTICO: Baixado de 10 para 1.0 (Não descarta ordens pequenas!)
     delay: 200,                // Reduzido de 500ms para 200ms de latência
+    minWhaleOrderValueUSD: 1000,
     customWallets: [
       '0xc2e7800b5af46e6093872b177b7a5e7f0563be51',
       '0x58c3f5d66c95d4c41b093fbdd2520e46b6c9de74',
@@ -870,6 +871,7 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
       isCanTrade: () => canTrade(),
       positions: () => realPositions,
       dryRun: isDryRun,
+      minWhaleOrderValueUSD: CONFIG.smartMoney.minWhaleOrderValueUSD || 1000,
       onTrade: async (trade, result) => {
         try {
           /** 
