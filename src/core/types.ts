@@ -603,4 +603,5 @@ export interface TradePositions {
   tokenId: string;
   endDate: Date;
   lockedFloor?: number;
+  isCrypto: boolean;
 }

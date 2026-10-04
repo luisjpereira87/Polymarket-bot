@@ -17,10 +17,12 @@ import {
   OnchainService,
   OrderResult,
   PolymarketSDK,
+  Position,
   SwapService,
   TradePositions,
+  UnifiedMarket,
   WalletProfile,
-  type SmartMoneyTrade,
+  type SmartMoneyTrade
 } from './src/index.js';
 
 // ============================================================================
@@ -220,6 +222,13 @@ const state: BotState = {
 
   smartMoneySignals: [],
 };
+
+export interface EnrichedPosition extends Position {
+  marketClosed?: boolean;
+  isWinner?: boolean;
+  curPrice?: number;
+  isCrypto?: boolean;
+}
 
 // Objeto global de controlo financeiro e liquidez
 const financialState = {
@@ -678,34 +687,17 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
   const isDryRun = CONFIG.dryRun ?? false;
   const modeTag = isDryRun ? '🧪 [DRY_RUN]' : '🔴 [LIVE]';
 
-  // 1. Registar sempre o sinal no feed do Dashboard
-  const signal: SmartMoneySignal = {
-    id: `sm-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-    timestamp: new Date().toISOString(),
-    wallet: trade.traderAddress,
-    market: trade.marketSlug || 'Unknown',
-    side: trade.side as 'BUY' | 'SELL',
-    size: trade.size,
-    price: trade.price,
-  };
-
-  state.smartMoneySignals.unshift(signal);
-  if (state.smartMoneySignals.length > 50) {
-    state.smartMoneySignals = state.smartMoneySignals.slice(0, 50);
-  }
-
-  // 2. Validar se a ordem foi bem-sucedida
+  // 1. Validar primeiro se a ordem falhou na exchange / simulação
   if (!result.success) {
     log('WARN', `❌ ${modeTag} Falha na ordem: ${result.errorMsg}`);
     updateDashboard();
     return;
   }
 
-  state.smartMoneyTrades++;
-
   const marketSlug = trade.marketSlug || (trade as any).market;
   const outcomeSuffix = trade.outcome ? `-${trade.outcome}` : '';
   const posKey = `${marketSlug}${outcomeSuffix}`;
+
   let execPrice = trade.price;
   if (isDryRun && trade.side === 'BUY') {
     const cachedPrice = liveMarketPrices.get(posKey);
@@ -721,24 +713,51 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
   let tradeCost = 0;
 
   if (trade.isSmartMoney) {
-    // 🐋 Apenas o Smart Money (Copy-Trading) usa escala e tetos máximos
     const sizeScale = CONFIG.smartMoney.sizeScale || 0.1;
     const maxSizePerTrade = CONFIG.smartMoney.maxSizePerTrade || 3.0;
 
     copySize = trade.size * sizeScale;
-    tradeCost = copySize * trade.price;
+    tradeCost = copySize * execPrice;
 
     if (tradeCost > maxSizePerTrade) {
       tradeCost = maxSizePerTrade;
       copySize = tradeCost / execPrice;
     }
   } else {
-    // 📈 Outras fontes (como o Direct Trading / Trend Following) usam o valor direto em USDC
     tradeCost = trade.size;
     copySize = tradeCost / execPrice;
   }
 
   const execShares = copySize;
+
+  // 2. Validar saldo em Dry Run ANTES de registar no dashboard
+  if (isDryRun && trade.side === 'BUY') {
+    const currentAvailableCash = financialState.availableCash ?? 1000;
+
+    if (currentAvailableCash < tradeCost) {
+      log('RISK', `[SIMULATION] ❌ Compra bloqueada: Caixa insuficiente ($${currentAvailableCash.toFixed(2)}). Requerido: $${tradeCost.toFixed(2)}`);
+      updateDashboard();
+      return; // Sai aqui e NÃO entra para o dashboard!
+    }
+  }
+
+  // 3. AGORA SIM: O trade é 100% válido, podemos registar no feed do Dashboard
+  const signal: SmartMoneySignal = {
+    id: `sm-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+    timestamp: new Date().toISOString(),
+    wallet: trade.traderAddress,
+    market: trade.marketSlug || 'Unknown',
+    side: trade.side as 'BUY' | 'SELL',
+    size: trade.size,
+    price: trade.price,
+  };
+
+  state.smartMoneySignals.unshift(signal);
+  if (state.smartMoneySignals.length > 50) {
+    state.smartMoneySignals = state.smartMoneySignals.slice(0, 50);
+  }
+
+  state.smartMoneyTrades++;
 
   // 3. Gestão de Posições e Balanços
   if (isDryRun) {
@@ -746,27 +765,10 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
     if (trade.side === 'BUY') {
       const currentAvailableCash = financialState.availableCash ?? 1000;
 
-      if (currentAvailableCash < tradeCost) {
-        log('RISK', `[SIMULATION] ❌ Compra bloqueada: Caixa insuficiente ($${currentAvailableCash.toFixed(2)}).`);
-        updateDashboard();
-        return;
-      }
-
       // Atualizar balanços
       financialState.availableCash = currentAvailableCash - tradeCost;
       financialState.committedCapital = (financialState.committedCapital || 0) + tradeCost;
 
-      // No normalizePositions ou na criação da posição:
-      const parsedEndDate = trade.endDate ? new Date(String(trade.endDate)) : undefined;
-
-      /** 
-      console.log('📅 DEBUG CREATE POSITION:', {
-        rawEndDate: trade.endDate,
-        parsedDateObject: parsedEndDate,
-        localTimeString: parsedEndDate?.toLocaleTimeString(),
-        utcString: parsedEndDate?.toISOString()
-      });
-      **/
       // Registar em realPositions (ou simulatedPositions, conforme preferires manter)
       const existing = realPositions.get(posKey);
       if (existing) {
@@ -788,7 +790,8 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
           timestamp: Date.now(),
           traderAddress: trade.traderAddress,
           tokenId: trade.tokenId || '',
-          endDate: trade.endDate
+          endDate: trade.endDate,
+          isCrypto: isCryptoPosition(undefined, trade.marketSlug, undefined)
         });
         console.log(realPositions);
       }
@@ -823,7 +826,6 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
     // 🔴 MODO PRODUÇÃO (Live): Sincroniza posições reais / chama portfólio manager se necessário
     log('TRADE', `✅ [LIVE] Trade processado com sucesso pela exchange.`);
     setupPortfolioManager(sdk)
-    // Aqui podes chamar a tua função de sincronização com a Polymarket API, ex: setupPortfolioManager(sdk)
   }
 
   updateDashboard();
@@ -1466,6 +1468,22 @@ function parseEndDate(rawEndDate: any, marketSlug?: string): Date {
   return new Date(Date.now() + 15 * 60 * 1000);
 }
 
+function isCryptoPosition(title?: string, slug?: string, eventSlug?: string): boolean {
+  const titleText = title || '';
+  const safeSlug = slug || eventSlug || '';
+
+  // Junta o título e o slug numa string única em minúsculas
+  const searchableText = `${safeSlug} ${titleText}`.toLowerCase();
+
+  const cryptoKeywords = [
+    'crypto', 'bitcoin', 'btc', 'ethereum', 'eth', 'solana', 'sol',
+    'cardano', 'ada', 'ripple', 'xrp', 'dogecoin', 'doge', 'web3',
+    'token', 'price-above', 'up-down', 'altcoin', 'bull', 'bear'
+  ];
+
+  return cryptoKeywords.some(keyword => searchableText.includes(keyword));
+}
+
 async function setupPortfolioManager(sdk: PolymarketSDK) {
   log('INFO', 'Iniciando Gestor de Portfólio...');
 
@@ -1503,7 +1521,8 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
           timestamp: Date.now(),
           traderAddress: p.proxyWallet || targetWalletAddress,
           tokenId: tokenId,
-          endDate: endDate
+          endDate: endDate,
+          isCrypto: isCryptoPosition(p.title, p.slug, p.eventSlug)
         });
       }
     }
@@ -1519,11 +1538,11 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
     if (CONFIG.dryRun) return;
 
     try {
-      const positions = await sdk.wallets.getWalletPositions(targetWalletAddress);
+      const positions: Position[] = await sdk.wallets.getWalletPositions(targetWalletAddress);
 
-      const enrichedPositions = await Promise.all(positions.map(async (pos: any) => {
+      const enrichedPositions: EnrichedPosition[] = await Promise.all(positions.map(async (pos: EnrichedPosition) => {
         try {
-          const market = await sdk.markets.getMarket(pos.conditionId);
+          const market: UnifiedMarket = await sdk.markets.getMarket(pos.conditionId);
           if (market) {
             pos.marketClosed = market.closed;
             const token = market.tokens.find((t: any) => t.tokenId === pos.asset);
@@ -1560,6 +1579,7 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
               existing.avgEntryPrice = avgPrice;
               existing.tokenId = tokenId;
               existing.endDate = parseEndDate(p.endDate, marketSlug);
+              existing.isCrypto = isCryptoPosition(p.title, p.slug, p.eventSlug);
             }
           } else {
             realPositions.set(posKey, {
@@ -1571,7 +1591,8 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
               timestamp: Date.now(),
               traderAddress: p.proxyWallet || targetWalletAddress,
               tokenId: tokenId,
-              endDate: parseEndDate(p.endDate, marketSlug)
+              endDate: parseEndDate(p.endDate, marketSlug),
+              isCrypto: isCryptoPosition(p.title, p.slug, p.eventSlug)
             });
           }
         }
@@ -1587,7 +1608,7 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
       let unrealized = 0;
       for (const p of enrichedPositions) {
         const entry = Number(p.avgPrice) || 0;
-        const current = Number(p.curPrice) || Number(p.msg_price) || 0;
+        const current = Number(p.curPrice) || 0;
         const size = Number(p.size) || 0;
 
         if (current > 0 && size > 0 && !p.marketClosed) {

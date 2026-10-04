@@ -904,7 +904,7 @@ export class SmartMoneyService {
     } = {}
   ): Promise<{ id: string; unsubscribe: () => void }> {
     const takeProfit = options.takeProfitPercent ?? 100.0;
-    const stopLoss = options.stopLossPercent ?? -50.0;
+    const baseStopLoss = options.stopLossPercent ?? -50.0;
     const maxDurationMs = options.maxTradeDurationMinutes ? options.maxTradeDurationMinutes * 60 * 1000 : null;
     const gracePeriodMs = (options.stopLossGracePeriodSeconds ?? 30) * 1000; // 👈 30 segundos por defeito
     const dryRun = options.dryRun ?? false;
@@ -917,6 +917,8 @@ export class SmartMoneyService {
       if (!position.avgEntryPrice || position.avgEntryPrice <= 0) {
         return;
       }
+
+      const stopLoss = position.isCrypto ? baseStopLoss : baseStopLoss / 2;
 
       const now = Date.now();
       const posTimestamp = position.timestamp || now;
@@ -987,8 +989,10 @@ export class SmartMoneyService {
       // 1. Take Profit absoluto (teto máximo configurado)
       const isTakeProfitTarget = pnlPercent >= takeProfit;
 
-      // 2. Trailing Trigger: Se já trancámos algum piso (>= 0) e o PnL caiu abaixo desse piso
-      const isFloorTriggered = position.lockedFloor >= 0 && pnlPercent <= position.lockedFloor;
+      // 2. Trailing Trigger: Só dispara se o piso foi trancado (>= 0), o PnL caiu abaixo do piso, 
+      // MAS O MAIS IMPORTANTE: garante que só dispara se ainda estivermos no lucro/breakeven (pnlPercent >= 0).
+      // Se já estiver negativo, deixamos o Stop Loss clássico lidar com isso!
+      const isFloorTriggered = position.lockedFloor >= 0 && pnlPercent <= position.lockedFloor && pnlPercent >= 0;
 
       // 3. Stop Loss Clássico: Só atua se NENHUM piso foi trancado ainda (< 0) e bateu no limite de perda (-50%)
       //const isStopLoss = position.lockedFloor < 0 && pnlPercent <= stopLoss;
@@ -1488,18 +1492,25 @@ export class SmartMoneyService {
           }
 
           // --- PASSO E: Validação de Orderbook (Slippage / Profundidade) ---
+          let executionPrice = activityTrade.price;
+
           if (activityTrade.side === 'BUY') {
             const bookValidation = await this.orderbookService.validateOrderBookSlippage(
               tokenId,
               usdcAmount,
               0.75, // maxAllowedPrice
-              0.25  // minAllowedPrice
+              0.40  // minAllowedPrice
             );
 
             if (!bookValidation.isValid) {
               stats.tradesSkipped++;
               console.log(`[SmartMoneyService] 🚫 Sinal descartado (${activityTrade.marketSlug}): ${bookValidation.reason}`);
               return;
+            }
+
+            // Atualiza para o preço médio real obtido do orderbook validado
+            if (bookValidation.averageExecutionPrice) {
+              executionPrice = bookValidation.averageExecutionPrice;
             }
           }
 
@@ -1519,7 +1530,7 @@ export class SmartMoneyService {
             marketSlug: activityTrade.marketSlug,
             side: activityTrade.side,
             size: activityTrade.size,
-            price: activityTrade.price,
+            price: executionPrice,
             tokenId,
             outcome: activityTrade.outcome,
             txHash: activityTrade.transactionHash,
@@ -1535,12 +1546,13 @@ export class SmartMoneyService {
               trader: traderAddress.slice(0, 8),
               side: activityTrade.side,
               market: activityTrade.marketSlug,
+              price: executionPrice.toFixed(4),
               copy: { size: copySize.toFixed(2), usdc: usdcAmount.toFixed(2) },
             });
           } else {
             const slippagePrice = activityTrade.side === 'BUY'
-              ? activityTrade.price * (1 + maxSlippage)
-              : activityTrade.price * (1 - maxSlippage);
+              ? executionPrice * (1 + maxSlippage)
+              : executionPrice * (1 - maxSlippage);
 
             result = await this.tradingService.createMarketOrder({
               tokenId,
