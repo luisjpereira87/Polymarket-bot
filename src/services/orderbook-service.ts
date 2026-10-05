@@ -86,4 +86,29 @@ export class OrderbookService {
             return { isValid: false, averageExecutionPrice: 0, maxPriceTouched: 0, totalShares: 0, reason: `Exceção ao validar order book: ${(error as Error).message}` };
         }
     }
+
+    async getBestBidPrice(tokenId: string): Promise<number | null> {
+        try {
+            const response = await fetch(`https://clob.polymarket.com/book?token_id=${tokenId}`);
+            if (!response.ok) {
+                return null;
+            }
+
+            const bookData = (await response.json()) as any;
+            const bids = bookData?.bids;
+
+            if (!bids || bids.length === 0) {
+                return null;
+            }
+
+            // Ordenar os bids por preço descendente para encontrar o maior (o comprador mais alto)
+            const sortedBids = [...bids].sort((a: any, b: any) => Number(b.price) - Number(a.price));
+            const bestBidPrice = Number(sortedBids[0].price);
+
+            return isNaN(bestBidPrice) ? null : bestBidPrice;
+        } catch (error) {
+            console.error(`[OrderbookService] ❌ Erro ao obter best bid para ${tokenId}:`, (error as Error).message);
+            return null;
+        }
+    }
 }

@@ -1627,7 +1627,7 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
 }
 
 
-async function startExpirationWatchdog(sdk: PolymarketSDK, intervalMs: number = 60 * 1000) {
+async function startExpirationWatchdog__(sdk: PolymarketSDK, intervalMs: number = 60 * 1000) {
   setInterval(async () => {
     const nowMs = Date.now();
 
@@ -1700,6 +1700,79 @@ async function startExpirationWatchdog(sdk: PolymarketSDK, intervalMs: number = 
         realPositions.delete(posKey);
 
         console.log(`🏁 [WATCHDOG] Posição ${posKey} liquidada por expiração. Resultado: $${finalPrice.toFixed(2)}`);
+      }
+    }
+  }, intervalMs);
+}
+
+async function startExpirationWatchdog(sdk: PolymarketSDK, intervalMs: number = 60 * 1000) {
+  setInterval(async () => {
+    const nowMs = Date.now();
+
+    for (const [posKey, position] of realPositions.entries()) {
+      if (!position.endDate) continue;
+
+      // 🛡 Blindagem: Garantir conversão segura para milissegundos
+      const endTimeMs = typeof position.endDate === 'number'
+        ? position.endDate
+        : new Date(position.endDate).getTime();
+
+      if (isNaN(endTimeMs)) {
+        console.log('WARN', `⚠️ [WATCHDOG] Data de fecho inválida para a posição ${posKey}`);
+        continue;
+      }
+
+      // Se o mercado já passou da data de fecho
+      if (nowMs >= endTimeMs) {
+        console.log(`⏰ [WATCHDOG] O mercado da posição ${posKey} expirou. A verificar preço final no Orderbook...`);
+
+        let finalPrice = 0;
+        let marketResolved = false;
+
+        try {
+          if (position.tokenId) {
+            // Vai direto ao orderbook buscar o preço real de saída (Best Bid)
+            const bestBid = await sdk.orderbook.getBestBidPrice(position.tokenId);
+
+            if (bestBid !== null && bestBid >= 0) {
+              finalPrice = bestBid;
+              marketResolved = true;
+
+              // Se o preço bateu nos extremos, normalizamos para a resolução exata
+              if (finalPrice >= 0.99) finalPrice = 1.00;
+              if (finalPrice <= 0.01) finalPrice = 0.00;
+            }
+          }
+        } catch (err) {
+          console.log('WARN', `⚠️ [WATCHDOG] Falha ao consultar orderbook para ${posKey}: ${(err as Error).message}`);
+        }
+
+        // Se por algum motivo o orderbook falhar completamente, damos mais um ciclo
+        if (!marketResolved) {
+          console.log(`⏳ [WATCHDOG] Posição ${posKey} expirada mas sem resposta do orderbook. A tentar no próximo ciclo...`);
+          continue;
+        }
+
+        const expiredSellTrade: SmartMoneyTrade = {
+          traderAddress: position.traderAddress || 'Watchdog-Expiry',
+          marketSlug: position.marketSlug,
+          side: 'SELL',
+          size: position.size,
+          price: finalPrice,
+          tokenId: position.tokenId,
+          traderName: 'Watchdog (Auto-Close)',
+          timestamp: nowMs,
+          isSmartMoney: false,
+          endDate: position.endDate,
+          outcome: position.outcome
+        };
+
+        processTradeExecution(sdk, expiredSellTrade, { success: true });
+
+        // Remover a posição do mapa para não repetir o ciclo
+        realPositions.delete(posKey);
+
+        console.log(`🏁 [WATCHDOG] Posição ${posKey} liquidada por expiração. Preço Final: $${finalPrice.toFixed(2)}`);
       }
     }
   }, intervalMs);
