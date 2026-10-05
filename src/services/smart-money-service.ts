@@ -953,24 +953,27 @@ export class SmartMoneyService {
       if (position.lockedFloor === undefined) {
         position.lockedFloor = -1;
       }
-
-      if (pnlPercent >= 100 && position.lockedFloor < 75) {
-        position.lockedFloor = 75;
-        console.log(`🚀 [Escada] ${posKey} atingiu 100%! Piso de lucro trancado nos 75%.`);
-      } else if (pnlPercent >= 75 && position.lockedFloor < 50) {
-        position.lockedFloor = 50;
-        console.log(`📈 [Escada] ${posKey} atingiu 75%! Piso de lucro trancado nos 50%.`);
-      } else if (pnlPercent >= 50 && position.lockedFloor < 25) {
-        position.lockedFloor = 25;
-        console.log(`📈 [Escada] ${posKey} atingiu 50%! Piso de lucro trancado nos 25%.`);
-      } else if (pnlPercent >= 25 && position.lockedFloor < 0) {
-        position.lockedFloor = 0;
-        console.log(`🛡 [Escada] ${posKey} atingiu 25%! Piso seguro trancado no Breakeven (0%).`);
+      if (position.isCrypto) {
+        if (pnlPercent >= 100 && position.lockedFloor < 75) {
+          position.lockedFloor = 75;
+          console.log(`🚀 [Escada] ${posKey} atingiu 100%! Piso de lucro trancado nos 75%.`);
+        } else if (pnlPercent >= 75 && position.lockedFloor < 50) {
+          position.lockedFloor = 50;
+          console.log(`📈 [Escada] ${posKey} atingiu 75%! Piso de lucro trancado nos 50%.`);
+        } else if (pnlPercent >= 50 && position.lockedFloor < 25) {
+          position.lockedFloor = 25;
+          console.log(`📈 [Escada] ${posKey} atingiu 50%! Piso de lucro trancado nos 25%.`);
+        } else if (pnlPercent >= 25 && position.lockedFloor < 0) {
+          position.lockedFloor = 0;
+          console.log(`🛡 [Escada] ${posKey} atingiu 25%! Piso seguro trancado no Breakeven (0%).`);
+        }
       }
-
-      const isTakeProfitTarget = pnlPercent >= takeProfit;
-      const isFloorTriggered = position.lockedFloor >= 0 && pnlPercent <= position.lockedFloor && pnlPercent >= 0;
-      const isStopLoss = pnlPercent <= stopLoss;
+      //const isTakeProfitTarget = pnlPercent >= takeProfit;
+      //const isFloorTriggered = position.lockedFloor >= 0 && pnlPercent <= position.lockedFloor && pnlPercent >= 0;
+      //const isStopLoss = pnlPercent <= stopLoss;
+      const isTakeProfitTarget = position.isCrypto ? (pnlPercent >= takeProfit) : false;
+      const isFloorTriggered = position.isCrypto ? (position.lockedFloor >= 0 && pnlPercent <= position.lockedFloor && pnlPercent >= 0) : false;
+      const isStopLoss = position.isCrypto ? (pnlPercent <= stopLoss) : false;
 
       const shouldExit = isTakeProfitTarget || isFloorTriggered || isStopLoss || isTimeout || isMarketClosed;
 
