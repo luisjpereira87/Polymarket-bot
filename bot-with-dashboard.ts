@@ -84,6 +84,7 @@ let CONFIG = {
     minTradeSize: 1.0,         // 🚨 CRÍTICO: Baixado de 10 para 1.0 (Não descarta ordens pequenas!)
     delay: 200,                // Reduzido de 500ms para 200ms de latência
     minWhaleOrderValueUSD: 1000,
+    minTradeValueUSD: 1.0,
     customWallets: [
       '0xc2e7800b5af46e6093872b177b7a5e7f0563be51',
       '0x58c3f5d66c95d4c41b093fbdd2520e46b6c9de74',
@@ -710,9 +711,10 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
     }
   }
 
-  let copySize = trade.size;
-  let tradeCost = 0;
+  //let copySize = trade.size;
+  //let tradeCost = 0;
 
+  /** 
   if (trade.isSmartMoney) {
     const sizeScale = CONFIG.smartMoney.sizeScale || 0.1;
     const maxSizePerTrade = CONFIG.smartMoney.maxSizePerTrade || 3.0;
@@ -728,8 +730,14 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
     tradeCost = trade.size;
     copySize = tradeCost / execPrice;
   }
+  **/
+  //tradeCost = trade.size;
+  //copySize = tradeCost / execPrice;
+  //const execShares = copySize;
 
-  const execShares = copySize;
+
+  const execShares = trade.size; // As shares vindas do trade
+  const tradeCost = execShares * execPrice; // O custo real em USDC
 
   // 2. Validar saldo em Dry Run ANTES de registar no dashboard
   if (isDryRun && trade.side === 'BUY') {
@@ -872,6 +880,7 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
       positions: () => realPositions,
       dryRun: isDryRun,
       minWhaleOrderValueUSD: CONFIG.smartMoney.minWhaleOrderValueUSD || 1000,
+      amount: CONFIG.smartMoney.minTradeValueUSD || 5,
       onTrade: async (trade, result) => {
         try {
           /** 

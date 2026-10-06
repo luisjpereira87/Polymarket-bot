@@ -1662,7 +1662,7 @@ export class RealtimeServiceV2 extends EventEmitter {
                     if (currentPrice > 0) {
                       const diff = currentPrice - position.avgEntryPrice;
                       const pnlPercent = (diff / position.avgEntryPrice) * 100;
-                      console.log(`[RealtimeServiceV2] 📈 [WS Preço Unificado] ${posKey} | Entrada: $${position.avgEntryPrice.toFixed(4)} | Atual: $${currentPrice.toFixed(4)} | PnL: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%`);
+                      //console.log(`[RealtimeServiceV2] 📈 [WS Preço Unificado] ${posKey} | Entrada: $${position.avgEntryPrice.toFixed(4)} | Atual: $${currentPrice.toFixed(4)} | PnL: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%`);
                       handlers.onPriceUpdate?.(posKey, currentPrice, pnlPercent);
                     }
                   },

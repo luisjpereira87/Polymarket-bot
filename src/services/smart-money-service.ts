@@ -164,6 +164,7 @@ export interface AutoCopyTradingOptions {
   onTrade?: (trade: SmartMoneyTrade, result: OrderResult) => void;
   onError?: (error: Error) => void;
   minWhaleOrderValueUSD?: number;
+  amount?: number;
 }
 
 /**
@@ -927,7 +928,8 @@ export class SmartMoneyService {
       }
 
       //const stopLoss = position.isCrypto ? baseStopLoss : baseStopLoss / 2;
-
+      // 📈 LOG DE PREÇO E PNL EM TEMPO REAL (Seja via REST ou WebSocket)
+      console.log(`[SmartMoneyService] 📈 [WS Preço Unificado] ${posKey} | Entrada: $${position.avgEntryPrice.toFixed(4)} | Atual: $${currentPrice.toFixed(4)} | PnL: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%`);
       const now = Date.now();
       const posTimestamp = position.timestamp || now;
       const age = now - posTimestamp;
@@ -950,6 +952,7 @@ export class SmartMoneyService {
       const isMarketClosed = isMarketExpired || isPriceResolved;
 
       // 📈 GESTÃO DE PATAMARES EM ESCADA (TRAILING FLOOR)
+      /** 
       if (position.lockedFloor === undefined) {
         position.lockedFloor = -1;
       }
@@ -974,13 +977,14 @@ export class SmartMoneyService {
       const isTakeProfitTarget = position.isCrypto ? (pnlPercent >= takeProfit) : false;
       const isFloorTriggered = position.isCrypto ? (position.lockedFloor >= 0 && pnlPercent <= position.lockedFloor && pnlPercent >= 0) : false;
       const isStopLoss = position.isCrypto ? (pnlPercent <= stopLoss) : false;
-
-      const shouldExit = isTakeProfitTarget || isFloorTriggered || isStopLoss || isTimeout || isMarketClosed;
+      /** */
+      //const shouldExit = isTakeProfitTarget || isFloorTriggered || isStopLoss || isTimeout || isMarketClosed;
+      const shouldExit = isTimeout || isMarketClosed;
 
       if (shouldExit) {
         let actionType = '🎯 Take-Profit';
-        if (isFloorTriggered) actionType = `🛡️ Trailing Escada (Fecho no piso de +${position.lockedFloor}%)`;
-        if (isStopLoss) actionType = '🛑 Stop-Loss';
+        //if (isFloorTriggered) actionType = `🛡️ Trailing Escada (Fecho no piso de +${position.lockedFloor}%)`;
+        //if (isStopLoss) actionType = '🛑 Stop-Loss';
         if (isTimeout) actionType = '⏰ Timeout (Tempo Limite)';
         if (isMarketClosed) actionType = '🏁 Mercado Fechado / Resolvido';
 
@@ -1696,22 +1700,28 @@ export class SmartMoneyService {
             stats.tradesSkipped++;
             return;
           }
-
+          /** 
           // --- PASSO C: Cálculos de Tamanho e Dimensão ---
           let copySize = activityTrade.size * sizeScale;
           let copyValue = copySize * activityTrade.price;
-
+          
           if (copyValue > maxSizePerTrade) {
             copyValue = maxSizePerTrade;
             copySize = copyValue / activityTrade.price;
           }
 
+          
           const usdcAmount = copyValue;
           const MIN_ORDER_SIZE = 1;
           if (usdcAmount < MIN_ORDER_SIZE || usdcAmount < minTradeSize) {
             stats.tradesSkipped++;
             return;
           }
+          **/
+          
+          const usdcAmount = options.amount || 1.0;
+
+
 
           // --- PASSO D: Filtro Anti-Duplicação ---
           if (activityTrade.side === 'BUY' && options.positions) {
@@ -1748,6 +1758,8 @@ export class SmartMoneyService {
             }
           }
 
+          const copySize = usdcAmount / executionPrice;
+
           // A partir daqui, o sinal é oficial e válido!
           stats.tradesDetected++;
 
@@ -1763,7 +1775,7 @@ export class SmartMoneyService {
             conditionId: activityTrade.conditionId,
             marketSlug: activityTrade.marketSlug,
             side: activityTrade.side,
-            size: activityTrade.size,
+            size: copySize,
             price: executionPrice,
             tokenId,
             outcome: activityTrade.outcome,
