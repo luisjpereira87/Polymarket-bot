@@ -703,6 +703,7 @@ export class SmartMoneyService {
 
   private activeSubscription: { unsubscribe: () => void } | null = null;
   private tradeHandlers: Set<(trade: SmartMoneyTrade) => void> = new Set();
+  private processingKeys = new Set<string>();
 
   constructor(
     walletService: WalletService,
@@ -1761,19 +1762,14 @@ export class SmartMoneyService {
 
             const currentPositions = options.positions();
 
-            // Verifica se já existe no mapa OU se já está em processamento ativo
-            if (currentPositions.has(posKey)) {
+            // Verifica se já está aberto no mapa oficial OU se já está a ser processado agora mesmo
+            if (currentPositions.has(posKey) || this.processingKeys.has(posKey)) {
               stats.tradesSkipped++;
               return;
             }
 
-            // 🛡️ TRAVÃO IMEDIATO DE CORRIDA: Insere uma chave prévia no mapa para bloquear duplicados em voo
-            // (evita que duas mensagens do WS em simultâneo passem o filtro antes de a ordem abrir)
-            currentPositions.set(posKey, {
-              marketSlug,
-              outcome: rawOutcome,
-              isPending: true // Marcador temporário enquanto valida o orderbook e executa
-            } as any);
+            // 🛡️ BLOQUEIO ATÓMICO: Marca imediatamente como "em processamento" antes de ir ao orderbook
+            this.processingKeys.add(posKey);
           }
 
           // --- PASSO E: Validação de Orderbook (Slippage / Profundidade) ---
