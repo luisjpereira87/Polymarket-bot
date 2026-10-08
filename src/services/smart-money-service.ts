@@ -952,11 +952,11 @@ export class SmartMoneyService {
       const isMarketClosed = isMarketExpired || isPriceResolved;
 
       // 📈 GESTÃO DE PATAMARES EM ESCADA (TRAILING FLOOR)
-      /** 
-      if (position.lockedFloor === undefined) {
-        position.lockedFloor = -1;
-      }
-      if (position.isCrypto) {
+      if (!position.isCrypto) {
+        if (position.lockedFloor === undefined) {
+          position.lockedFloor = -1;
+        }
+
         if (pnlPercent >= 100 && position.lockedFloor < 75) {
           position.lockedFloor = 75;
           console.log(`🚀 [Escada] ${posKey} atingiu 100%! Piso de lucro trancado nos 75%.`);
@@ -974,17 +974,19 @@ export class SmartMoneyService {
       //const isTakeProfitTarget = pnlPercent >= takeProfit;
       //const isFloorTriggered = position.lockedFloor >= 0 && pnlPercent <= position.lockedFloor && pnlPercent >= 0;
       //const isStopLoss = pnlPercent <= stopLoss;
-      const isTakeProfitTarget = position.isCrypto ? (pnlPercent >= takeProfit) : false;
-      const isFloorTriggered = position.isCrypto ? (position.lockedFloor >= 0 && pnlPercent <= position.lockedFloor && pnlPercent >= 0) : false;
-      const isStopLoss = position.isCrypto ? (pnlPercent <= stopLoss) : false;
-      /** */
-      //const shouldExit = isTakeProfitTarget || isFloorTriggered || isStopLoss || isTimeout || isMarketClosed;
-      const shouldExit = isTimeout || isMarketClosed;
+      const posWithFloor = position as { lockedFloor?: number };
+      const floorValue = posWithFloor.lockedFloor ?? -1;
+      const isTakeProfitTarget = !position.isCrypto ? (pnlPercent >= takeProfit) : false;
+      const isFloorTriggered = !position.isCrypto ? (floorValue >= 0 && pnlPercent <= floorValue && pnlPercent >= 0) : false;
+      const isStopLoss = !position.isCrypto ? (pnlPercent <= stopLoss) : false;
+
+      const shouldExit = isTakeProfitTarget || isFloorTriggered || isStopLoss || isTimeout || isMarketClosed;
+      //const shouldExit = isTimeout || isMarketClosed;
 
       if (shouldExit) {
         let actionType = '🎯 Take-Profit';
-        //if (isFloorTriggered) actionType = `🛡️ Trailing Escada (Fecho no piso de +${position.lockedFloor}%)`;
-        //if (isStopLoss) actionType = '🛑 Stop-Loss';
+        if (isFloorTriggered) actionType = `🛡️ Trailing Escada (Fecho no piso de +${position.lockedFloor}%)`;
+        if (isStopLoss) actionType = '🛑 Stop-Loss';
         if (isTimeout) actionType = '⏰ Timeout (Tempo Limite)';
         if (isMarketClosed) actionType = '🏁 Mercado Fechado / Resolvido';
 
@@ -1072,29 +1074,55 @@ export class SmartMoneyService {
         const lastActivity = lastActivityMap.get(posKey) || position.timestamp || now;
         const timeSinceLastSignal = now - lastActivity;
 
-        // Se o WebSocket estiver mudo há mais de 60 segundos para esta posição:
         if (timeSinceLastSignal > STALE_THRESHOLD_MS) {
-          console.warn(`[SmartMoneyService] ⚠️ Alerta: Sem sinais de WebSocket para ${posKey} há >60s. A forçar verificação REST...`);
+          console.warn(`[SmartMoneyService] ⚠️ Alerta: Sem sinais para ${posKey} há >60s. A forçar verificação REST / SDK...`);
 
           try {
-            const tokenId = (position as any).tokenId;
-            if (!tokenId) continue;
+            const tokenId = position.tokenId;
+            const marketSlug = position.marketSlug;
+            let freshPrice: number | null = null;
 
-            // Vai buscar o preço atual fresco via REST API / Orderbook
-            const freshPrice = await this.orderbookService.getBestBidPrice(tokenId);
+            // 1. Tenta ir buscar o preço fresco ao orderbook
+            if (tokenId) {
+              freshPrice = await this.orderbookService.getBestBidPrice(tokenId);
+            }
 
-            if (freshPrice && freshPrice > 0) {
+            // 2. Plano B: Se o orderbook falhou, consulta o SDK para ver se o mercado fechou/resolveu
+            if ((!freshPrice || freshPrice <= 0) && marketSlug) {
+              const marketInfo: GammaMarket | null = await (this as any).sdk?.markets?.getMarket(marketSlug);
+
+              if (marketInfo && marketInfo.closed) {
+                // Procura qual o outcome que venceu (preço final = 1.0 ou muito próximo)
+                const outcomes = marketInfo.outcomes || [];
+                const prices = marketInfo.outcomePrices || [];
+
+                let winningOutcome: string | null = null;
+                for (let i = 0; i < outcomes.length; i++) {
+                  if (prices[i] >= 0.99) {
+                    winningOutcome = outcomes[i];
+                    break;
+                  }
+                }
+
+                // Compara se o outcome em que apostámos corresponde ao vencedor oficial
+                const userOutcome = position.outcome ? position.outcome.toLowerCase() : '';
+                const isWinner = winningOutcome && userOutcome && winningOutcome.toLowerCase() === userOutcome;
+                freshPrice = isWinner ? 1.0 : 0.0;
+
+                console.log(`🏁 [SDK Gamma Fallback] Mercado ${marketSlug} fechado. Vencedor detetado: ${winningOutcome} | Nossa escolha (${position.outcome}): ${isWinner ? 'VITÓRIA (1.0)' : 'DERROTA (0.0)'}`);
+              }
+            }
+
+            if (freshPrice !== null && freshPrice >= 0) {
               const avgEntry = position.avgEntryPrice;
               const pnlPercent = ((freshPrice - avgEntry) / avgEntry) * 100;
 
-              // Injeta o preço fresco no handler principal para reavaliar saídas/pisos
               await internalHandler(posKey, freshPrice, pnlPercent);
             }
           } catch (err) {
-            console.error(`[SmartMoneyService] ❌ Erro no polling de segurança REST para ${posKey}:`, err);
+            console.error(`[SmartMoneyService] ❌ Erro no polling de segurança para ${posKey}:`, err);
           }
 
-          // Atualiza o timestamp para evitar chamadas excessivas em loop caso falhe
           lastActivityMap.set(posKey, Date.now());
         }
       }
@@ -1718,21 +1746,34 @@ export class SmartMoneyService {
             return;
           }
           **/
-          
+
           const usdcAmount = options.amount || 1.0;
 
 
 
           // --- PASSO D: Filtro Anti-Duplicação ---
           if (activityTrade.side === 'BUY' && options.positions) {
-            const marketSlug = activityTrade.marketSlug || (activityTrade as any).market;
-            const outcomeSuffix = activityTrade.outcome ? `-${activityTrade.outcome}` : '';
+            const rawSlug = activityTrade.marketSlug || (activityTrade as any).market || '';
+            const rawOutcome = activityTrade.outcome || '';
+            const marketSlug = rawSlug.trim().toLowerCase();
+            const outcomeSuffix = rawOutcome ? `-${rawOutcome.trim()}` : '';
             const posKey = `${marketSlug}${outcomeSuffix}`;
 
-            if (options.positions().has(posKey)) {
+            const currentPositions = options.positions();
+
+            // Verifica se já existe no mapa OU se já está em processamento ativo
+            if (currentPositions.has(posKey)) {
               stats.tradesSkipped++;
               return;
             }
+
+            // 🛡️ TRAVÃO IMEDIATO DE CORRIDA: Insere uma chave prévia no mapa para bloquear duplicados em voo
+            // (evita que duas mensagens do WS em simultâneo passem o filtro antes de a ordem abrir)
+            currentPositions.set(posKey, {
+              marketSlug,
+              outcome: rawOutcome,
+              isPending: true // Marcador temporário enquanto valida o orderbook e executa
+            } as any);
           }
 
           // --- PASSO E: Validação de Orderbook (Slippage / Profundidade) ---

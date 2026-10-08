@@ -1893,7 +1893,7 @@ async function main() {
   await setupDipArb(sdk);
 
   await setupPriceMonitor(sdk);
-  await startExpirationWatchdog(sdk);
+  //await startExpirationWatchdog(sdk);
 
   // 2. Atualiza a lista de carteiras do Smart Money automaticamente a cada 2 horas
   const TWO_HOURS_MS = 2 * 60 * 60 * 1000;

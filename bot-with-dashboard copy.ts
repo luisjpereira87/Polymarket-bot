@@ -147,7 +147,7 @@ const state: BotState = {
   dailyPnL: 0,
   totalPnL: 0,
   consecutiveLosses: 0,
-  consecutiveWins: 0,  // 🔴 NEW
+  consecutiveWins: 0, // 🔴 NEW
   tradesExecuted: 0,
   isPaused: false,
   pauseUntil: 0,
@@ -204,6 +204,8 @@ const state: BotState = {
   },
 
   smartMoneySignals: [],
+  wins: 0,
+  losses: 0
 };
 
 // ============================================================================
