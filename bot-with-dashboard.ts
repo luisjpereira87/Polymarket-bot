@@ -1502,7 +1502,7 @@ function isCryptoPosition(title?: string, slug?: string, eventSlug?: string): bo
   return cryptoKeywords.some(keyword => searchableText.includes(keyword));
 }
 
-async function setupPortfolioManager(sdk: PolymarketSDK) {
+async function setupPortfolioManager__(sdk: PolymarketSDK) {
   log('INFO', 'Iniciando Gestor de Portfólio...');
 
   // 🛡️ Modo Dry Run: Ignora a sincronização com a blockchain/API real para preservar posições virtuais locais
@@ -1616,6 +1616,159 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
         }
       }
 
+      for (const existingKey of realPositions.keys()) {
+        if (!activeKeysInThisRound.has(existingKey)) {
+          realPositions.delete(existingKey);
+          console.log(`[PortfolioManager] 🧹 Posição órfã/fechada ${existingKey} limpa do mapa local.`);
+        }
+      }
+
+      let unrealized = 0;
+      for (const p of enrichedPositions) {
+        const entry = Number(p.avgPrice) || 0;
+        const current = Number(p.curPrice) || 0;
+        const size = Number(p.size) || 0;
+
+        if (current > 0 && size > 0 && !p.marketClosed) {
+          unrealized += (current - entry) * size;
+        }
+      }
+      state.unrealizedPnL = unrealized;
+      state.positions = enrichedPositions.filter(p => !p.marketClosed);
+      updateDashboard();
+    } catch (err: any) {
+      log('WARN', `Erro de sincronização de posições: ${err.message}`);
+    }
+  }, 30 * 1000);
+}
+
+async function setupPortfolioManager(sdk: PolymarketSDK) {
+  log('INFO', 'Iniciando Gestor de Portfólio...');
+
+  if (CONFIG.dryRun) {
+    log('INFO', '🛡️ Modo Dry Run ativo: Gestor de portfólio a operar exclusivamente com posições virtuais.');
+    return;
+  }
+
+  const targetWalletAddress = process.env.POLYMARKET_FUNDER_ADDRESS || '';
+
+  // Helper seguro para gerar posKey consistente
+  const getPosKey = (p: any): string | null => {
+    const slug = p.slug || p.eventSlug || p.marketSlug;
+    if (!slug) return null;
+    const outcome = p.outcome ? `-${p.outcome}` : '';
+    return `${slug}${outcome}`;
+  };
+
+  try {
+    const positions = await sdk.wallets.getWalletPositions(targetWalletAddress);
+    state.positions = positions;
+
+    realPositions.clear();
+
+    for (const p of positions) {
+      const size = Number(p.size) || 0;
+      const avgPrice = Number(p.avgPrice) || 0;
+      const posKey = getPosKey(p);
+      const marketSlug = p.slug || p.eventSlug;
+      const tokenId = p.asset || p.tokenId;
+      const endDate = parseEndDate(p.endDate, marketSlug);
+
+      if (size > 0 && posKey && marketSlug) {
+        realPositions.set(posKey, {
+          marketSlug,
+          outcome: p.outcome,
+          side: 'BUY',
+          size,
+          avgEntryPrice: avgPrice,
+          timestamp: Date.now(),
+          traderAddress: p.proxyWallet || targetWalletAddress,
+          tokenId,
+          endDate,
+          isCrypto: isCryptoPosition(p.title, p.slug, p.eventSlug)
+        });
+      }
+    }
+
+    log('WALLET', `Sincronizadas ${realPositions.size} posições existentes.`);
+    updateDashboard();
+  } catch (err: any) {
+    log('WARN', `Sincronização de Portfólio falhou: ${err.message}`);
+  }
+
+  setInterval(async () => {
+    if (CONFIG.dryRun) return;
+
+    try {
+      const positions: Position[] = await sdk.wallets.getWalletPositions(targetWalletAddress);
+
+      // 🛡️ SALVAGUARDA 1: Se a API falhar e retornar 0 posições sem aviso, não limpa a memória
+      if (!positions || positions.length === 0) {
+        return;
+      }
+
+      const enrichedPositions: EnrichedPosition[] = await Promise.all(positions.map(async (pos: EnrichedPosition) => {
+        try {
+          if (pos.conditionId) {
+            const market: UnifiedMarket = await sdk.markets.getMarket(pos.conditionId);
+            if (market) {
+              pos.marketClosed = market.closed;
+              const token = market.tokens?.find((t: any) => t.tokenId === (pos.asset || pos.tokenId));
+              if (token) {
+                pos.isWinner = token.winner || false;
+                pos.curPrice = Number(token.price);
+              }
+            }
+          }
+        } catch (e) { }
+        return pos;
+      }));
+
+      const activeKeysInThisRound = new Set<string>();
+
+      for (const p of enrichedPositions) {
+        const size = Number(p.size) || 0;
+        const avgPrice = Number(p.avgPrice) || 0;
+        const posKey = getPosKey(p);
+        const marketSlug = p.slug || p.eventSlug;
+        const tokenId = p.asset || p.tokenId;
+
+        // 🛡️ CORREÇÃO CRÍTICA: Um preço 0 (ou undefined) NÃO significa mercado resolvido!
+        // Só consideramos resolvido se o mercado estiver explicitamente marcado como closed, 
+        // ou se curPrice tiver um valor REAL de término (>= 0.999).
+        const hasValidPrice = p.curPrice !== undefined && p.curPrice !== null && p.curPrice > 0;
+        const isResolved = p.marketClosed === true || (hasValidPrice && p.curPrice! >= 0.999);
+
+        if (size > 0 && posKey && marketSlug && !isResolved) {
+          activeKeysInThisRound.add(posKey);
+
+          if (realPositions.has(posKey)) {
+            const existing = realPositions.get(posKey);
+            if (existing) {
+              existing.size = size;
+              existing.avgEntryPrice = avgPrice;
+              existing.tokenId = tokenId;
+              existing.endDate = parseEndDate(p.endDate, marketSlug);
+              existing.isCrypto = isCryptoPosition(p.title, p.slug, p.eventSlug);
+            }
+          } else {
+            realPositions.set(posKey, {
+              marketSlug,
+              outcome: p.outcome,
+              side: 'BUY',
+              size,
+              avgEntryPrice: avgPrice,
+              timestamp: Date.now(),
+              traderAddress: p.proxyWallet || targetWalletAddress,
+              tokenId,
+              endDate: parseEndDate(p.endDate, marketSlug),
+              isCrypto: isCryptoPosition(p.title, p.slug, p.eventSlug)
+            });
+          }
+        }
+      }
+
+      // Limpeza de posições órfãs com log de depuração
       for (const existingKey of realPositions.keys()) {
         if (!activeKeysInThisRound.has(existingKey)) {
           realPositions.delete(existingKey);
