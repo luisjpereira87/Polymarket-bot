@@ -82,6 +82,7 @@ let CONFIG = {
 
     maxSlippage: 0.05,         // Subido de 0.03 para 0.05 (Evita rejeitar trades por ligeira variação de preço)
     minTradeSize: 1.0,         // 🚨 CRÍTICO: Baixado de 10 para 1.0 (Não descarta ordens pequenas!)
+    maxTradeSize: 10.0,
     delay: 200,                // Reduzido de 500ms para 200ms de latência
     minWhaleOrderValueUSD: 1000,
     minTradeValueUSD: 1.0,
@@ -136,7 +137,13 @@ let CONFIG = {
     trailingStopPct: 0.10,
     maxHoldDays: 7,
     minRiskReward: 1.5,
+
     minTradeValueUSD: 1.0,
+
+    minTradeSize: 1,
+    maxTradeSize: 10,
+    capitalPercentage: 0.05,
+    maxSizePerTrade: 1.5,
   },
 
   dryRun: process.env.DRY_RUN !== 'false',
@@ -880,7 +887,7 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
       positions: () => realPositions,
       dryRun: isDryRun,
       minWhaleOrderValueUSD: CONFIG.smartMoney.minWhaleOrderValueUSD || 1000,
-      amount: CONFIG.smartMoney.minTradeValueUSD || 5,
+      amount: () => calculateDynamicTradeAmount(state.usdcBalance, CONFIG.smartMoney),
       onTrade: async (trade, result) => {
         try {
           /** 
@@ -1433,7 +1440,7 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
       enabled: CONFIG.directTrading.enabled,
       interval: CONFIG.binance.interval,
       trendThreshold: CONFIG.binance.trendThreshold,
-      amount: CONFIG.directTrading.minTradeValueUSD || 5,
+      amount: () => calculateDynamicTradeAmount(state.usdcBalance, CONFIG.directTrading),
       dryRun: CONFIG.dryRun,
       checkIntervalMs: 3 * 60 * 1000,
       isCanTrade: () => canTrade(),
@@ -1785,6 +1792,38 @@ async function startExpirationWatchdog(sdk: PolymarketSDK, intervalMs: number = 
       }
     }
   }, intervalMs);
+}
+
+function calculateDynamicTradeAmount(
+  availableBalance: number,
+  config: {
+    capitalPercentage?: number; // Ex: 0.05 para 5% do capital
+    minTradeSize?: number;      // Ex: 10 USDC (piso mínimo)
+    maxTradeSize?: number;   // Ex: 50 USDC (teto máximo)
+  } = {}
+): number {
+  const percentage = config.capitalPercentage ?? 0.05; // Default: 5% da banca por trade
+  const minSize = config.minTradeSize ?? 10;           // Piso padrão
+  const maxSize = config.maxTradeSize ?? 50;       // Teto padrão
+
+  // Se o saldo detetado for zero ou negativo, retorna o mínimo de segurança ou 0
+  if (!availableBalance || availableBalance <= 0) {
+    return minSize;
+  }
+
+  // 1. Calcula o valor bruto baseado na percentagem da banca
+  let calculatedAmount = availableBalance * percentage;
+
+  // 2. Aplica os limites de segurança (Clamp entre minTradeSize e maxSizePerTrade)
+  calculatedAmount = Math.max(minSize, Math.min(calculatedAmount, maxSize));
+
+  // 3. Salvaguarda final: Nunca podes gastar mais do que o saldo real disponível
+  if (calculatedAmount > availableBalance) {
+    calculatedAmount = availableBalance;
+  }
+
+  // Retorna arredondado a 2 casas decimais para evitar problemas de precisão com moedas fiat/USDC
+  return Math.round(calculatedAmount * 100) / 100;
 }
 
 // ============================================================================

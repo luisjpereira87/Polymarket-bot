@@ -164,7 +164,7 @@ export interface AutoCopyTradingOptions {
   onTrade?: (trade: SmartMoneyTrade, result: OrderResult) => void;
   onError?: (error: Error) => void;
   minWhaleOrderValueUSD?: number;
-  amount?: number;
+  amount: () => number;
 }
 
 /**
@@ -1748,7 +1748,7 @@ export class SmartMoneyService {
           }
           **/
 
-          const usdcAmount = options.amount || 1.0;
+          const usdcAmount = options.amount() || 1.0;
 
 
 

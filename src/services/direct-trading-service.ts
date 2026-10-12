@@ -8,7 +8,7 @@ export interface DirectTradingServiceConfig {
     enabled: boolean;
     interval: string;         // ex: '15m'
     trendThreshold: number;   // ex: 0.3
-    amount: number;           // ex: 5 (USDC)
+    amount:  () => number;           // ex: 5 (USDC)
     dryRun?: boolean;         // Flag para saber se simula ou executa a sério
     checkIntervalMs?: number; // ex: 5 * 60 * 1000
     isCanTrade: () => boolean;
@@ -296,7 +296,7 @@ export class DirectTradingService {
         }
 
         // 🛡️ VALIDAR LIVRO DE ORDENS REAL (Anti-Slippage)
-        const amountUsdc = config.amount || 5;
+        const amountUsdc = config.amount() || 5;
         const validation = await this.orderbookService.validateOrderBookSlippage(targetToken.tokenId, amountUsdc, 0.75, 0.25);
 
         if (!validation.isValid) {
