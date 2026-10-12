@@ -907,6 +907,260 @@ export class SmartMoneyService {
     } = {}
   ): Promise<{ id: string; unsubscribe: () => void }> {
     const takeProfit = options.takeProfitPercent ?? 100.0;
+    const stopLoss = options.stopLossPercent ?? -50.0;
+    const maxDurationMs = options.maxTradeDurationMinutes ? options.maxTradeDurationMinutes * 60 * 1000 : null;
+    const gracePeriodMs = (options.stopLossGracePeriodSeconds ?? 30) * 1000;
+    const dryRun = options.dryRun ?? false;
+
+    const lastActivityMap = new Map<string, number>();
+
+    const internalHandler = async (posKey: string, currentPrice: number, pnlPercent: number) => {
+      lastActivityMap.set(posKey, Date.now());
+
+      const position = realPositions.get(posKey);
+      if (!position) return;
+
+      // 🛡️ DEFESA 1: Ignorar se o preço de entrada for inválido ou zero
+      if (!position.avgEntryPrice || position.avgEntryPrice <= 0) {
+        return;
+      }
+
+      console.log(`[SmartMoneyService] 📈 [WS Preço Unificado] ${posKey} | Entrada: $${position.avgEntryPrice.toFixed(4)} | Atual: $${currentPrice.toFixed(4)} | PnL: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%`);
+
+      // Dispara o callback de atualização de preço para a UI/Logs
+      options.onPriceUpdate?.(posKey, currentPrice, pnlPercent);
+
+      const now = Date.now();
+      const posTimestamp = position.timestamp || now;
+      const age = now - posTimestamp;
+
+      // 🛡️ DEFESA 2: Avaliação do Período de Graça
+      const isWithinGracePeriod = age < gracePeriodMs;
+
+      // Verificação de expiração temporal e fecho de mercado
+      const isTimeout = maxDurationMs !== null && age >= maxDurationMs;
+      const marketEndDate = (position as any).endDate;
+      const isMarketExpired = marketEndDate && now >= new Date(marketEndDate).getTime();
+
+      // 🛡️ Validação estrita de Preço Resolvido (Evita falsos fechos com $0.00 de liquidez vazia)
+      const isPriceResolved = currentPrice >= 0.99 || (currentPrice <= 0.01 && !isWithinGracePeriod);
+      const isMarketClosed = isMarketExpired || isPriceResolved;
+
+      // 📈 GESTÃO DE PATAMARES EM ESCADA (TRAILING FLOOR)
+      if (!position.isCrypto) {
+        if (position.lockedFloor === undefined) {
+          position.lockedFloor = -1;
+        }
+
+        if (pnlPercent >= 100 && position.lockedFloor < 75) {
+          position.lockedFloor = 75;
+          console.log(`🚀 [Escada] ${posKey} atingiu 100%! Piso de lucro trancado nos 75%.`);
+        } else if (pnlPercent >= 75 && position.lockedFloor < 50) {
+          position.lockedFloor = 50;
+          console.log(`📈 [Escada] ${posKey} atingiu 75%! Piso de lucro trancado nos 50%.`);
+        } else if (pnlPercent >= 50 && position.lockedFloor < 25) {
+          position.lockedFloor = 25;
+          console.log(`📈 [Escada] ${posKey} atingiu 50%! Piso de lucro trancado nos 25%.`);
+        } else if (pnlPercent >= 25 && position.lockedFloor < 0) {
+          position.lockedFloor = 0;
+          console.log(`🛡 [Escada] ${posKey} atingiu 25%! Piso seguro trancado no Breakeven (0%).`);
+        }
+      }
+
+      const posWithFloor = position as { lockedFloor?: number };
+      const floorValue = posWithFloor.lockedFloor ?? -1;
+
+      // Regras voluntárias de saída (Sujeitas ao Período de Graça)
+      const isTakeProfitTarget = !position.isCrypto ? (pnlPercent >= takeProfit) : false;
+      const isFloorTriggered = !position.isCrypto ? (floorValue >= 0 && pnlPercent <= floorValue && pnlPercent >= 0) : false;
+      const isStopLoss = !position.isCrypto ? (pnlPercent <= stopLoss) : false;
+
+      // 🎯 SE AINDA ESTIVER NO PERÍODO DE GRAÇA, ignora Stop-Loss e Trailing Floor,
+      // mas PERMITE fecho se o mercado expirou/resolveu ou deu Timeout.
+      const effectiveStopLoss = isWithinGracePeriod ? false : isStopLoss;
+      const effectiveFloor = isWithinGracePeriod ? false : isFloorTriggered;
+      const effectiveTakeProfit = isWithinGracePeriod ? false : isTakeProfitTarget;
+
+      const shouldExit = effectiveTakeProfit || effectiveFloor || effectiveStopLoss || isTimeout || isMarketClosed;
+
+      if (shouldExit) {
+        let actionType = '🎯 Take-Profit';
+        if (effectiveFloor) actionType = `🛡️ Trailing Escada (Fecho no piso de +${position.lockedFloor}%)`;
+        if (effectiveStopLoss) actionType = '🛑 Stop-Loss';
+        if (isTimeout) actionType = '⏰ Timeout (Tempo Limite)';
+        if (isMarketClosed) actionType = '🏁 Mercado Fechado / Resolvido';
+
+        console.log(`💰 ${actionType} de ${pnlPercent.toFixed(1)}% (Idade: ${(age / 60000).toFixed(1)}m) atingido em ${posKey}! A fechar posição...`);
+
+        const exitShares = position.size;
+        let result: OrderResult = { success: false, errorMsg: 'Not executed yet' };
+
+        if (dryRun) {
+          result = { success: true, orderId: `dry_run_exit_${Date.now()}` };
+          console.log('[DRY RUN EXIT]', {
+            posKey,
+            side: 'SELL',
+            shares: exitShares.toFixed(2),
+            price: currentPrice.toFixed(3),
+            pnlPercent: pnlPercent.toFixed(2) + '%',
+            reason: actionType,
+          });
+        } else {
+          const tokenId = (position as any).tokenId;
+          if (!tokenId) {
+            console.warn(`[SmartMoneyService] ⚠️ Falha ao fechar ${posKey}: TokenId em falta.`);
+            return;
+          }
+
+          let attempts = 0;
+          const maxAttempts = 3;
+
+          while (attempts < maxAttempts) {
+            attempts++;
+            const livePrice = currentPrice;
+            let slippageMultiplier = 0.98;
+            if (attempts === 2) slippageMultiplier = 0.93;
+            if (attempts === 3) slippageMultiplier = 0.85;
+
+            const rawTargetPrice = livePrice * slippageMultiplier;
+            const adjustedPrice = Math.max(0.01, Number(rawTargetPrice.toFixed(2)));
+
+            result = await this.tradingService.createMarketOrder({
+              tokenId,
+              side: 'SELL',
+              amount: exitShares,
+              price: adjustedPrice,
+              orderType: 'FAK',
+            });
+
+            if (result && result.success) break;
+            await new Promise(resolve => setTimeout(resolve, 600));
+          }
+        }
+
+        if (result && result.success) {
+          const exitTrade: SmartMoneyTrade = {
+            traderAddress: position.traderAddress || 'SYSTEM_AUTO_EXIT',
+            marketSlug: position.marketSlug,
+            outcome: position.outcome,
+            side: 'SELL',
+            size: position.size,
+            price: currentPrice,
+            timestamp: Date.now(),
+            isSmartMoney: true,
+            endDate: position.endDate
+          };
+
+          if (options.executeTradeHandler) {
+            options.executeTradeHandler(exitTrade, result);
+          }
+
+          options.onPositionClosed?.(exitTrade, result, pnlPercent);
+          realPositions.delete(posKey);
+          lastActivityMap.delete(posKey);
+        }
+      }
+    };
+
+    this.priceHandlers.add(internalHandler);
+
+    // 🛡️ INTERVALO DE REFORÇO REST (Polling de Segurança para WebSockets mudos)
+    const STALE_THRESHOLD_MS = 60 * 1000;
+    const POLLING_INTERVAL_MS = 15 * 1000;
+
+    const safetyPollingTimer = setInterval(async () => {
+      const now = Date.now();
+      for (const [posKey, position] of realPositions.entries()) {
+        const lastActivity = lastActivityMap.get(posKey) || position.timestamp || now;
+        const timeSinceLastSignal = now - lastActivity;
+
+        if (timeSinceLastSignal > STALE_THRESHOLD_MS) {
+          console.warn(`[SmartMoneyService] ⚠️ Alerta: Sem sinais para ${posKey} há >60s. A forçar verificação REST / SDK...`);
+
+          try {
+            const tokenId = position.tokenId;
+            const marketSlug = position.marketSlug;
+            let freshPrice: number | null = null;
+
+            if (tokenId) {
+              freshPrice = await this.orderbookService.getBestBidPrice(tokenId);
+            }
+
+            if ((!freshPrice || freshPrice <= 0) && marketSlug) {
+              const marketInfo: GammaMarket | null = await (this as any).sdk?.markets?.getMarket(marketSlug);
+
+              if (marketInfo && marketInfo.closed) {
+                const outcomes = marketInfo.outcomes || [];
+                const prices = marketInfo.outcomePrices || [];
+
+                let winningOutcome: string | null = null;
+                for (let i = 0; i < outcomes.length; i++) {
+                  if (prices[i] >= 0.99) {
+                    winningOutcome = outcomes[i];
+                    break;
+                  }
+                }
+
+                const userOutcome = position.outcome ? position.outcome.toLowerCase() : '';
+                const isWinner = winningOutcome && userOutcome && winningOutcome.toLowerCase() === userOutcome;
+                freshPrice = isWinner ? 1.0 : 0.0;
+
+                console.log(`🏁 [SDK Gamma Fallback] Mercado ${marketSlug} fechado. Vencedor detetado: ${winningOutcome} | Nossa escolha (${position.outcome}): ${isWinner ? 'VITÓRIA (1.0)' : 'DERROTA (0.0)'}`);
+              }
+            }
+
+            if (freshPrice !== null && freshPrice >= 0) {
+              const avgEntry = position.avgEntryPrice;
+              const pnlPercent = ((freshPrice - avgEntry) / avgEntry) * 100;
+
+              await internalHandler(posKey, freshPrice, pnlPercent);
+            }
+          } catch (err) {
+            console.error(`[SmartMoneyService] ❌ Erro no polling de segurança para ${posKey}:`, err);
+          }
+
+          lastActivityMap.set(posKey, Date.now());
+        }
+      }
+    }, POLLING_INTERVAL_MS);
+
+    if (!this.priceSubscription) {
+      this.priceSubscription = this.realtimeService.subscribePositionPriceWebSocket(realPositions, {
+        onPriceUpdate: (posKey, currentPrice, pnlPercent) => {
+          for (const handler of this.priceHandlers) {
+            handler(posKey, currentPrice, pnlPercent);
+          }
+        }
+      }, this.tradingService.getFunderAddress(), dryRun);
+    }
+
+    return {
+      id: `price_monitor_exec_${Date.now()}`,
+      unsubscribe: () => {
+        clearInterval(safetyPollingTimer);
+        this.priceHandlers.delete(internalHandler);
+        if (this.priceHandlers.size === 0 && this.priceSubscription) {
+          this.priceSubscription.unsubscribe();
+          this.priceSubscription = null;
+        }
+      },
+    };
+  }
+
+  async subscribePositionPricesWithExecution_old(
+    realPositions: Map<string, TradePositions>,
+    options: {
+      takeProfitPercent?: number;
+      stopLossPercent?: number;
+      maxTradeDurationMinutes?: number;
+      stopLossGracePeriodSeconds?: number;
+      dryRun?: boolean;
+      onPositionClosed?: (trade: SmartMoneyTrade, result: OrderResult, pnlPercent: number) => void;
+      onPriceUpdate?: (posKey: string, currentPrice: number, pnlPercent: number) => void;
+      executeTradeHandler?: (trade: SmartMoneyTrade, result: OrderResult) => void;
+    } = {}
+  ): Promise<{ id: string; unsubscribe: () => void }> {
+    const takeProfit = options.takeProfitPercent ?? 100.0;
     //const baseStopLoss = options.stopLossPercent ?? -50.0;
     const stopLoss = options.stopLossPercent ?? -50.0;
     const maxDurationMs = options.maxTradeDurationMinutes ? options.maxTradeDurationMinutes * 60 * 1000 : null;
