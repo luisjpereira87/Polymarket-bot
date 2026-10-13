@@ -937,6 +937,7 @@ export class SmartMoneyService {
       // 🛡️ DEFESA 2: Avaliação do Período de Graça
       const isWithinGracePeriod = age < gracePeriodMs;
 
+      /**
       // Verificação de expiração temporal e fecho de mercado
       const isTimeout = maxDurationMs !== null && age >= maxDurationMs;
       const marketEndDate = (position as any).endDate;
@@ -945,7 +946,23 @@ export class SmartMoneyService {
       // 🛡️ Validação estrita de Preço Resolvido (Evita falsos fechos com $0.00 de liquidez vazia)
       const isPriceResolved = currentPrice >= 0.99 || (currentPrice <= 0.01 && !isWithinGracePeriod);
       const isMarketClosed = isMarketExpired || isPriceResolved;
+      **/
 
+      // 1. Timeout por duração máxima do trade
+      const isTimeout = maxDurationMs !== null && age >= maxDurationMs;
+      
+      // 2. Leitura da data de termo do mercado
+      const marketEndDate = (position as any).endDate;
+      const isTimeExpired = marketEndDate && now >= new Date(marketEndDate).getTime();
+      
+      // 3. Validação estrita de preço resolvido nos extremos (fora do período de graça)
+      const isPriceResolved = currentPrice >= 0.999 || (currentPrice <= 0.001 && !isWithinGracePeriod);
+      
+      // 4. CORREÇÃO: O mercado só fecha por data se o tempo expirou E o preço já estiver resolvido 
+      // (evita fechar a -18% só porque a hora teórica do evento passou por uns minutos).
+      const isMarketClosed = isPriceResolved || (isTimeExpired && (currentPrice >= 0.90 || currentPrice <= 0.10));
+
+      
       // 📈 GESTÃO DE PATAMARES EM ESCADA (TRAILING FLOOR)
       if (!position.isCrypto) {
         if (position.lockedFloor === undefined) {
