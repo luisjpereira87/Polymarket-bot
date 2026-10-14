@@ -648,6 +648,7 @@ async function whalesQualifiedWallets(sdk: PolymarketSDK): Promise<string[]> {
       const trades = profile.tradeCount ?? (profile as any).trades_count ?? (profile as any).trades ?? 0;
 
       // Cálculo de ROI % se disponível no perfil (Volume vs Lucro)
+      
       const volume = (profile as any).volume ?? (profile as any).totalVolume ?? 0;
       const roiPercent = volume > 0 ? (totalPnL / volume) * 100 : 0;
 
