@@ -535,7 +535,7 @@ async function agressiveQualifiedWallets(sdk: PolymarketSDK) {
   }
 }
 
-async function whalesQualifiedWallets(sdk: PolymarketSDK): Promise<string[]> {
+async function whalesQualifiedWallets__(sdk: PolymarketSDK): Promise<string[]> {
   try {
     const qualified: string[] = [];
 
@@ -611,7 +611,84 @@ async function whalesQualifiedWallets(sdk: PolymarketSDK): Promise<string[]> {
   }
 }
 
-async function refreshWalletCache(sdk: PolymarketSDK) {
+async function whalesQualifiedWallets(sdk: PolymarketSDK): Promise<string[]> {
+  try {
+    const qualified: string[] = [];
+
+    // 1. Adicionar carteiras personalizadas definidas nas configurações (se existirem)
+    if (CONFIG.smartMoney.customWallets && CONFIG.smartMoney.customWallets.length > 0) {
+      for (const wallet of CONFIG.smartMoney.customWallets) {
+        qualified.push(wallet);
+        log('WALLET', `⭐ Carteira personalizada adicionada: ${wallet.slice(0, 10)}...`);
+      }
+    }
+
+    // 2. Obter o leaderboard focado em lucro (PnL)
+    const leaderboard = await sdk.wallets.getLeaderboardByPeriod('week', CONFIG.smartMoney.topN, 'pnl');
+    log('WALLET', `📊 Leaderboard obtido: ${leaderboard.length} carteiras para analisar.`);
+
+    for (const entry of leaderboard) {
+      if (!CONFIG.smartMoney.enabled && qualified.length === 0) break;
+      if (qualified.length >= 15) break;
+      if (qualified.includes(entry.address)) continue;
+
+      const profile: WalletProfile | null = await sdk.wallets.getWalletProfile(entry.address);
+      if (!profile) {
+        log('INFO', `⚠️ Perfil não encontrado para ${entry.address.slice(0, 10)}...`);
+        continue;
+      }
+
+      // 🔍 Captura flexível de propriedades
+      const rawWinRate = profile.winRate ?? (profile as any).win_rate ?? 0;
+      // Normaliza winRate para formato decimal (ex: se vier 70 em vez de 0.70)
+      const winRate = rawWinRate > 1 ? rawWinRate / 100 : rawWinRate;
+
+      const totalPnL = profile.totalPnL ?? (profile as any).pnl ?? (profile as any).profit ?? 0;
+      const smartScore = profile.smartScore ?? (profile as any).smart_score ?? 0;
+      const trades = profile.tradeCount ?? (profile as any).trades_count ?? (profile as any).trades ?? 0;
+
+      // Cálculo de ROI % se disponível no perfil (Volume vs Lucro)
+      const volume = (profile as any).volume ?? (profile as any).totalVolume ?? 0;
+      const roiPercent = volume > 0 ? (totalPnL / volume) * 100 : 0;
+
+      const lastActiveRaw = profile.lastActiveAt ?? (profile as any).last_active_at ?? Date.now();
+      const lastActive = new Date(lastActiveRaw).getTime();
+      const hoursSinceLastActive = (Date.now() - lastActive) / (1000 * 60 * 60);
+
+      log('INFO', `Wallet ${entry.address.slice(0, 8)} -> PnL: $${totalPnL} | WR: ${(winRate * 100).toFixed(1)}% | ROI: ${roiPercent.toFixed(1)}% | Score: ${smartScore} | Trades: ${trades} | Inativo: ${hoursSinceLastActive.toFixed(0)}h`);
+
+      // 🛡️ REGRAS EXIGENTES DE ELITE (Filtro >70%)
+      const ELITE_WIN_RATE = 0.70;            // Mínimo de 70% de taxa de acerto
+      const MIN_REQUIRED_PNL = 3000;          // PnL absoluto significativo
+      const MIN_TRADES = 30;                  // Mínimo 30 trades para evitar sorte de principiante
+      const MAX_INACTIVE_HOURS = 168;         // Ativo nos últimos 7 dias (168h)
+
+      // Critério de Aprovação:
+      // Must-Have: WinRate >= 70% AND Trades >= 30 AND PnL > 0 AND Ativo recentemente
+      const hasEliteWinRate = winRate >= ELITE_WIN_RATE;
+      const hasConsistentHistory = trades >= MIN_TRADES;
+      const isProfitable = totalPnL >= MIN_REQUIRED_PNL;
+      const isRecentlyActive = hoursSinceLastActive <= MAX_INACTIVE_HOURS;
+
+      if (hasEliteWinRate && hasConsistentHistory && isProfitable && isRecentlyActive) {
+        qualified.push(entry.address);
+        log('WALLET', `🐋 🔥 Baleia de Elite Qualificada (>70% WR): ${entry.address.slice(0, 10)}... (PnL: $${Number(totalPnL).toLocaleString()} | WR: ${(winRate * 100).toFixed(1)}% | Trades: ${trades})`);
+      } else {
+        log('INFO', `❌ Rejeitada: EliteWR=${hasEliteWinRate} (${(winRate * 100).toFixed(1)}%), PnLOK=${isProfitable}, TradesOK=${hasConsistentHistory}, ActiveOK=${isRecentlyActive}`);
+      }
+
+      await new Promise(r => setTimeout(r, 250)); // Respeitar rate limits da SDK
+    }
+
+    log('WALLET', `✅ Total de carteiras de elite qualificadas (>70% WR): ${qualified.length}`);
+    return qualified;
+  } catch (err) {
+    log('WARN', `Erro ao carregar Leaderboard de Elite: ${(err as Error).message}`);
+    return [];
+  }
+}
+
+async function refreshWalletCache__(sdk: PolymarketSDK) {
   try {
     log('WALLET', '🔄 A procurar novas carteiras...');
 
@@ -641,6 +718,57 @@ async function refreshWalletCache(sdk: PolymarketSDK) {
     // 3. Atualiza o estado global
     state.followedWallets = followedWalletsCache;
     log('WALLET', `✅ Cache sincronizada. A seguir ${followedWalletsCache.length} carteiras.`);
+    updateDashboard();
+
+  } catch (err) {
+    log('WARN', `⚠️ Erro ao atualizar cache de carteiras: ${(err as Error).message}`);
+  }
+}
+
+async function refreshWalletCache(sdk: PolymarketSDK) {
+  try {
+    log('WALLET', '🔄 A recarregar e revalidar carteiras de elite em tempo real...');
+
+    // 1. Vai buscar a lista atualizada de quem CUMPRE as regras estritas NESTE MOMENTO
+    const freshQualified: string[] | undefined = await whalesQualifiedWallets(sdk);
+
+    if (!freshQualified || freshQualified.length === 0) {
+      log('WARN', '⚠️ A busca de carteiras não retornou resultados. A manter a cache atual por segurança.');
+      return;
+    }
+
+    // 2. Proteção para preservar sempre as tuas 'customWallets' adicionadas manualmente
+    const customWallets = CONFIG.smartMoney.customWallets || [];
+
+    // 3. RECONSTRUÇÃO LIMPA DA CACHE:
+    // Garante que APENAS quem passou na validação recente (ou é custom) fica na lista.
+    // Qualquer baleia que tenha degradado o PnL/WinRate é automaticamente REMOVIDA.
+    const newCache: string[] = [];
+
+    // Adiciona as custom wallets primeiro
+    for (const wallet of customWallets) {
+      if (!newCache.includes(wallet)) newCache.push(wallet);
+    }
+
+    // Adiciona as baleias qualificadas do momento até atingir o limite
+    for (const wallet of freshQualified) {
+      if (!newCache.includes(wallet) && newCache.length < MAX_WALLETS_LIMIT) {
+        newCache.push(wallet);
+      }
+    }
+
+    // Identifica quem foi removido para registar no log
+    const removedWallets = followedWalletsCache.filter(w => !newCache.includes(w));
+    if (removedWallets.length > 0) {
+      log('WALLET', `🧹 A remover ${removedWallets.length} carteiras que perderam performance ou saíram do top.`);
+    }
+
+    // 4. Substitui a cache antiga pela nova cache totalmente filtrada
+    followedWalletsCache = newCache;
+
+    // 5. Atualiza o estado global
+    state.followedWallets = followedWalletsCache;
+    log('WALLET', `✅ Cache sincronizada! A seguir exatamente ${followedWalletsCache.length} carteiras de alta precisão.`);
     updateDashboard();
 
   } catch (err) {
