@@ -950,19 +950,19 @@ export class SmartMoneyService {
 
       // 1. Timeout por duração máxima do trade
       const isTimeout = maxDurationMs !== null && age >= maxDurationMs;
-      
+
       // 2. Leitura da data de termo do mercado
       const marketEndDate = (position as any).endDate;
       const isTimeExpired = marketEndDate && now >= new Date(marketEndDate).getTime();
-      
+
       // 3. Validação estrita de preço resolvido nos extremos (fora do período de graça)
       const isPriceResolved = currentPrice >= 0.999 || (currentPrice <= 0.001 && !isWithinGracePeriod);
-      
+
       // 4. CORREÇÃO: O mercado só fecha por data se o tempo expirou E o preço já estiver resolvido 
       // (evita fechar a -18% só porque a hora teórica do evento passou por uns minutos).
       const isMarketClosed = isPriceResolved || (isTimeExpired && (currentPrice >= 0.90 || currentPrice <= 0.10));
 
-      
+
       // 📈 GESTÃO DE PATAMARES EM ESCADA (TRAILING FLOOR)
       if (!position.isCrypto) {
         if (position.lockedFloor === undefined) {
@@ -1927,10 +1927,213 @@ export class SmartMoneyService {
     };
   }
 
+  async startAutoCopyTrading(options: AutoCopyTradingOptions): Promise<AutoCopyTradingSubscription> {
+    const startTime = Date.now();
+
+    // 1. Resolver a lista de endereços alvo
+    let targetAddresses: string[] = [];
+    if (options.targetAddresses?.length) {
+      targetAddresses = options.targetAddresses.map(a => a.toLowerCase());
+    }
+    if (options.topN && options.topN > 0) {
+      const smartMoneyList = await this.getSmartMoneyList(options.topN);
+      targetAddresses = [...new Set([...targetAddresses, ...smartMoneyList.map(w => w.address)])];
+    }
+    if (targetAddresses.length === 0) {
+      throw new Error('No target addresses. Use targetAddresses or topN.');
+    }
+
+    // 2. Configurações e Estatísticas
+    const stats: AutoCopyTradingStats = {
+      startTime,
+      tradesDetected: 0,
+      tradesExecuted: 0,
+      tradesSkipped: 0,
+      tradesFailed: 0,
+      totalUsdcSpent: 0,
+    };
+
+    const maxSlippage = options.maxSlippage ?? 0.03;
+    const orderType = options.orderType ?? 'FOK';
+    const dryRun = options.dryRun ?? false;
+    const minWhaleValue = options.minWhaleOrderValueUSD ?? 500; // Default: 500 USDC
+
+    // 3. Subscrição ao RealtimeService com callback blindado
+    const subscription = this.realtimeService.subscribeAllActivity({
+      onTrade: async (activityTrade: ActivityTrade) => {
+        let posKey = '';
+
+        try {
+          // --- PASSO A: Validar Endereço e Dados Básicos ---
+          const rawAddress = activityTrade.trader?.address;
+          if (!rawAddress) return;
+          const traderAddress = rawAddress.toLowerCase();
+
+          if (!targetAddresses.includes(traderAddress)) return;
+
+          // 🐋 FILTRO DE CONVICÇÃO DA BALEIA
+          const totalOrderValueUSD = activityTrade.size * activityTrade.price;
+
+          if (totalOrderValueUSD < minWhaleValue) {
+            stats.tradesSkipped++;
+            return;
+          }
+
+          if (options.sideFilter && activityTrade.side !== options.sideFilter) {
+            stats.tradesSkipped++;
+            return;
+          }
+
+          if (options.isCanTrade && !options.isCanTrade() && activityTrade.side === 'BUY') {
+            stats.tradesSkipped++;
+            return;
+          }
+
+          // --- PASSO B: Extrair Token ID ---
+          const tokenId = activityTrade.tokenId || (activityTrade as any).asset;
+          if (!tokenId) {
+            stats.tradesSkipped++;
+            return;
+          }
+
+          const usdcAmount = options.amount() || 1.0;
+
+          // --- PASSO C: Filtro Anti-Duplicação com Segurança Atómica ---
+          if (activityTrade.side === 'BUY' && options.positions) {
+            const rawSlug = activityTrade.marketSlug || (activityTrade as any).market || '';
+            const rawOutcome = activityTrade.outcome || '';
+            const marketSlug = rawSlug.trim().toLowerCase();
+            const outcomeSuffix = rawOutcome ? `-${rawOutcome.trim()}` : '';
+            posKey = `${marketSlug}${outcomeSuffix}`;
+
+            const currentPositions = options.positions();
+
+            // Verifica se a posição já existe OU se já está a ser processada
+            if (currentPositions.has(posKey) || this.processingKeys.has(posKey)) {
+              stats.tradesSkipped++;
+              return;
+            }
+
+            // Bloqueio temporário imediato
+            this.processingKeys.add(posKey);
+          }
+
+          // --- PASSO D: Validação de Orderbook (Slippage / Profundidade) ---
+          let executionPrice = activityTrade.price;
+
+          if (activityTrade.side === 'BUY') {
+            const bookValidation = await this.orderbookService.validateOrderBookSlippage(
+              tokenId,
+              usdcAmount,
+              0.75, // maxAllowedPrice (Teto máximo de preço)
+              0.40  // minAllowedPrice (Piso estratégico: entre 40% e 75%)
+            );
+
+            if (!bookValidation || !bookValidation.isValid) {
+              stats.tradesSkipped++;
+              console.log(`[SmartMoneyService] 🚫 Sinal descartado (${activityTrade.marketSlug}): ${bookValidation?.reason || 'Orderbook inválido'}`);
+
+              // 🛡️ LIMPEZA DA CHAVE: Permite tentar novamente se a liquidez entrar mais tarde
+              if (posKey) this.processingKeys.delete(posKey);
+              return;
+            }
+
+            // Exigir estritamente o preço médio calculado no livro de ordens atual
+            if (bookValidation.averageExecutionPrice && bookValidation.averageExecutionPrice > 0) {
+              executionPrice = bookValidation.averageExecutionPrice;
+            } else {
+              stats.tradesSkipped++;
+              console.log(`[SmartMoneyService] 🚫 Preço médio de execução no livro é inválido.`);
+              if (posKey) this.processingKeys.delete(posKey);
+              return;
+            }
+          }
+
+          const copySize = usdcAmount / executionPrice;
+          stats.tradesDetected++;
+
+          // --- PASSO E: Execução (Dry Run ou Real) ---
+          if (options.delay && options.delay > 0) {
+            await new Promise(resolve => setTimeout(resolve, options.delay));
+          }
+
+          let result: OrderResult;
+          const smartMoneyTrade: SmartMoneyTrade = {
+            traderAddress,
+            traderName: activityTrade.trader?.name,
+            conditionId: activityTrade.conditionId,
+            marketSlug: activityTrade.marketSlug,
+            side: activityTrade.side,
+            size: copySize,
+            price: executionPrice,
+            tokenId,
+            outcome: activityTrade.outcome,
+            txHash: activityTrade.transactionHash,
+            timestamp: activityTrade.timestamp,
+            isSmartMoney: true,
+            smartMoneyInfo: this.smartMoneyCache.get(traderAddress),
+            endDate: activityTrade.endDate,
+          };
+
+          if (dryRun) {
+            result = { success: true, orderId: `dry_run_${Date.now()}` };
+            console.log('[DRY RUN]', {
+              trader: traderAddress.slice(0, 8),
+              side: activityTrade.side,
+              market: activityTrade.marketSlug,
+              price: executionPrice.toFixed(4),
+              copy: { size: copySize.toFixed(2), usdc: usdcAmount.toFixed(2) },
+            });
+          } else {
+            const maxSlippagePrice = executionPrice * (1 + maxSlippage);
+
+            result = await this.tradingService.createMarketOrder({
+              tokenId,
+              side: activityTrade.side,
+              amount: usdcAmount,
+              price: maxSlippagePrice,
+              orderType,
+            });
+          }
+
+          if (result.success) {
+            stats.tradesExecuted++;
+            stats.totalUsdcSpent += usdcAmount;
+          } else {
+            stats.tradesFailed++;
+            // Se a ordem falhar, libertamos a chave
+            if (posKey) this.processingKeys.delete(posKey);
+          }
+
+          options.onTrade?.(smartMoneyTrade, result);
+
+        } catch (error) {
+          // Garantia de limpeza em caso de exceção no fluxo
+          if (posKey) this.processingKeys.delete(posKey);
+          stats.tradesFailed++;
+          options.onError?.(error instanceof Error ? error : new Error(String(error)));
+        }
+      },
+      onError: (error) => {
+        console.error('[SmartMoneyService] Subscription error:', error);
+      },
+    }, targetAddresses);
+
+    return {
+      id: `smart_money_${Date.now()}`,
+      targetAddresses,
+      startTime,
+      isActive: true,
+      stats,
+      stop: () => subscription.unsubscribe(),
+      getStats: () => ({ ...stats }),
+    };
+  }
+
   /**
    * Inicia o copy trading de forma limpa e direta
    */
-  async startAutoCopyTrading(options: AutoCopyTradingOptions): Promise<AutoCopyTradingSubscription> {
+  async startAutoCopyTrading_old(options: AutoCopyTradingOptions): Promise<AutoCopyTradingSubscription> {
     const startTime = Date.now();
 
     // 1. Resolver a lista de endereços alvo

@@ -632,13 +632,22 @@ async function whalesQualifiedWallets(sdk: PolymarketSDK): Promise<string[]> {
       if (qualified.length >= 15) break;
       if (qualified.includes(entry.address)) continue;
 
+      // 🔍 1. Captura de Volume DIRETAMENTE do entry do Leaderboard
+      const volume = Number(
+        entry.volume ??
+        (entry as any).totalVolume ??
+        (entry as any).amountTraded ??
+        (entry as any).volumeUsd ??
+        0
+      );
+
       const profile: WalletProfile | null = await sdk.wallets.getWalletProfile(entry.address);
       if (!profile) {
         log('INFO', `⚠️ Perfil não encontrado para ${entry.address.slice(0, 10)}...`);
         continue;
       }
 
-      // 🔍 Captura flexível de propriedades
+      // 🔍 2. Captura flexível de propriedades do perfil
       const rawWinRate = profile.winRate ?? (profile as any).win_rate ?? 0;
       // Normaliza winRate para formato decimal (ex: se vier 70 em vez de 0.70)
       const winRate = rawWinRate > 1 ? rawWinRate / 100 : rawWinRate;
@@ -647,25 +656,26 @@ async function whalesQualifiedWallets(sdk: PolymarketSDK): Promise<string[]> {
       const smartScore = profile.smartScore ?? (profile as any).smart_score ?? 0;
       const trades = profile.tradeCount ?? (profile as any).trades_count ?? (profile as any).trades ?? 0;
 
-      // Cálculo de ROI % se disponível no perfil (Volume vs Lucro)
-      
-      const volume = (profile as any).volume ?? (profile as any).totalVolume ?? 0;
+      // 📊 3. Cálculo do ROI % baseado no volume real do Leaderboard
       const roiPercent = volume > 0 ? (totalPnL / volume) * 100 : 0;
 
       const lastActiveRaw = profile.lastActiveAt ?? (profile as any).last_active_at ?? Date.now();
       const lastActive = new Date(lastActiveRaw).getTime();
       const hoursSinceLastActive = (Date.now() - lastActive) / (1000 * 60 * 60);
 
-      log('INFO', `Wallet ${entry.address.slice(0, 8)} -> PnL: $${totalPnL} | WR: ${(winRate * 100).toFixed(1)}% | ROI: ${roiPercent.toFixed(1)}% | Score: ${smartScore} | Trades: ${trades} | Inativo: ${hoursSinceLastActive.toFixed(0)}h`);
+      // Log de diagnóstico completo e limpo com ROI real e Volume
+      log(
+        'INFO',
+        `Wallet ${entry.address.slice(0, 8)} -> PnL: $${totalPnL} | WR: ${(winRate * 100).toFixed(1)}% | ROI: ${roiPercent.toFixed(1)}% | Vol: $${Number(volume).toLocaleString()} | Score: ${smartScore} | Trades: ${trades} | Inativo: ${hoursSinceLastActive.toFixed(0)}h`
+      );
 
       // 🛡️ REGRAS EXIGENTES DE ELITE (Filtro >70%)
       const ELITE_WIN_RATE = 0.70;            // Mínimo de 70% de taxa de acerto
-      const MIN_REQUIRED_PNL = 3000;          // PnL absoluto significativo
+      const MIN_REQUIRED_PNL = 3000;          // PnL absoluto significativo ($3,000)
       const MIN_TRADES = 30;                  // Mínimo 30 trades para evitar sorte de principiante
       const MAX_INACTIVE_HOURS = 168;         // Ativo nos últimos 7 dias (168h)
 
       // Critério de Aprovação:
-      // Must-Have: WinRate >= 70% AND Trades >= 30 AND PnL > 0 AND Ativo recentemente
       const hasEliteWinRate = winRate >= ELITE_WIN_RATE;
       const hasConsistentHistory = trades >= MIN_TRADES;
       const isProfitable = totalPnL >= MIN_REQUIRED_PNL;
@@ -673,9 +683,15 @@ async function whalesQualifiedWallets(sdk: PolymarketSDK): Promise<string[]> {
 
       if (hasEliteWinRate && hasConsistentHistory && isProfitable && isRecentlyActive) {
         qualified.push(entry.address);
-        log('WALLET', `🐋 🔥 Baleia de Elite Qualificada (>70% WR): ${entry.address.slice(0, 10)}... (PnL: $${Number(totalPnL).toLocaleString()} | WR: ${(winRate * 100).toFixed(1)}% | Trades: ${trades})`);
+        log(
+          'WALLET',
+          `🐋 🔥 Baleia de Elite Qualificada (>70% WR): ${entry.address.slice(0, 10)}... (PnL: $${Number(totalPnL).toLocaleString()} | WR: ${(winRate * 100).toFixed(1)}% | ROI: ${roiPercent.toFixed(1)}% | Trades: ${trades})`
+        );
       } else {
-        log('INFO', `❌ Rejeitada: EliteWR=${hasEliteWinRate} (${(winRate * 100).toFixed(1)}%), PnLOK=${isProfitable}, TradesOK=${hasConsistentHistory}, ActiveOK=${isRecentlyActive}`);
+        log(
+          'INFO',
+          `❌ Rejeitada: EliteWR=${hasEliteWinRate} (${(winRate * 100).toFixed(1)}%), PnLOK=${isProfitable}, TradesOK=${hasConsistentHistory}, ActiveOK=${isRecentlyActive}`
+        );
       }
 
       await new Promise(r => setTimeout(r, 250)); // Respeitar rate limits da SDK
