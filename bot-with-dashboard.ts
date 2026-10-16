@@ -1980,7 +1980,7 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
       updateDashboard();
 
       const durationMs = Date.now() - cycleStartTime;
-      log('INFO', `[PortfolioManager] ✅ Sincronização concluída em ${(durationMs / 1000).toFixed(2)}s. Próxima em 30s.`);
+      //log('INFO', `[PortfolioManager] ✅ Sincronização concluída em ${(durationMs / 1000).toFixed(2)}s. Próxima em 30s.`);
 
     } catch (err: any) {
       log('WARN', `[PortfolioManager] ❌ Erro na sincronização periódica: ${err.message}`);
