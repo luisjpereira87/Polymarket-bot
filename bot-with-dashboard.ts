@@ -13,14 +13,12 @@ import { dashboardEmitter, startDashboard } from './src/dashboard/index.js';
 import type { BotConfig, BotState, DipArbSignal, LogLevel, SmartMoneySignal } from './src/dashboard/types.js';
 import {
   ArbitrageService,
-  MarketToken,
   OnchainService,
   OrderResult,
   PolymarketSDK,
   Position,
   SwapService,
   TradePositions,
-  UnifiedMarket,
   WalletProfile,
   type SmartMoneyTrade
 } from './src/index.js';
@@ -1467,6 +1465,7 @@ async function updateBalances(sdk: PolymarketSDK) {
   try {
     const balances = await swapService.getBalances();
     const polymarketBalances = await sdk.tradingService.getPolymarketBalances()
+
     let changed = false;
 
     for (const b of balances) {
@@ -1593,12 +1592,6 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
     },
     {
       onTrade: async (trade, result) => {
-        // Aqui lidas com a execução através da tua função unificada que atualiza o dashboard e o portfólio
-        /**
-        if (trade.marketSlug) {
-          await updatePricesCache(sdk, trade.marketSlug);
-        }
-        **/
         processTradeExecution(sdk, trade, result);
       }
     }
@@ -1647,146 +1640,6 @@ function isCryptoPosition(title?: string, slug?: string, eventSlug?: string): bo
   return cryptoKeywords.some(keyword => searchableText.includes(keyword));
 }
 
-async function setupPortfolioManager__(sdk: PolymarketSDK) {
-  log('INFO', 'Iniciando Gestor de Portfólio...');
-
-  // 🛡️ Modo Dry Run: Ignora a sincronização com a blockchain/API real para preservar posições virtuais locais
-  if (CONFIG.dryRun) {
-    log('INFO', '🛡️ Modo Dry Run ativo: Gestor de portfólio a operar exclusivamente com posições virtuais.');
-    return;
-  }
-
-  const targetWalletAddress = process.env.POLYMARKET_FUNDER_ADDRESS || '';
-
-  try {
-    const positions = await sdk.wallets.getWalletPositions(targetWalletAddress);
-    state.positions = positions;
-
-    realPositions.clear();
-
-    for (const p of positions) {
-      const size = Number(p.size) || 0;
-      const avgPrice = Number(p.avgPrice) || 0;
-      const marketSlug = p.slug || p.eventSlug;
-      const outcome = p.outcome;
-      const outcomeSuffix = outcome ? `-${outcome}` : '';
-      const posKey = `${marketSlug}${outcomeSuffix}`;
-      const tokenId = p.asset || p.tokenId;
-      const endDate = parseEndDate(p.endDate, marketSlug);
-
-      if (size > 0 && marketSlug) {
-        realPositions.set(posKey, {
-          marketSlug: marketSlug,
-          outcome: outcome,
-          side: 'BUY',
-          size: size,
-          avgEntryPrice: avgPrice,
-          timestamp: Date.now(),
-          traderAddress: p.proxyWallet || targetWalletAddress,
-          tokenId: tokenId,
-          endDate: endDate,
-          isCrypto: isCryptoPosition(p.title, p.slug, p.eventSlug)
-        });
-      }
-    }
-
-    log('WALLET', `Sincronizadas ${positions.length} posições existentes.`);
-    updateDashboard();
-  } catch (err: any) {
-    log('WARN', `Sincronização de Portfólio falhou: ${err.message}`);
-  }
-
-  setInterval(async () => {
-    // Dupla segurança caso o Dry Run seja ativado em runtime
-    if (CONFIG.dryRun) return;
-
-    try {
-      const positions: Position[] = await sdk.wallets.getWalletPositions(targetWalletAddress);
-
-      const enrichedPositions: EnrichedPosition[] = await Promise.all(positions.map(async (pos: EnrichedPosition) => {
-        try {
-          const market: UnifiedMarket = await sdk.markets.getMarket(pos.conditionId);
-          if (market) {
-            pos.marketClosed = market.closed;
-            const token = market.tokens.find((t: any) => t.tokenId === pos.asset);
-            if (token) {
-              pos.isWinner = token.winner || false;
-              pos.curPrice = token.price || 0;
-            }
-          }
-        } catch (e) { }
-        return pos;
-      }));
-
-      const activeKeysInThisRound = new Set<string>();
-
-      for (const p of enrichedPositions) {
-        const size = Number(p.size) || 0;
-        const avgPrice = Number(p.avgPrice) || 0;
-        const currentPrice = Number(p.curPrice) || 0;
-        const marketSlug = p.slug || p.eventSlug;
-        const outcome = p.outcome;
-        const outcomeSuffix = outcome ? `-${outcome}` : '';
-        const posKey = `${marketSlug}${outcomeSuffix}`;
-        const tokenId = p.asset || p.tokenId;
-
-        const isResolved = p.marketClosed === true || currentPrice >= 0.999 || currentPrice <= 0.001;
-
-        if (size > 0 && marketSlug && !isResolved) {
-          activeKeysInThisRound.add(posKey);
-
-          if (realPositions.has(posKey)) {
-            const existing = realPositions.get(posKey);
-            if (existing) {
-              existing.size = size;
-              existing.avgEntryPrice = avgPrice;
-              existing.tokenId = tokenId;
-              existing.endDate = parseEndDate(p.endDate, marketSlug);
-              existing.isCrypto = isCryptoPosition(p.title, p.slug, p.eventSlug);
-            }
-          } else {
-            realPositions.set(posKey, {
-              marketSlug: marketSlug,
-              outcome: outcome,
-              side: 'BUY',
-              size: size,
-              avgEntryPrice: avgPrice,
-              timestamp: Date.now(),
-              traderAddress: p.proxyWallet || targetWalletAddress,
-              tokenId: tokenId,
-              endDate: parseEndDate(p.endDate, marketSlug),
-              isCrypto: isCryptoPosition(p.title, p.slug, p.eventSlug)
-            });
-          }
-        }
-      }
-
-      for (const existingKey of realPositions.keys()) {
-        if (!activeKeysInThisRound.has(existingKey)) {
-          realPositions.delete(existingKey);
-          console.log(`[PortfolioManager] 🧹 Posição órfã/fechada ${existingKey} limpa do mapa local.`);
-        }
-      }
-
-      let unrealized = 0;
-      for (const p of enrichedPositions) {
-        const entry = Number(p.avgPrice) || 0;
-        const current = Number(p.curPrice) || 0;
-        const size = Number(p.size) || 0;
-
-        if (current > 0 && size > 0 && !p.marketClosed) {
-          unrealized += (current - entry) * size;
-        }
-      }
-      state.unrealizedPnL = unrealized;
-      state.positions = enrichedPositions.filter(p => !p.marketClosed);
-      updateDashboard();
-    } catch (err: any) {
-      log('WARN', `Erro de sincronização de posições: ${err.message}`);
-    }
-  }, 30 * 1000);
-}
-
 async function setupPortfolioManager(sdk: PolymarketSDK) {
   log('INFO', 'Iniciando Gestor de Portfólio...');
 
@@ -1800,7 +1653,6 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
     log('WARN', '⚠️ POLYMARKET_FUNDER_ADDRESS não está definido nas variáveis de ambiente!');
   }
 
-  // Helper seguro para gerar posKey consistente
   const getPosKey = (p: any): string | null => {
     const slug = p.slug || p.eventSlug || p.marketSlug;
     if (!slug) return null;
@@ -1808,342 +1660,155 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
     return `${slug}${outcome}`;
   };
 
-  // 🛡️ Sincronização inicial protegida com Timeout para não travar o arranque
-  try {
-    log('INFO', `[PortfolioManager] A obter posições iniciais para a carteira ${targetWalletAddress}...`);
+  // Helper seguro para obter posições da carteira com timeout
+  const fetchPositionsWithTimeout = async () => {
+    return Promise.race([
+      sdk.wallets.getWalletPositions(targetWalletAddress),
+      new Promise<Position[]>((_, reject) =>
+        setTimeout(() => reject(new Error('Timeout ao obter posições (10s)')), 10000)
+      )
+    ]);
+  };
 
-    const fetchInitialPositions = async () => {
-      return Promise.race([
-        sdk.wallets.getWalletPositions(targetWalletAddress),
-        new Promise<Position[]>((_, reject) =>
-          setTimeout(() => reject(new Error('Timeout inicial ao obter posições (10s)')), 10000)
-        )
-      ]);
-    };
+  const fetchMarketWithTimeout = async (conditionId: string) => {
+    return Promise.race([
+      sdk.markets.getMarket(conditionId),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`Timeout getMarket (${conditionId})`)), 5000)
+      )
+    ]);
+  };
 
-    const positions = await fetchInitialPositions();
-    state.positions = positions || [];
+  // 🛡️ Sincronização e Enriquecimento Unificado
+  const syncAndEnrichPortfolio = async () => {
+    const rawPositions = await fetchPositionsWithTimeout();
+    if (!rawPositions || rawPositions.length === 0) {
+      realPositions.clear();
+      state.positions = [];
+      updateDashboard();
+      return;
+    }
 
-    realPositions.clear();
+    // 1. Enriquecer posições via REST (com tratamento de exceção seguro)
+    const enrichedPositions: EnrichedPosition[] = await Promise.all(
+      rawPositions.map(async (pos: EnrichedPosition) => {
+        try {
+          if (pos.conditionId) {
+            const market: any = await fetchMarketWithTimeout(pos.conditionId);
+            if (market) {
+              pos.marketClosed = market.closed || !market.active;
+              const token = market.tokens?.find((t: any) => t.tokenId === (pos.asset || pos.tokenId));
+              if (token) {
+                pos.isWinner = token.winner || false;
+                pos.curPrice = Number(token.price);
+              }
+            }
+          }
+        } catch (e: any) {
+          // Em caso de falha no getMarket, tenta validar pelo preço direto se existir
+        }
+        return pos;
+      })
+    );
 
-    if (positions && positions.length > 0) {
-      for (const p of positions) {
-        const size = Number(p.size) || 0;
-        const avgPrice = Number(p.avgPrice) || 0;
-        const posKey = getPosKey(p);
-        const marketSlug = p.slug || p.eventSlug;
-        const tokenId = p.asset || p.tokenId;
-        const endDate = parseEndDate(p.endDate, marketSlug);
+    const activeKeysInThisRound = new Set<string>();
 
-        if (size > 0 && posKey && marketSlug) {
-          realPositions.set(posKey, {
-            marketSlug,
-            outcome: p.outcome,
-            side: 'BUY',
-            size,
-            avgEntryPrice: avgPrice,
-            timestamp: Date.now(),
-            traderAddress: p.proxyWallet || targetWalletAddress,
-            tokenId,
-            endDate,
-            isCrypto: isCryptoPosition(p.title, p.slug, p.eventSlug)
-          });
+    // 2. Mapear apenas posições VERDADEIRAMENTE ATIVAS
+    for (const p of enrichedPositions) {
+      const size = Number(p.size) || 0;
+      const avgPrice = Number(p.avgPrice) || 0;
+      const posKey = getPosKey(p);
+      const marketSlug = p.slug || p.eventSlug;
+      const tokenId = p.asset || p.tokenId;
+
+      const hasValidPrice = p.curPrice !== undefined && p.curPrice !== null && p.curPrice > 0;
+
+      // 🟢 FILTRO RIGOROSO DE RESOLUÇÃO:
+      // Se o mercado está fechado, ou o preço está a 0 ou 1, considera resolvido!
+      const isResolved = p.marketClosed === true || (hasValidPrice && (p.curPrice! >= 0.999 || p.curPrice! <= 0.001));
+
+      if (size > 0 && posKey && marketSlug && !isResolved) {
+        activeKeysInThisRound.add(posKey);
+
+        const posData = {
+          marketSlug,
+          outcome: p.outcome,
+          side: 'BUY' as const,
+          size,
+          avgEntryPrice: avgPrice,
+          timestamp: Date.now(),
+          traderAddress: p.proxyWallet || targetWalletAddress,
+          tokenId,
+          endDate: parseEndDate(p.endDate, marketSlug),
+          isCrypto: isCryptoPosition(p.title, p.slug, p.eventSlug)
+        };
+
+        if (realPositions.has(posKey)) {
+          const existing = realPositions.get(posKey);
+          if (existing) {
+            Object.assign(existing, posData);
+          }
+        } else {
+          realPositions.set(posKey, posData);
         }
       }
     }
 
-    log('WALLET', `Sincronizadas ${realPositions.size} posições existentes.`);
+    // 3. Limpeza de posições órfãs / encerradas
+    for (const existingKey of realPositions.keys()) {
+      if (!activeKeysInThisRound.has(existingKey)) {
+        realPositions.delete(existingKey);
+        log('INFO', `[PortfolioManager] 🧹 Posição fechada/resolvida ${existingKey} removida da monitorização.`);
+      }
+    }
+
+    // 4. Atualizar Métricas e Estado
+    let unrealized = 0;
+    for (const p of enrichedPositions) {
+      const entry = Number(p.avgPrice) || 0;
+      const current = Number(p.curPrice) || 0;
+      const size = Number(p.size) || 0;
+
+      if (current > 0 && size > 0 && !p.marketClosed) {
+        unrealized += (current - entry) * size;
+      }
+    }
+
+    state.unrealizedPnL = unrealized;
+    state.positions = enrichedPositions.filter(p => !p.marketClosed && Number(p.size) > 0);
     updateDashboard();
+  };
+
+  // --- ARRANQUE E LOOP ---
+  try {
+    log('INFO', `[PortfolioManager] A sincronizar posições para carteira ${targetWalletAddress}...`);
+    await syncAndEnrichPortfolio();
+    log('WALLET', `Sincronizadas ${realPositions.size} posições ativas.`);
   } catch (err: any) {
-    log('WARN', `Sincronização inicial de Portfólio falhou: ${err.message}. A continuar com posições vazias...`);
+    log('WARN', `Sincronização inicial falhou: ${err.message}.`);
   }
 
-  // --- LOOP RECURSIVO CONTROLADO (A cada 30 segundos) ---
   const SYNC_INTERVAL_MS = 30 * 1000;
-
+  let syncCycleCounter = 0;
   const runSyncCycle = async () => {
     if (CONFIG.dryRun) return;
-
     const cycleStartTime = Date.now();
 
     try {
-      const fetchPositionsWithTimeout = async () => {
-        return Promise.race([
-          sdk.wallets.getWalletPositions(targetWalletAddress),
-          new Promise<Position[]>((_, reject) =>
-            setTimeout(() => reject(new Error('Timeout ao obter posições da carteira')), 10000)
-          )
-        ]);
-      };
-
-      const positions = await fetchPositionsWithTimeout();
-
-      if (!positions || positions.length === 0) {
-        // Se a carteira estiver vazia, limpa o estado com segurança
-        state.positions = [];
-        updateDashboard();
-        return;
-      }
-
-      const fetchMarketWithTimeout = async (conditionId: string) => {
-        return Promise.race([
-          sdk.markets.getMarket(conditionId),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error(`Timeout getMarket no conditionId: ${conditionId}`)), 8000)
-          )
-        ]);
-      };
-
-      const enrichedPositions: EnrichedPosition[] = await Promise.all(
-        positions.map(async (pos: EnrichedPosition) => {
-          try {
-            if (pos.conditionId) {
-              const market: any = await fetchMarketWithTimeout(pos.conditionId);
-              if (market) {
-                pos.marketClosed = market.closed;
-                const token = market.tokens?.find((t: any) => t.tokenId === (pos.asset || pos.tokenId));
-                if (token) {
-                  pos.isWinner = token.winner || false;
-                  pos.curPrice = Number(token.price);
-                }
-              }
-            }
-          } catch (e: any) {
-            // Ignora falhas individuais para não afetar o lote
-          }
-          return pos;
-        })
-      );
-
-      const activeKeysInThisRound = new Set<string>();
-
-      for (const p of enrichedPositions) {
-        const size = Number(p.size) || 0;
-        const avgPrice = Number(p.avgPrice) || 0;
-        const posKey = getPosKey(p);
-        const marketSlug = p.slug || p.eventSlug;
-        const tokenId = p.asset || p.tokenId;
-
-        const hasValidPrice = p.curPrice !== undefined && p.curPrice !== null && p.curPrice > 0;
-        const isResolved = p.marketClosed === true || (hasValidPrice && p.curPrice! >= 0.999);
-
-        if (size > 0 && posKey && marketSlug && !isResolved) {
-          activeKeysInThisRound.add(posKey);
-
-          if (realPositions.has(posKey)) {
-            const existing = realPositions.get(posKey);
-            if (existing) {
-              existing.size = size;
-              existing.avgEntryPrice = avgPrice;
-              existing.tokenId = tokenId;
-              existing.endDate = parseEndDate(p.endDate, marketSlug);
-              existing.isCrypto = isCryptoPosition(p.title, p.slug, p.eventSlug);
-            }
-          } else {
-            realPositions.set(posKey, {
-              marketSlug,
-              outcome: p.outcome,
-              side: 'BUY',
-              size,
-              avgEntryPrice: avgPrice,
-              timestamp: Date.now(),
-              traderAddress: p.proxyWallet || targetWalletAddress,
-              tokenId,
-              endDate: parseEndDate(p.endDate, marketSlug),
-              isCrypto: isCryptoPosition(p.title, p.slug, p.eventSlug)
-            });
-          }
-        }
-      }
-
-      // Limpeza de posições órfãs
-      for (const existingKey of realPositions.keys()) {
-        if (!activeKeysInThisRound.has(existingKey)) {
-          realPositions.delete(existingKey);
-          console.log(`[PortfolioManager] 🧹 Posição órfã/fechada ${existingKey} limpa do mapa local.`);
-        }
-      }
-
-      let unrealized = 0;
-      for (const p of enrichedPositions) {
-        const entry = Number(p.avgPrice) || 0;
-        const current = Number(p.curPrice) || 0;
-        const size = Number(p.size) || 0;
-
-        if (current > 0 && size > 0 && !p.marketClosed) {
-          unrealized += (current - entry) * size;
-        }
-      }
-
-      state.unrealizedPnL = unrealized;
-      state.positions = enrichedPositions.filter(p => !p.marketClosed);
-      updateDashboard();
-
+      await syncAndEnrichPortfolio();
       const durationMs = Date.now() - cycleStartTime;
-      //log('INFO', `[PortfolioManager] ✅ Sincronização concluída em ${(durationMs / 1000).toFixed(2)}s. Próxima em 30s.`);
-
+      syncCycleCounter++;
+      if (syncCycleCounter === 1 || syncCycleCounter % 20 === 0) {
+        log('INFO', `[PortfolioManager] ✅ Sincronização concluída em ${(durationMs / 1000).toFixed(2)}s. (Ciclo #${syncCycleCounter})`);
+      }
     } catch (err: any) {
-      log('WARN', `[PortfolioManager] ❌ Erro na sincronização periódica: ${err.message}`);
+      log('WARN', `[PortfolioManager] ❌ Erro no ciclo de sincronização: ${err.message}`);
     } finally {
-      // Agenda o próximo ciclo garantindo os 30s de intervalo limpo
       setTimeout(runSyncCycle, SYNC_INTERVAL_MS);
     }
   };
 
-  // Arranca o primeiro ciclo periódico após 30 segundos
   setTimeout(runSyncCycle, SYNC_INTERVAL_MS);
-}
-
-
-async function startExpirationWatchdog__(sdk: PolymarketSDK, intervalMs: number = 60 * 1000) {
-  setInterval(async () => {
-    const nowMs = Date.now();
-
-    for (const [posKey, position] of realPositions.entries()) {
-      if (!position.endDate) continue;
-
-      // 🛡 Blindagem: Garantir conversão segura para milissegundos
-      const endTimeMs = typeof position.endDate === 'number'
-        ? position.endDate
-        : new Date(position.endDate).getTime();
-
-      if (isNaN(endTimeMs)) {
-        console.log('WARN', `⚠️ [WATCHDOG] Data de fecho inválida para a posição ${posKey}`);
-        continue;
-      }
-
-      // Se o mercado já passou da data de fecho
-      if (nowMs >= endTimeMs) {
-        console.log(`⏰ [WATCHDOG] O mercado da posição ${posKey} expirou. A verificar resultado...`);
-
-        let finalPrice = 0;
-        let marketResolved = false;
-
-        try {
-          const fullMarket = await sdk.markets.getMarket(position.marketSlug);
-
-          if (fullMarket && fullMarket.tokens) {
-            const targetToken = fullMarket.tokens.find((t: MarketToken) =>
-              t.tokenId === position.tokenId || t.outcome === position.outcome
-            );
-
-            if (targetToken) {
-              if (targetToken.winner === true) {
-                finalPrice = 1.00;
-                marketResolved = true;
-              } else if (targetToken.winner === false) {
-                finalPrice = 0.00;
-                marketResolved = true;
-              }
-            }
-          }
-        } catch (err) {
-          console.log('WARN', `⚠️️ [WATCHDOG] Falha ao consultar o token para ${posKey}: ${(err as Error).message}`);
-        }
-
-        // Se a API ainda não marcou o winner, saltamos este ciclo e tentamos no próximo
-        // para evitar liquidar com base em preços flutuantes de último minuto
-        if (!marketResolved) {
-          console.log(`⏳ [WATCHDOG] Posição ${posKey} expirada mas mercado ainda não liquidado na API. A tentar no próximo ciclo...`);
-          continue;
-        }
-
-        const expiredSellTrade: SmartMoneyTrade = {
-          traderAddress: position.traderAddress || 'Watchdog-Expiry',
-          marketSlug: position.marketSlug,
-          side: 'SELL',
-          size: position.size,
-          price: finalPrice,
-          tokenId: position.tokenId,
-          traderName: 'Watchdog (Auto-Close)',
-          timestamp: nowMs,
-          isSmartMoney: false,
-          endDate: position.endDate,
-          outcome: position.outcome
-        };
-
-        processTradeExecution(sdk, expiredSellTrade, { success: true });
-
-        // Remover a posição do mapa para não repetir o ciclo
-        realPositions.delete(posKey);
-
-        console.log(`🏁 [WATCHDOG] Posição ${posKey} liquidada por expiração. Resultado: $${finalPrice.toFixed(2)}`);
-      }
-    }
-  }, intervalMs);
-}
-
-async function startExpirationWatchdog(sdk: PolymarketSDK, intervalMs: number = 60 * 1000) {
-  setInterval(async () => {
-    const nowMs = Date.now();
-
-    for (const [posKey, position] of realPositions.entries()) {
-      if (!position.endDate) continue;
-
-      // 🛡 Blindagem: Garantir conversão segura para milissegundos
-      const endTimeMs = typeof position.endDate === 'number'
-        ? position.endDate
-        : new Date(position.endDate).getTime();
-
-      if (isNaN(endTimeMs)) {
-        console.log('WARN', `⚠️ [WATCHDOG] Data de fecho inválida para a posição ${posKey}`);
-        continue;
-      }
-
-      // Se o mercado já passou da data de fecho
-      if (nowMs >= endTimeMs) {
-        console.log(`⏰ [WATCHDOG] O mercado da posição ${posKey} expirou. A verificar preço final no Orderbook...`);
-
-        let finalPrice = 0;
-        let marketResolved = false;
-
-        try {
-          if (position.tokenId) {
-            // Vai direto ao orderbook buscar o preço real de saída (Best Bid)
-            const bestBid = await sdk.orderbook.getBestBidPrice(position.tokenId);
-
-            if (bestBid !== null && bestBid >= 0) {
-              finalPrice = bestBid;
-              marketResolved = true;
-
-              // Se o preço bateu nos extremos, normalizamos para a resolução exata
-              if (finalPrice >= 0.99) finalPrice = 1.00;
-              if (finalPrice <= 0.01) finalPrice = 0.00;
-            }
-          }
-        } catch (err) {
-          console.log('WARN', `⚠️ [WATCHDOG] Falha ao consultar orderbook para ${posKey}: ${(err as Error).message}`);
-        }
-
-        // Se por algum motivo o orderbook falhar completamente, damos mais um ciclo
-        if (!marketResolved) {
-          console.log(`⏳ [WATCHDOG] Posição ${posKey} expirada mas sem resposta do orderbook. A tentar no próximo ciclo...`);
-          continue;
-        }
-
-        const expiredSellTrade: SmartMoneyTrade = {
-          traderAddress: position.traderAddress || 'Watchdog-Expiry',
-          marketSlug: position.marketSlug,
-          side: 'SELL',
-          size: position.size,
-          price: finalPrice,
-          tokenId: position.tokenId,
-          traderName: 'Watchdog (Auto-Close)',
-          timestamp: nowMs,
-          isSmartMoney: false,
-          endDate: position.endDate,
-          outcome: position.outcome
-        };
-
-        processTradeExecution(sdk, expiredSellTrade, { success: true });
-
-        // Remover a posição do mapa para não repetir o ciclo
-        realPositions.delete(posKey);
-
-        console.log(`🏁 [WATCHDOG] Posição ${posKey} liquidada por expiração. Preço Final: $${finalPrice.toFixed(2)}`);
-      }
-    }
-  }, intervalMs);
 }
 
 function calculateDynamicTradeAmount(
