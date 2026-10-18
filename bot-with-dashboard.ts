@@ -82,7 +82,7 @@ let CONFIG = {
     minTradeSize: 1.0,         // 🚨 CRÍTICO: Baixado de 10 para 1.0 (Não descarta ordens pequenas!)
     maxTradeSize: 10.0,
     delay: 200,                // Reduzido de 500ms para 200ms de latência
-    minWhaleOrderValueUSD: 1000,
+    minWhaleOrderValueUSD: 100,
     minTradeValueUSD: 1.0,
     customWallets: [
       '0xc2e7800b5af46e6093872b177b7a5e7f0563be51',
