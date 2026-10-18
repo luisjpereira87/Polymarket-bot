@@ -998,7 +998,8 @@ export class SmartMoneyService {
       const effectiveFloor = isWithinGracePeriod ? false : isFloorTriggered;
       const effectiveTakeProfit = isWithinGracePeriod ? false : isTakeProfitTarget;
 
-      const shouldExit = effectiveTakeProfit || effectiveFloor || effectiveStopLoss || isTimeout || isMarketClosed;
+      //const shouldExit = effectiveTakeProfit || effectiveFloor || effectiveStopLoss || isTimeout || isMarketClosed;
+      const shouldExit =  isTimeout || isMarketClosed;
 
       if (shouldExit) {
         let actionType = '🎯 Take-Profit';
