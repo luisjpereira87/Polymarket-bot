@@ -907,7 +907,8 @@ export class SmartMoneyService {
     } = {}
   ): Promise<{ id: string; unsubscribe: () => void }> {
     const takeProfit = options.takeProfitPercent ?? 100.0;
-    const stopLoss = options.stopLossPercent ?? -50.0;
+    //const stopLoss = options.stopLossPercent ?? -50.0;
+    const stopLoss = options.stopLossPercent ?? -40.0;
     const maxDurationMs = options.maxTradeDurationMinutes ? options.maxTradeDurationMinutes * 60 * 1000 : null;
     const gracePeriodMs = (options.stopLossGracePeriodSeconds ?? 30) * 1000;
     const dryRun = options.dryRun ?? false;
@@ -964,6 +965,7 @@ export class SmartMoneyService {
 
 
       // 📈 GESTÃO DE PATAMARES EM ESCADA (TRAILING FLOOR)
+      /** 
       if (!position.isCrypto) {
         if (position.lockedFloor === undefined) {
           position.lockedFloor = -1;
@@ -983,14 +985,14 @@ export class SmartMoneyService {
           console.log(`🛡 [Escada] ${posKey} atingiu 25%! Piso seguro trancado no Breakeven (0%).`);
         }
       }
-
+      **/
       const posWithFloor = position as { lockedFloor?: number };
       const floorValue = posWithFloor.lockedFloor ?? -1;
 
       // Regras voluntárias de saída (Sujeitas ao Período de Graça)
-      const isTakeProfitTarget = !position.isCrypto ? (pnlPercent >= takeProfit) : false;
-      const isFloorTriggered = !position.isCrypto ? (floorValue >= 0 && pnlPercent <= floorValue && pnlPercent >= 0) : false;
-      const isStopLoss = !position.isCrypto ? (pnlPercent <= stopLoss) : false;
+      const isTakeProfitTarget = pnlPercent >= takeProfit;
+      const isFloorTriggered = floorValue >= 0 && pnlPercent <= floorValue && pnlPercent >= 0;
+      const isStopLoss = pnlPercent <= stopLoss;
 
       // 🎯 SE AINDA ESTIVER NO PERÍODO DE GRAÇA, ignora Stop-Loss e Trailing Floor,
       // mas PERMITE fecho se o mercado expirou/resolveu ou deu Timeout.
@@ -999,7 +1001,7 @@ export class SmartMoneyService {
       const effectiveTakeProfit = isWithinGracePeriod ? false : isTakeProfitTarget;
 
       //const shouldExit = effectiveTakeProfit || effectiveFloor || effectiveStopLoss || isTimeout || isMarketClosed;
-      const shouldExit =  isTimeout || isMarketClosed;
+      const shouldExit =  effectiveStopLoss || isTimeout || isMarketClosed;
 
       if (shouldExit) {
         let actionType = '🎯 Take-Profit';
@@ -1042,11 +1044,11 @@ export class SmartMoneyService {
 
             const rawTargetPrice = livePrice * slippageMultiplier;
             const adjustedPrice = Math.max(0.01, Number(rawTargetPrice.toFixed(2)));
-
+            const cleanShares = Number(exitShares.toFixed(2));
             result = await this.tradingService.createMarketOrder({
               tokenId,
               side: 'SELL',
-              amount: exitShares,
+              amount: cleanShares,
               price: adjustedPrice,
               orderType: 'FAK',
             });
