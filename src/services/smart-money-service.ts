@@ -908,7 +908,7 @@ export class SmartMoneyService {
   ): Promise<{ id: string; unsubscribe: () => void }> {
     const takeProfit = options.takeProfitPercent ?? 100.0;
     //const stopLoss = options.stopLossPercent ?? -50.0;
-    const stopLoss = options.stopLossPercent ?? -40.0;
+    const stopLoss = -40.0;
     const maxDurationMs = options.maxTradeDurationMinutes ? options.maxTradeDurationMinutes * 60 * 1000 : null;
     const gracePeriodMs = (options.stopLossGracePeriodSeconds ?? 30) * 1000;
     const dryRun = options.dryRun ?? false;
@@ -965,27 +965,26 @@ export class SmartMoneyService {
 
 
       // 📈 GESTÃO DE PATAMARES EM ESCADA (TRAILING FLOOR)
-      /** 
-      if (!position.isCrypto) {
-        if (position.lockedFloor === undefined) {
-          position.lockedFloor = -1;
-        }
-
-        if (pnlPercent >= 100 && position.lockedFloor < 75) {
-          position.lockedFloor = 75;
-          console.log(`🚀 [Escada] ${posKey} atingiu 100%! Piso de lucro trancado nos 75%.`);
-        } else if (pnlPercent >= 75 && position.lockedFloor < 50) {
-          position.lockedFloor = 50;
-          console.log(`📈 [Escada] ${posKey} atingiu 75%! Piso de lucro trancado nos 50%.`);
-        } else if (pnlPercent >= 50 && position.lockedFloor < 25) {
-          position.lockedFloor = 25;
-          console.log(`📈 [Escada] ${posKey} atingiu 50%! Piso de lucro trancado nos 25%.`);
-        } else if (pnlPercent >= 25 && position.lockedFloor < 0) {
-          position.lockedFloor = 0;
-          console.log(`🛡 [Escada] ${posKey} atingiu 25%! Piso seguro trancado no Breakeven (0%).`);
-        }
+      
+      if (position.lockedFloor === undefined) {
+        position.lockedFloor = -1;
       }
-      **/
+
+      if (pnlPercent >= 100 && position.lockedFloor < 75) {
+        position.lockedFloor = 75;
+        console.log(`🚀 [Escada] ${posKey} atingiu 100%! Piso de lucro trancado nos 75%.`);
+      } else if (pnlPercent >= 75 && position.lockedFloor < 50) {
+        position.lockedFloor = 50;
+        console.log(`📈 [Escada] ${posKey} atingiu 75%! Piso de lucro trancado nos 50%.`);
+      } else if (pnlPercent >= 50 && position.lockedFloor < 25) {
+        position.lockedFloor = 25;
+        console.log(`📈 [Escada] ${posKey} atingiu 50%! Piso de lucro trancado nos 25%.`);
+      } else if (pnlPercent >= 25 && position.lockedFloor < 0) {
+        position.lockedFloor = 0;
+        console.log(`🛡 [Escada] ${posKey} atingiu 25%! Piso seguro trancado no Breakeven (0%).`);
+      }
+      
+    
       const posWithFloor = position as { lockedFloor?: number };
       const floorValue = posWithFloor.lockedFloor ?? -1;
 
@@ -1000,8 +999,8 @@ export class SmartMoneyService {
       const effectiveFloor = isWithinGracePeriod ? false : isFloorTriggered;
       const effectiveTakeProfit = isWithinGracePeriod ? false : isTakeProfitTarget;
 
-      //const shouldExit = effectiveTakeProfit || effectiveFloor || effectiveStopLoss || isTimeout || isMarketClosed;
-      const shouldExit =  effectiveStopLoss || isTimeout || isMarketClosed;
+      const shouldExit = effectiveTakeProfit || effectiveFloor || effectiveStopLoss || isTimeout || isMarketClosed;
+      //const shouldExit =  effectiveStopLoss || isTimeout || isMarketClosed;
 
       if (shouldExit) {
         let actionType = '🎯 Take-Profit';
