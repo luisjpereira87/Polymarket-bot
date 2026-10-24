@@ -907,8 +907,8 @@ export class SmartMoneyService {
     } = {}
   ): Promise<{ id: string; unsubscribe: () => void }> {
     const takeProfit = options.takeProfitPercent ?? 100.0;
-    //const stopLoss = options.stopLossPercent ?? -50.0;
-    const stopLoss = -40.0;
+    const stopLoss = options.stopLossPercent ?? -50.0;
+    //const stopLoss = -40.0;
     const maxDurationMs = options.maxTradeDurationMinutes ? options.maxTradeDurationMinutes * 60 * 1000 : null;
     const gracePeriodMs = (options.stopLossGracePeriodSeconds ?? 30) * 1000;
     const dryRun = options.dryRun ?? false;
@@ -999,8 +999,8 @@ export class SmartMoneyService {
       const effectiveFloor = isWithinGracePeriod ? false : isFloorTriggered;
       const effectiveTakeProfit = isWithinGracePeriod ? false : isTakeProfitTarget;
 
-      const shouldExit = effectiveTakeProfit || effectiveFloor || effectiveStopLoss || isTimeout || isMarketClosed;
-      //const shouldExit =  effectiveStopLoss || isTimeout || isMarketClosed;
+      //const shouldExit = effectiveTakeProfit || effectiveFloor || effectiveStopLoss || isTimeout || isMarketClosed;
+      const shouldExit =  effectiveStopLoss || isTimeout || isMarketClosed;
 
       if (shouldExit) {
         let actionType = '🎯 Take-Profit';

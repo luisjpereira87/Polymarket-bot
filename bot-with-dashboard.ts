@@ -59,6 +59,8 @@ let CONFIG = {
 
     takeProfitPercent: 100, // +15% de lucro
     stopLossPercent: -50,
+
+    maxOpenPositions: 3,
   },
 
   smartMoney: {
@@ -269,6 +271,10 @@ function updateDashboard() {
 }
 
 function canTrade(): boolean {
+  if (realPositions.size >= CONFIG.risk.maxOpenPositions) {
+    return false;
+  }
+
   return true;
 }
 
@@ -1455,7 +1461,7 @@ let swapService: SwapService | null = null;
 async function updateBalances(sdk: PolymarketSDK) {
   if (CONFIG.dryRun) {
     const totalUsdc = CONFIG.capital.totalUsd || 250
-    state.usdcEBalance = totalUsdc + state.totalPnL;
+    state.usdcBalance = totalUsdc + state.totalPnL;
     state.maticBalance = 100;
     updateDashboard();
     return;
@@ -1833,7 +1839,7 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
 
       const durationMs = Date.now() - cycleStartTime;
       syncCycleCounter++;
-      
+
       // Imprime no 1º ciclo e depois apenas de 20 em 20 ciclos (~10 minutos)
       if (syncCycleCounter === 1 || syncCycleCounter % 20 === 0) {
         log('INFO', `[PortfolioManager] ✅ Sincronização concluída em ${(durationMs / 1000).toFixed(2)}s. (Ciclo #${syncCycleCounter})`);
