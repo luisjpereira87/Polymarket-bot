@@ -125,7 +125,7 @@ let CONFIG = {
     enabled: process.env.TREND_ANALYSIS_ENABLED === 'true',
     symbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'] as const,
     interval: '15m' as const,
-    trendThreshold: 0.3, //2,
+    trendThreshold: 0.8, //2,
   },
 
   directTrading: {
