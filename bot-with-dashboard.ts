@@ -44,7 +44,7 @@ let CONFIG = {
 
   risk: {
     dailyMaxLossPct: 1,
-    maxConsecutiveLosses: 6,
+    maxConsecutiveLosses: 3,
     pauseOnBreachMinutes: 60,
 
     monthlyMaxLossPct: 1, //0.15,
@@ -271,7 +271,38 @@ function updateDashboard() {
 }
 
 function canTrade(): boolean {
+  // 1. Verificação se o bot está permanentemente parado
+  if (state.permanentlyHalted) {
+    return false;
+  }
+
+  // 2. Verificação de Pausa Ativa (ex: a pausa de 2h por perdas consecutivas)
+  if (state.isPaused) {
+    if (Date.now() < state.pauseUntil) {
+      return false; // Ainda está dentro do tempo de penalização
+    } else {
+      // A pausa expirou, limpa o estado de pausa
+      state.isPaused = false;
+      log('INFO', '✅ Bot retomou a execução após período de pausa por perdas consecutivas');
+      updateDashboard();
+    }
+  }
+
+  // 3. Verificação de Posições Abertas Máximas
   if (realPositions.size >= CONFIG.risk.maxOpenPositions) {
+    return false;
+  }
+
+  // 4. Verificação de Perdas Consecutivas (Gatilho da Pausa de 2h)
+  const maxConsecutiveLossesAllowed = CONFIG.risk.maxConsecutiveLosses ?? 3; // Exemplo: padrão de 3 perdas seguidas
+
+  if (state.consecutiveLosses >= maxConsecutiveLossesAllowed) {
+    state.isPaused = true;
+    const pauseDurationMs = 2 * 60 * 60 * 1000; // 2 Horas em milissegundos
+    state.pauseUntil = Date.now() + pauseDurationMs;
+
+    log('WARN', `🛑 Detetadas ${state.consecutiveLosses} perdas consecutivas. Bot pausado por 2 horas até ${new Date(state.pauseUntil).toLocaleTimeString()}`);
+    updateDashboard();
     return false;
   }
 

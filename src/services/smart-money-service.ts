@@ -964,27 +964,39 @@ export class SmartMoneyService {
       const isMarketClosed = isPriceResolved || (isTimeExpired && (currentPrice >= 0.90 || currentPrice <= 0.10));
 
 
-      // 📈 GESTÃO DE PATAMARES EM ESCADA (TRAILING FLOOR)
-      
+      // 📈 GESTÃO DE PATAMARES EM ESCADA (TRAILING FLOOR DINÂMICO)
       if (position.lockedFloor === undefined) {
-        position.lockedFloor = -1;
+        position.lockedFloor = -1; // -1 significa sem piso trancado ainda (permite stop-loss normal)
       }
 
-      if (pnlPercent >= 100 && position.lockedFloor < 75) {
-        position.lockedFloor = 75;
-        console.log(`🚀 [Escada] ${posKey} atingiu 100%! Piso de lucro trancado nos 75%.`);
-      } else if (pnlPercent >= 75 && position.lockedFloor < 50) {
-        position.lockedFloor = 50;
-        console.log(`📈 [Escada] ${posKey} atingiu 75%! Piso de lucro trancado nos 50%.`);
-      } else if (pnlPercent >= 50 && position.lockedFloor < 25) {
-        position.lockedFloor = 25;
-        console.log(`📈 [Escada] ${posKey} atingiu 50%! Piso de lucro trancado nos 25%.`);
-      } else if (pnlPercent >= 25 && position.lockedFloor < 0) {
-        position.lockedFloor = 0;
-        console.log(`🛡 [Escada] ${posKey} atingiu 25%! Piso seguro trancado no Breakeven (0%).`);
+      // Calcula o preço máximo possível ($1.00) e o ganho percentual máximo teórico a partir da entrada
+      const entryPrice = position.avgEntryPrice;
+      const maxPossiblePrice = 1.00;
+      const maxPossibleGainPct = ((maxPossiblePrice - entryPrice) / entryPrice) * 100;
+
+      // Definimos os degraus da escada de forma proporcional ao potencial do ativo:
+      // - Se o potencial for grande (ex: entrou a $0.20 -> max gain +400%), os degraus normais funcionam bem.
+      // - Se o potencial for curto (ex: entrou a $0.70 -> max gain +42%), a escada adapta-se.
+      
+      const thresholdLevel4 = Math.min(100, maxPossibleGainPct * 0.80); // 80% do caminho para o topo
+      const thresholdLevel3 = Math.min(75,  maxPossibleGainPct * 0.60); // 60% do caminho
+      const thresholdLevel2 = Math.min(50,  maxPossibleGainPct * 0.40); // 40% do caminho
+      const thresholdLevel1 = Math.min(25,  maxPossibleGainPct * 0.20); // 20% do caminho (ou protege no breakeven)
+
+      if (pnlPercent >= thresholdLevel4 && position.lockedFloor < (thresholdLevel3)) {
+        position.lockedFloor = Math.floor(thresholdLevel3);
+        console.log(`🚀 [Escada Dinâmica] ${posKey} atingiu o topo (${pnlPercent.toFixed(1)}%)! Piso trancado nos +${position.lockedFloor}%.`);
+      } else if (pnlPercent >= thresholdLevel3 && position.lockedFloor < (thresholdLevel2)) {
+        position.lockedFloor = Math.floor(thresholdLevel2);
+        console.log(`📈 [Escada Dinâmica] ${posKey} subiu bem (${pnlPercent.toFixed(1)}%)! Piso trancado nos +${position.lockedFloor}%.`);
+      } else if (pnlPercent >= thresholdLevel2 && position.lockedFloor < (thresholdLevel1)) {
+        position.lockedFloor = Math.floor(thresholdLevel1);
+        console.log(`📈 [Escada Dinâmica] ${posKey} progrediu (${pnlPercent.toFixed(1)}%)! Piso trancado nos +${position.lockedFloor}%.`);
+      } else if (pnlPercent >= thresholdLevel1 && position.lockedFloor < 0) {
+        position.lockedFloor = 0; // Breakeven
+        console.log(`🛡 [Escada Dinâmica] ${posKey} atingiu o primeiro patamar (${pnlPercent.toFixed(1)}%). Piso seguro trancado no Breakeven (0%).`);
       }
       
-    
       const posWithFloor = position as { lockedFloor?: number };
       const floorValue = posWithFloor.lockedFloor ?? -1;
 
@@ -999,8 +1011,8 @@ export class SmartMoneyService {
       const effectiveFloor = isWithinGracePeriod ? false : isFloorTriggered;
       const effectiveTakeProfit = isWithinGracePeriod ? false : isTakeProfitTarget;
 
-      //const shouldExit = effectiveTakeProfit || effectiveFloor || effectiveStopLoss || isTimeout || isMarketClosed;
-      const shouldExit =  effectiveStopLoss || isTimeout || isMarketClosed;
+      const shouldExit = effectiveTakeProfit || effectiveFloor || effectiveStopLoss || isTimeout || isMarketClosed;
+      //const shouldExit =  effectiveStopLoss || isTimeout || isMarketClosed;
 
       if (shouldExit) {
         let actionType = '🎯 Take-Profit';
