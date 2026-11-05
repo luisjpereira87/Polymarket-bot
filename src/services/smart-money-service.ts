@@ -978,6 +978,7 @@ export class SmartMoneyService {
       // - Se o potencial for grande (ex: entrou a $0.20 -> max gain +400%), os degraus normais funcionam bem.
       // - Se o potencial for curto (ex: entrou a $0.70 -> max gain +42%), a escada adapta-se.
       
+      /**
       const thresholdLevel4 = Math.min(100, maxPossibleGainPct * 0.80); // 80% do caminho para o topo
       const thresholdLevel3 = Math.min(75,  maxPossibleGainPct * 0.60); // 60% do caminho
       const thresholdLevel2 = Math.min(50,  maxPossibleGainPct * 0.40); // 40% do caminho
@@ -995,6 +996,20 @@ export class SmartMoneyService {
       } else if (pnlPercent >= thresholdLevel1 && position.lockedFloor < 0) {
         position.lockedFloor = 0; // Breakeven
         console.log(`🛡 [Escada Dinâmica] ${posKey} atingiu o primeiro patamar (${pnlPercent.toFixed(1)}%). Piso seguro trancado no Breakeven (0%).`);
+      }
+      **/
+
+      // Degraus alargados para absorver a volatilidade agressiva de cripto
+      const thresholdHigh = Math.min(100, maxPossibleGainPct * 0.70); 
+      const thresholdMid = Math.min(50, maxPossibleGainPct * 0.45);   
+
+      if (pnlPercent >= thresholdHigh && position.lockedFloor < thresholdMid) {
+        position.lockedFloor = Math.floor(thresholdMid);
+        console.log(`🚀 [Escada Cripto] ${posKey} pumpou forte (${pnlPercent.toFixed(1)}%). Piso de lucro trancado em +${position.lockedFloor}%.`);
+      } else if (pnlPercent >= thresholdMid && position.lockedFloor < 0) {
+        // Só tranca no breakeven (0%) se o ativo já tiver dado uma margem muito confortável
+        position.lockedFloor = 0; 
+        console.log(`🛡 [Escada Cripto] ${posKey} consolidou ganhos (${pnlPercent.toFixed(1)}%). Piso trancado no Breakeven.`);
       }
       
       const posWithFloor = position as { lockedFloor?: number };
