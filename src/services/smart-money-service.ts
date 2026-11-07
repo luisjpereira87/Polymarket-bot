@@ -998,7 +998,7 @@ export class SmartMoneyService {
         console.log(`🛡 [Escada Dinâmica] ${posKey} atingiu o primeiro patamar (${pnlPercent.toFixed(1)}%). Piso seguro trancado no Breakeven (0%).`);
       }
       **/
-
+      /**
       // Degraus alargados para absorver a volatilidade agressiva de cripto
       const thresholdHigh = Math.min(100, maxPossibleGainPct * 0.70); 
       const thresholdMid = Math.min(50, maxPossibleGainPct * 0.45);   
@@ -1011,7 +1011,7 @@ export class SmartMoneyService {
         position.lockedFloor = 0; 
         console.log(`🛡 [Escada Cripto] ${posKey} consolidou ganhos (${pnlPercent.toFixed(1)}%). Piso trancado no Breakeven.`);
       }
-      
+      **/
       const posWithFloor = position as { lockedFloor?: number };
       const floorValue = posWithFloor.lockedFloor ?? -1;
 
@@ -1026,8 +1026,9 @@ export class SmartMoneyService {
       const effectiveFloor = isWithinGracePeriod ? false : isFloorTriggered;
       const effectiveTakeProfit = isWithinGracePeriod ? false : isTakeProfitTarget;
 
-      const shouldExit = effectiveTakeProfit || effectiveFloor || effectiveStopLoss || isTimeout || isMarketClosed;
+      //const shouldExit = effectiveTakeProfit || effectiveFloor || effectiveStopLoss || isTimeout || isMarketClosed;
       //const shouldExit =  effectiveStopLoss || isTimeout || isMarketClosed;
+      const shouldExit =  isTimeout || isMarketClosed;
 
       if (shouldExit) {
         let actionType = '🎯 Take-Profit';

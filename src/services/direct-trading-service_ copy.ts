@@ -1,0 +1,535 @@
+import { SmartMoneyTrade, TradePositions } from '../index.js';
+import { BinanceService } from './binance-service.js';
+import { MarketService } from './market-service.js';
+import { OrderbookService } from './orderbook-service.js';
+import { TradingService } from './trading-service.js';
+
+export interface DirectTradingServiceConfig {
+    enabled: boolean;
+    interval: string;         // ex: '15m'
+    trendThreshold: number;   // ex: 0.3
+    amount:  () => number;           // ex: 5 (USDC)
+    dryRun?: boolean;         // Flag para saber se simula ou executa a sério
+    checkIntervalMs?: number; // ex: 5 * 60 * 1000
+    isCanTrade: () => boolean;
+    positions: () => Map<string, TradePositions>
+}
+
+export interface OrderBookValidationResult {
+    isValid: boolean;
+    averageExecutionPrice: number;
+    maxPriceTouched: number;
+    totalShares: number;
+    reason?: string;
+}
+
+interface ClobOrderBookResponse {
+    market?: string;
+    asset_id?: string;
+    bids?: Array<{ price: string; size: string }>;
+    asks?: Array<{ price: string; size: string }>;
+    min_order_size?: string;
+    tick_size?: string;
+    neg_risk?: boolean;
+    last_trade_price?: string;
+}
+
+export type DirectTradingCallback = (trade: any, result: any) => Promise<void> | void;
+
+export class DirectTradingService {
+    private marketService: MarketService;
+    private tradingService: TradingService;
+    private binanceService: BinanceService;
+    private orderbookService: OrderbookService;
+    private timer: NodeJS.Timeout | null = null;
+
+    constructor(
+        tradingService: TradingService,
+        marketService: MarketService,
+        binanceService: BinanceService,
+        orderbookService: OrderbookService
+    ) {
+        this.tradingService = tradingService;
+        this.marketService = marketService;
+        this.binanceService = binanceService;
+        this.orderbookService = orderbookService;
+    }
+
+    /**
+     * Inicia o serviço de Direct Trading aceitando parâmetros de execução e o callback de sinal
+     */
+    public async startTradingLoop(
+        config: DirectTradingServiceConfig,
+        options: {
+            onTrade: DirectTradingCallback;
+        }
+    ) {
+        if (config.isCanTrade && !config.isCanTrade()) {
+            console.warn(`[SmartMoneyService] ⚠️ Sinal ignorado: canTrade() retornou falso.`);
+            return;
+        }
+
+        if (!config.enabled) {
+            console.log('TREND', 'Serviço de Direct Trading está desativado na configuração.');
+            return;
+        }
+
+        console.log('TREND', '🚀 A iniciar Direct Trading Service (Binance + Polymarket)...');
+
+        const executeCheck = async () => {
+            const now = new Date();
+            const currentMinute = now.getMinutes();
+            const minuteInBlock = currentMinute % 15;
+
+            // Proteção extra: se o ciclo disparar dentro dos primeiros 1 minutos, salta fora!
+            if (minuteInBlock < 1) {
+                console.log('TREND', `⏳ [Safety] Minuto ${currentMinute} (${minuteInBlock}m do bloco). Demasiado cedo, a ignorar ciclo para evitar abertura...`);
+                return;
+            }
+
+            const coins: Array<'BTC' | 'ETH' | 'SOL'> = ['BTC', 'ETH', 'SOL'];
+
+            for (const coin of coins) {
+                try {
+                    await this.analyzeAndExecuteCoin(coin, config, options.onTrade);
+                } catch (err) {
+                    console.log('ERROR', `❌ Erro no ciclo de tendência para ${coin}: ${(err as Error).message}`);
+                }
+            }
+        };
+
+        const intervalMs = config.checkIntervalMs || 5 * 60 * 1000;
+
+        const getDelayToSafeMinute = () => {
+            const now = new Date();
+            const currentMinute = now.getMinutes();
+            const minuteInBlock = currentMinute % 15;
+
+            if (minuteInBlock < 1) {
+                const targetMinute = (Math.floor(currentMinute / 15) * 15) + 3;
+                const targetDate = new Date(now);
+                targetDate.setMinutes(targetMinute, 0, 0);
+                const delay = targetDate.getTime() - now.getTime();
+                return delay > 0 ? delay : 0;
+            }
+            return 0;
+        };
+
+        const startInterval = () => {
+            // Garante que limpa qualquer timer anterior antes de criar um novo
+            if (this.timer) {
+                clearTimeout(this.timer);
+                clearInterval(this.timer);
+            }
+            this.timer = setInterval(executeCheck, intervalMs);
+        };
+
+        const initialDelay = getDelayToSafeMinute();
+
+        if (initialDelay > 0) {
+            console.log('TREND', `⏳ [Loop] A aguardar ${(initialDelay / 1000).toFixed(0)}s para escapar à zona de viragem de 15m...`);
+            this.timer = setTimeout(async () => {
+                await executeCheck();
+                startInterval(); // Arranca o intervalo regular após o delay inicial
+            }, initialDelay);
+        } else {
+            // Executa já e arranca o intervalo regular
+            await executeCheck();
+            startInterval();
+        }
+
+        return {
+            unsubscribe: () => {
+                if (this.timer) {
+                    clearTimeout(this.timer);
+                    clearInterval(this.timer);
+                    this.timer = null;
+                    console.log('TREND', '🛑 Direct Trading Service cancelado via unsubscribe.');
+                }
+            }
+        };
+    }
+
+    public stop() {
+        if (this.timer) {
+            clearInterval(this.timer);
+            this.timer = null;
+        }
+        console.log('TREND', '🛑 Direct Trading Service parado.');
+    }
+
+    private async analyzeAndExecuteCoin(
+        coin: 'BTC' | 'ETH' | 'SOL',
+        config: DirectTradingServiceConfig,
+        onTrade: DirectTradingCallback
+    ) {
+        const symbolMap: Record<'BTC' | 'ETH' | 'SOL', any> = {
+            BTC: 'BTCUSDT',
+            ETH: 'ETHUSDT',
+            SOL: 'SOLUSDT'
+        };
+        const symbol = symbolMap[coin];
+
+        // 1. Obter klines da Binance (pedimos um histórico ligeiramente maior para o RSI)
+        const klines = await this.binanceService.getKLines(symbol, config.interval as any, { limit: 30 });
+        if (!klines || klines.length < 20) {
+            console.log('WARN', `⚠️ Klines insuficientes para ${symbol}: ${klines?.length ?? 0}`);
+            return;
+        }
+
+        const closePrices = klines.map((k: any) => Number(k.close));
+
+        // Cálculo do RSI (14 períodos) e EMA do RSI (9 períodos)
+        const currentRsi = this.calculateRSI(closePrices, 14);
+
+        // Gerar histórico recente de RSI para calcular a EMA do RSI
+        const rsiHistory: number[] = [];
+        for (let i = 8; i >= 0; i--) {
+            if (closePrices.length > 14 + i) {
+                const sliceCloses = closePrices.slice(0, closePrices.length - i);
+                rsiHistory.push(this.calculateRSI(sliceCloses, 14));
+            }
+        }
+        const rsiEma = this.calculateEMA(rsiHistory, 9);
+        const isRsiBullish = currentRsi > rsiEma;
+        const isRsiBearish = currentRsi < rsiEma;
+
+        const recent = klines.slice(-5);
+        const older = klines.slice(-10, -5);
+        const recentAvg = recent.reduce((s, k) => s + k.close, 0) / recent.length;
+        const olderAvg = older.reduce((s, k) => s + k.close, 0) / older.length;
+
+        const changePercent = ((recentAvg - olderAvg) / olderAvg) * 100;
+        const threshold = config.trendThreshold;
+
+        let trend: 'up' | 'down' | 'neutral' = 'neutral';
+        if (changePercent > threshold) trend = 'up';
+        else if (changePercent < -threshold) trend = 'down';
+
+        console.log('KLINE', `📊 [${symbol}] Variação: ${changePercent.toFixed(4)}% | RSI: ${currentRsi.toFixed(1)} (EMA: ${rsiEma.toFixed(1)}) | Tendência: ${trend.toUpperCase()}`);
+
+        if (trend === 'neutral') return;
+
+        // 🛡️ FILTRO DE RSI: Validar se o momento técnico apoia a tendência indicada pela variação
+        if (trend === 'up' && !isRsiBullish) {
+            console.log('WARN', `⏳ [${coin}] Sinal UP ignorado: Variação positiva mas RSI (${currentRsi.toFixed(1)}) abaixo da EMA (${rsiEma.toFixed(1)}) - Falta de momentum comprador.`);
+            return;
+        }
+        if (trend === 'down' && !isRsiBearish) {
+            console.log('WARN', `⏳ [${coin}] Sinal DOWN ignorado: Variação negativa mas RSI (${currentRsi.toFixed(1)}) acima da EMA (${rsiEma.toFixed(1)}) - Falta de momentum vendedor.`);
+            return;
+        }
+
+        // 🕯️ FILTRO DE ANÁLISE DO CORPO E DIREÇÃO DO CANDLE CORRENTE
+        const currentKline = klines[klines.length - 1];
+        const candleOpen = Number(currentKline.open);
+        const candleClose = Number(currentKline.close);
+        const candleHigh = Number(currentKline.high);
+        const candleLow = Number(currentKline.low);
+
+        const bodySize = Math.abs(candleClose - candleOpen);
+        const totalRange = candleHigh - candleLow;
+
+        // 1. Evitar velas de indecisão (Dojis / corpos muito esmagados face ao pavio)
+        // O corpo deve ocupar pelo menos 25% do movimento total daquela vela para ter força
+        const minBodyRatio = 0.25;
+        if (totalRange > 0 && (bodySize / totalRange) < minBodyRatio) {
+            console.log('WARN', `⏳ [${coin}] Ignorado: Candle atual sem corpo expressivo (Doji/Indecisão). A aguardar força real.`);
+            return;
+        }
+
+        // 2. Validar se o corpo do candle está na direção correta do sinal
+        if (trend === 'up' && candleClose <= candleOpen) {
+            console.log('WARN', `⏳ [${coin}] Sinal UP ignorado: Candle atual está vermelho (Open: $${candleOpen} > Close: $${candleClose}).`);
+            return;
+        }
+        if (trend === 'down' && candleClose >= candleOpen) {
+            console.log('WARN', `⏳ [${coin}] Sinal DOWN ignorado: Candle atual está verde (Open: $${candleOpen} < Close: $${candleClose}).`);
+            return;
+        }
+
+        // 2. Encontrar mercado de curto prazo na Polymarket
+        const markets = await this.marketService.scanCryptoShortTermMarkets({
+            coin: coin,
+            duration: '15m',
+            minMinutesUntilEnd: 2,
+            maxMinutesUntilEnd: 60,
+            limit: 1,
+            sortBy: 'endDate'
+        });
+
+        if (!markets || markets.length === 0) {
+            console.log('WARN', `⚠️ Nenhum mercado de curto prazo encontrado na Polymarket para ${coin}`);
+            return;
+        }
+
+        const market = markets[0];
+        if (!market.conditionId) return;
+
+        if (!this.isMarketInValidWindow(market, coin)) {
+            return;
+        }
+
+        const fullMarket = await this.marketService.getMarket(market.conditionId);
+        const yesToken = fullMarket.tokens.find((t: any) => t.outcome === 'Up' || t.outcome === 'Yes');
+        const noToken = fullMarket.tokens.find((t: any) => t.outcome === 'Down' || t.outcome === 'No');
+        const targetToken = trend === 'up' ? yesToken : noToken;
+
+        if (!targetToken) {
+            console.log('WARN', `⚠️ Token de destino ('${trend === 'up' ? 'Up/Yes' : 'Down/No'}') não encontrado para ${coin}`);
+            return;
+        }
+
+        // 🛡️ Obter o preço real diretamente do outcomePrices do market
+        const tokenIndex = fullMarket.tokens ? fullMarket.tokens.findIndex((t: any) => t.tokenId === targetToken.tokenId) : -1;
+
+        // 🛡️ FILTRO ANTI-DUPLICAÇÃO (Igual ao Smart Money)
+        const outcomeName = targetToken.outcome || 'Yes';
+        const posKey = `${market.slug}-${outcomeName}`;
+
+        // Invocar a função para obter o Map de posições
+        const currentPositions = typeof config.positions === 'function' ? config.positions() : null;
+
+        if (currentPositions && currentPositions.has(posKey)) {
+            console.log('WARN', `⏳ [${coin}] Sinal ignorado (Anti-Duplicação): Já tens posição ativa em ${posKey}`);
+            return;
+        }
+
+        // 🛡️ VALIDAR LIVRO DE ORDENS REAL (Anti-Slippage)
+        const amountUsdc = config.amount() || 5;
+        const validation = await this.orderbookService.validateOrderBookSlippage(targetToken.tokenId, amountUsdc, 0.75, 0.25);
+
+        if (!validation.isValid) {
+            console.log('WARN', `⏳ [${coin}] Sinal ignorado (Slippage/Livro): ${validation.reason}`);
+            return;
+        }
+
+        console.log(`✅ [${coin}] Livro validado com sucesso! Preço Médio Estimado: ${validation.averageExecutionPrice.toFixed(2)} (Máx tocado: ${validation.maxPriceTouched})`);
+
+        // O execShares passa a ser o calculado de forma precisa pelo livro de ordens
+        const execShares = validation.totalShares;
+        const tokenPrice = validation.averageExecutionPrice;
+
+
+        const rawEndDate = market.endDate || fullMarket.endDate;
+        const validEndDate = rawEndDate ? new Date(rawEndDate) : new Date(Date.now() + 15 * 60 * 1000);
+
+        const syntheticTrade: SmartMoneyTrade = {
+            traderAddress: `TrendFollowing-${coin}`,
+            marketSlug: market.slug,
+            side: 'BUY',
+            size: execShares,
+            price: tokenPrice,
+            tokenId: targetToken.tokenId,
+            conditionId: market.conditionId,
+            traderName: `Trend Bot (${coin})`,
+            timestamp: Date.now(),
+            isSmartMoney: false,
+            endDate: validEndDate,
+            outcome: targetToken.outcome
+        };
+
+        const isDryRun = config.dryRun ?? false;
+
+        if (isDryRun) {
+            console.log('SIGNAL', `🧪 [DRY RUN] Direct Trade (${coin}): ${trend.toUpperCase()} em ${market.question?.slice(0, 30)}...`);
+            await onTrade(syntheticTrade, { success: true });
+        } else {
+            console.log('SIGNAL', `🔴 Executando Direct Trade Real (${coin}): ${trend.toUpperCase()} em ${market.question?.slice(0, 30)}...`);
+
+            try {
+                const res = await this.tradingService.createMarketOrder({
+                    tokenId: targetToken.tokenId,
+                    side: 'BUY',
+                    amount: amountUsdc
+                });
+
+                await onTrade(syntheticTrade, res);
+
+                if (res && res.success) {
+                    console.log('TRADE', `✅ Direct Trade Executado (${coin}): Compra de $${amountUsdc} em ${targetToken.outcome}`);
+                } else {
+                    console.log('WARN', `❌ Direct Trade falhou: ${res?.errorMsg || 'Erro desconhecido'}`);
+                }
+            } catch (orderErr) {
+                console.log('ERROR', `❌ Erro crítico ao submeter ordem de Direct Trade: ${(orderErr as Error).message}`);
+            }
+        }
+    }
+
+    /**
+     * Calcula o RSI (Relative Strength Index)
+     */
+    private calculateRSI(closes: number[], period: number = 14): number {
+        if (closes.length < period + 1) return 50;
+
+        let gains = 0;
+        let losses = 0;
+
+        for (let i = 1; i <= period; i++) {
+            const change = closes[i] - closes[i - 1];
+            if (change > 0) gains += change;
+            else losses -= change;
+        }
+
+        let avgGain = gains / period;
+        let avgLoss = losses / period;
+
+        for (let i = period + 1; i < closes.length; i++) {
+            const change = closes[i] - closes[i - 1];
+            const gain = change > 0 ? change : 0;
+            const loss = change < 0 ? -change : 0;
+
+            avgGain = (avgGain * (period - 1) + gain) / period;
+            avgLoss = (avgLoss * (period - 1) + loss) / period;
+        }
+
+        if (avgLoss === 0) return 100;
+        const rs = avgGain / avgLoss;
+        return Number((100 - (100 / (1 + rs))).toFixed(2));
+    }
+
+    /**
+     * Calcula a EMA (Exponential Moving Average) para um histórico de valores
+     */
+    private calculateEMA(values: number[], period: number = 9): number {
+        if (values.length === 0) return 50;
+        if (values.length < period) {
+            const sum = values.reduce((acc, val) => acc + val, 0);
+            return Number((sum / values.length).toFixed(2));
+        }
+
+        const k = 2 / (period + 1);
+        let ema = values.slice(0, period).reduce((acc, val) => acc + val, 0) / period;
+
+        for (let i = period; i < values.length; i++) {
+            ema = (values[i] * k) + (ema * (1 - k));
+        }
+
+        return Number(ema.toFixed(2));
+    }
+
+
+    private isMarketInValidWindow(market: any, coin: string): boolean {
+        let startTimeMs = 0;
+        let endTimeMs = 0;
+
+        // 1. Tentar extrair o timestamp do slug (ex: 'eth-updown-15m-1790708400' -> isto é o INÍCIO)
+        if (market.slug) {
+            const parts = market.slug.split('-');
+            const potentialTimestamp = Number(parts[parts.length - 1]);
+            if (!isNaN(potentialTimestamp) && potentialTimestamp > 1700000000) {
+                startTimeMs = potentialTimestamp * 1000;
+                endTimeMs = startTimeMs + (15 * 60 * 1000); // 15 minutos depois = FIM correto!
+            }
+        }
+
+        // 2. Fallback para o endDate da API se o slug falhar
+        if (!endTimeMs && market.endDate) {
+            endTimeMs = new Date(market.endDate).getTime();
+            startTimeMs = endTimeMs - (15 * 60 * 1000);
+        }
+
+        if (!endTimeMs || isNaN(endTimeMs)) {
+            console.log('WARN', `⚠️ [${coin}] Impossível determinar a data de fecho do mercado (${market.slug}).`);
+            return false;
+        }
+
+        const nowMs = Date.now();
+
+        // Validação 1: O mercado ainda não começou
+        if (nowMs < startTimeMs) {
+            console.log('WARN', `⏳ [${coin}] Ignorado: O mercado ainda não começou (Início estimado em ${new Date(startTimeMs).toLocaleTimeString()}).`);
+            return false;
+        }
+
+        // Validação 2: O mercado já terminou
+        if (nowMs >= endTimeMs) {
+            console.log('WARN', `⏳ [${coin}] Ignorado: O mercado já terminou (Encerrou às ${new Date(endTimeMs).toLocaleTimeString()}).`);
+            return false;
+        }
+
+        // Validação 3: Menos de 5 minutos para fechar (Zona de pânico)
+        const minutesRemaining = (endTimeMs - nowMs) / (1000 * 60);
+        if (minutesRemaining < 5) {
+            console.log('WARN', `⏳ [${coin}] Ignorado: Faltam apenas ${minutesRemaining.toFixed(1)}m para o mercado fechar.`);
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+ * Simula o consumo do livro de ordens (Order Book) para um determinado montante em USDC,
+ * validando se a ordem respeita os limites de preço (teto e piso).
+ */
+    /**private async validateOrderBookSlippage(
+        tokenId: string,
+        amountUsdc: number,
+        maxAllowedPrice: number = 0.75,
+        minAllowedPrice: number = 0.25
+    ): Promise<OrderBookValidationResult> {
+        try {
+            const response = await fetch(`https://clob.polymarket.com/book?token_id=${tokenId}`);
+            if (!response.ok) {
+                return { isValid: false, averageExecutionPrice: 0, maxPriceTouched: 0, totalShares: 0, reason: 'Erro ao contactar a API do CLOB' };
+            }
+
+            // Fazemos o cast explícito para a interface ClobOrderBookResponse
+            const bookData = (await response.json()) as ClobOrderBookResponse;
+
+            if (!bookData || !bookData.asks || bookData.asks.length === 0) {
+                return { isValid: false, averageExecutionPrice: 0, maxPriceTouched: 0, totalShares: 0, reason: 'Livro de ordens sem asks disponíveis' };
+            }
+
+            let remainingUsdc = amountUsdc;
+            let totalShares = 0;
+            let maxPriceTouched = 0;
+
+            // Ordenar os asks por preço ascendente
+            const sortedAsks = [...bookData.asks].sort((a, b) => Number(a.price) - Number(b.price));
+
+            for (const ask of sortedAsks) {
+                const askPrice = Number(ask.price);
+                const askSize = Number(ask.size);
+                const costAtThisLevel = askPrice * askSize;
+
+                if (remainingUsdc <= costAtThisLevel) {
+                    const sharesNeeded = remainingUsdc / askPrice;
+                    totalShares += sharesNeeded;
+                    maxPriceTouched = Math.max(maxPriceTouched, askPrice);
+                    remainingUsdc = 0;
+                    break;
+                } else {
+                    remainingUsdc -= costAtThisLevel;
+                    totalShares += askSize;
+                    maxPriceTouched = Math.max(maxPriceTouched, askPrice);
+                }
+            }
+
+            if (remainingUsdc > 0) {
+                return { isValid: false, averageExecutionPrice: 0, maxPriceTouched, totalShares, reason: `Liquidez insuficiente no livro para preencher os $${amountUsdc}` };
+            }
+
+            const averageExecutionPrice = amountUsdc / totalShares;
+
+            if (maxPriceTouched > maxAllowedPrice) {
+                return { isValid: false, averageExecutionPrice, maxPriceTouched, totalShares, reason: `Pior preço necessário no livro (${maxPriceTouched.toFixed(2)}) excede o teto de ${maxAllowedPrice}` };
+            }
+
+            if (averageExecutionPrice < minAllowedPrice) {
+                return { isValid: false, averageExecutionPrice, maxPriceTouched, totalShares, reason: `Preço médio (${averageExecutionPrice.toFixed(2)}) abaixo do piso de ${minAllowedPrice}` };
+            }
+
+            return {
+                isValid: true,
+                averageExecutionPrice,
+                maxPriceTouched,
+                totalShares
+            };
+
+        } catch (error) {
+            return { isValid: false, averageExecutionPrice: 0, maxPriceTouched: 0, totalShares: 0, reason: `Exceção ao validar order book: ${(error as Error).message}` };
+        }
+    }**/
+}
