@@ -1124,49 +1124,90 @@ export class SmartMoneyService {
         if (timeSinceLastSignal > STALE_THRESHOLD_MS) {
           console.warn(`[SmartMoneyService] ⚠️ Alerta: Sem sinais para ${posKey} há >60s. A forçar verificação REST / SDK...`);
 
+          let freshPrice: number | null = null;
+          let fetchSuccess = false;
+
           try {
             const tokenId = position.tokenId;
             const marketSlug = position.marketSlug;
-            let freshPrice: number | null = null;
 
+            // 1. Tenta obter o preço pelo Orderbook (Best Bid)
             if (tokenId) {
-              freshPrice = await this.orderbookService.getBestBidPrice(tokenId);
-            }
-
-            if ((!freshPrice || freshPrice <= 0) && marketSlug) {
-              const marketInfo: GammaMarket | null = await (this as any).sdk?.markets?.getMarket(marketSlug);
-
-              if (marketInfo && marketInfo.closed) {
-                const outcomes = marketInfo.outcomes || [];
-                const prices = marketInfo.outcomePrices || [];
-
-                let winningOutcome: string | null = null;
-                for (let i = 0; i < outcomes.length; i++) {
-                  if (prices[i] >= 0.99) {
-                    winningOutcome = outcomes[i];
-                    break;
-                  }
+              try {
+                freshPrice = await this.orderbookService.getBestBidPrice(tokenId);
+                if (freshPrice !== null && freshPrice >= 0) {
+                  fetchSuccess = true;
                 }
-
-                const userOutcome = position.outcome ? position.outcome.toLowerCase() : '';
-                const isWinner = winningOutcome && userOutcome && winningOutcome.toLowerCase() === userOutcome;
-                freshPrice = isWinner ? 1.0 : 0.0;
-
-                console.log(`🏁 [SDK Gamma Fallback] Mercado ${marketSlug} fechado. Vencedor detetado: ${winningOutcome} | Nossa escolha (${position.outcome}): ${isWinner ? 'VITÓRIA (1.0)' : 'DERROTA (0.0)'}`);
+              } catch (obErr) {
+                console.warn(`[SmartMoneyService] ⚠️ Falha ao obter bid do orderbook para ${posKey}:`, obErr);
               }
             }
 
-            if (freshPrice !== null && freshPrice >= 0) {
+            // 2. Fallback para a API Gamma se o orderbook falhou ou veio vazio
+            if (!fetchSuccess && marketSlug) {
+              try {
+                const marketInfo: GammaMarket | null = await (this as any).sdk?.markets?.getMarket(marketSlug);
+
+                if (marketInfo && marketInfo.closed) {
+                  const outcomes = marketInfo.outcomes || [];
+                  const prices = marketInfo.outcomePrices || [];
+
+                  let winningOutcome: string | null = null;
+                  for (let i = 0; i < outcomes.length; i++) {
+                    if (prices[i] >= 0.99) {
+                      winningOutcome = outcomes[i];
+                      break;
+                    }
+                  }
+
+                  const userOutcome = position.outcome ? position.outcome.toLowerCase() : '';
+                  const isWinner = winningOutcome && userOutcome && winningOutcome.toLowerCase() === userOutcome;
+                  freshPrice = isWinner ? 1.0 : 0.0;
+                  fetchSuccess = true;
+
+                  console.log(`🏁 [SDK Gamma Fallback] Mercado ${marketSlug} fechado. Vencedor detetado: ${winningOutcome} | Nossa escolha (${position.outcome}): ${isWinner ? 'VITÓRIA (1.0)' : 'DERROTA (0.0)'}`);
+                }
+              } catch (gammaErr) {
+                console.warn(`[SmartMoneyService] ⚠️ Falha no fallback Gamma para ${posKey}:`, gammaErr);
+              }
+            }
+
+            // 3. Processamento seguro do preço obtido
+            if (fetchSuccess && freshPrice !== null && freshPrice >= 0) {
               const avgEntry = position.avgEntryPrice;
               const pnlPercent = ((freshPrice - avgEntry) / avgEntry) * 100;
 
-              await internalHandler(posKey, freshPrice, pnlPercent);
-            }
-          } catch (err) {
-            console.error(`[SmartMoneyService] ❌ Erro no polling de segurança para ${posKey}:`, err);
-          }
+              if (freshPrice === 0.0) {
+                console.log(`💀 [Polling] Posição ${posKey} dada como perdida (0.0). A limpar do registo local...`);
+                
+                const lossTrade: SmartMoneyTrade = {
+                  traderAddress: position.traderAddress || 'SYSTEM_AUTO_EXIT',
+                  marketSlug: position.marketSlug,
+                  outcome: position.outcome,
+                  side: 'SELL',
+                  size: position.size,
+                  price: 0.0,
+                  timestamp: Date.now(),
+                  isSmartMoney: true,
+                  endDate: position.endDate
+                };
+                
+                options.onPositionClosed?.(lossTrade, { success: true, orderId: 'market_expired_zero' }, -100);
+                realPositions.delete(posKey);
+                lastActivityMap.delete(posKey);
+              } else {
+                await internalHandler(posKey, freshPrice, pnlPercent);
+              }
 
-          lastActivityMap.set(posKey, Date.now());
+              // Atualiza o timestamp de atividade apenas se a consulta foi bem-sucedida
+              lastActivityMap.set(posKey, Date.now());
+            } else {
+              console.warn(`[SmartMoneyService] ⚠️ Dados indisponíveis para ${posKey} (serviço devolveu null/vazio). A manter posição em aberto por segurança.`);
+            }
+
+          } catch (err) {
+            console.error(`[SmartMoneyService] ❌ Erro crítico no bloco de segurança para ${posKey}:`, err);
+          }
         }
       }
     }, POLLING_INTERVAL_MS);
