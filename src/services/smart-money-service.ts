@@ -1143,32 +1143,48 @@ export class SmartMoneyService {
               }
             }
 
-            // 2. Fallback para a API Gamma se o orderbook falhou ou veio vazio
+            // 2. Fallback para a API Gamma ou verificação de expiração de tempo
             if (!fetchSuccess && marketSlug) {
               try {
                 const marketInfo: GammaMarket | null = await (this as any).sdk?.markets?.getMarket(marketSlug);
 
-                if (marketInfo && marketInfo.closed) {
-                  const outcomes = marketInfo.outcomes || [];
-                  const prices = marketInfo.outcomePrices || [];
+                const isMarketClosedGamma = marketInfo && marketInfo.closed;
+                const marketEndDate = position.endDate ? new Date(position.endDate).getTime() : 0;
+                const isTimeExpired = marketEndDate > 0 && Date.now() >= marketEndDate;
 
+                if (isMarketClosedGamma || isTimeExpired) {
                   let winningOutcome: string | null = null;
-                  for (let i = 0; i < outcomes.length; i++) {
-                    if (prices[i] >= 0.99) {
-                      winningOutcome = outcomes[i];
-                      break;
+                  
+                  if (marketInfo && marketInfo.outcomes && marketInfo.outcomePrices) {
+                    const outcomes = marketInfo.outcomes;
+                    const prices = marketInfo.outcomePrices;
+                    for (let i = 0; i < outcomes.length; i++) {
+                      if (prices[i] >= 0.99) {
+                        winningOutcome = outcomes[i];
+                        break;
+                      }
                     }
                   }
 
                   const userOutcome = position.outcome ? position.outcome.toLowerCase() : '';
-                  const isWinner = winningOutcome && userOutcome && winningOutcome.toLowerCase() === userOutcome;
+                  const isWinner = winningOutcome ? (winningOutcome.toLowerCase() === userOutcome) : false;
+                  
                   freshPrice = isWinner ? 1.0 : 0.0;
                   fetchSuccess = true;
 
-                  console.log(`🏁 [SDK Gamma Fallback] Mercado ${marketSlug} fechado. Vencedor detetado: ${winningOutcome} | Nossa escolha (${position.outcome}): ${isWinner ? 'VITÓRIA (1.0)' : 'DERROTA (0.0)'}`);
+                  console.log(`🏁 [SDK Gamma / Timeout Fallback] Mercado ${marketSlug} fechado/expirado. Vencedor: ${winningOutcome || 'N/D'} | Nossa escolha: ${position.outcome} -> ${isWinner ? 'VITÓRIA (1.0)' : 'DERROTA (0.0)'}`);
                 }
               } catch (gammaErr) {
                 console.warn(`[SmartMoneyService] ⚠️ Falha no fallback Gamma para ${posKey}:`, gammaErr);
+                
+                // 🛡️ ÚLTIMA LINHA DE DEFESA: Se a API falhou E o mercado já terminou há mais de 5 minutos,
+                // forçamos o fecho a 0.0 para a posição nunca mais prender o bot num loop zombie.
+                const marketEndDate = position.endDate ? new Date(position.endDate).getTime() : 0;
+                if (marketEndDate > 0 && Date.now() > marketEndDate + (5 * 60 * 1000)) {
+                  console.warn(`[SmartMoneyService] 🚨 Forçando fecho por timeout de API para mercado zombie: ${posKey}`);
+                  freshPrice = 0.0;
+                  fetchSuccess = true;
+                }
               }
             }
 
@@ -1199,7 +1215,6 @@ export class SmartMoneyService {
                 await internalHandler(posKey, freshPrice, pnlPercent);
               }
 
-              // Atualiza o timestamp de atividade apenas se a consulta foi bem-sucedida
               lastActivityMap.set(posKey, Date.now());
             } else {
               console.warn(`[SmartMoneyService] ⚠️ Dados indisponíveis para ${posKey} (serviço devolveu null/vazio). A manter posição em aberto por segurança.`);
