@@ -1623,7 +1623,7 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
       trendThreshold: CONFIG.binance.trendThreshold,
       amount: () => calculateDynamicTradeAmount(state.usdcBalance, CONFIG.directTrading),
       dryRun: CONFIG.dryRun,
-      checkIntervalMs: 3 * 60 * 1000,
+      //checkIntervalMs: 3 * 60 * 1000,
       isCanTrade: () => canTrade(),
       positions: () => realPositions,
     },
