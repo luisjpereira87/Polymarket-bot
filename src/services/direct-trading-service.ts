@@ -57,6 +57,8 @@ interface Candidate {
     secondsLeft: number;
     sigma: number;
     pTarget: number;
+    z: number;
+    gap: number;      // pTarget - preço pago (divergência modelo vs mercado)
     edge: number;
     endDate: Date;
 }
@@ -71,7 +73,8 @@ const MAX_SECONDS_LEFT = 300;
 // Modelo
 const SIGMA_INFLATE = 1.2;     // caudas gordas / incerteza do modelo
 const MAX_P_TARGET = 0.95;     // limita a confiança do modelo
-const MIN_P_PREFILTER = 0.60;  // abaixo disto nem vale a pena ir ao book
+const MIN_ABS_Z = 1.0;         // |spot - open| tem de ser >= 1 desvio (p >= ~0.84) antes de ir ao book
+const MAX_MODEL_DISAGREEMENT = 0.20; // se p - preço > isto, desconfia do modelo e não entra
 
 // Preço / edge
 const MAX_ENTRY_PRICE = 0.85;  // acima disto: mercado praticamente resolvido
@@ -93,7 +96,7 @@ const EDGE_LOG_DIR = 'logs';
 const EDGE_LOG_FILE = `${EDGE_LOG_DIR}/edge-log.jsonl`;
 const SKIP_LOG_THROTTLE_MS = 15_000;
 
-const SYMBOL_MAP: Record<'BTC' | 'ETH' | 'SOL', any> = {
+const SYMBOL_MAP:  Record<'BTC' | 'ETH' | 'SOL', any> = {
     BTC: 'BTCUSDT',
     ETH: 'ETHUSDT',
     SOL: 'SOLUSDT'
@@ -307,6 +310,10 @@ export class DirectTradingService {
         const pTarget = direction === 'up' ? pUp : 1 - pUp;
         const pCapped = Math.min(pTarget, MAX_P_TARGET);
 
+        // z = distância à abertura em desvios-padrão (com o σ inflacionado)
+        const sdPrice = sigma * SIGMA_INFLATE * Math.sqrt(secondsLeft) * spot;
+        const z = sdPrice > 0 ? Math.abs(spot - open) / sdPrice : 0;
+
         // Linha de avaliação (uma a cada 10 s por moeda), para veres que o bot está a trabalhar
         {
             const now = Date.now();
@@ -315,13 +322,16 @@ export class DirectTradingService {
                 const movePct = ((spot - open) / open) * 100;
                 console.log(
                     'EVAL',
-                    `🔎 [${coin}] open=${open} spot=${spot} (${movePct >= 0 ? '+' : ''}${movePct.toFixed(3)}%) | σ/s=${sigma.toExponential(2)} | faltam ${secondsLeft.toFixed(0)}s | p(${direction})=${pTarget.toFixed(3)}`
+                    `🔎 [${coin}] open=${open} spot=${spot} (${movePct >= 0 ? '+' : ''}${movePct.toFixed(3)}%) | σ/s=${sigma.toExponential(2)} | faltam ${secondsLeft.toFixed(0)}s | z=${z.toFixed(2)} | p(${direction})=${pTarget.toFixed(3)}`
                 );
             }
         }
 
-        if (pCapped < MIN_P_PREFILTER) {
-            this.logSkip(coin, 'p_baixo', { open, spot, secondsLeft, sigma, pTarget });
+        // Filtro principal: só avança se o preço já se afastou bem da abertura.
+        // Com z < 1 o resultado é praticamente moeda ao ar e pequenas diferenças
+        // no open (fonte de resolução) invalidam o sinal.
+        if (z < MIN_ABS_Z) {
+            this.logSkip(coin, 'z_baixo', { open, spot, secondsLeft, sigma, z, pTarget });
             return null;
         }
 
@@ -378,6 +388,14 @@ export class DirectTradingService {
             return null;
         }
 
+        // 6b. Divergência modelo vs mercado: se o mercado paga muito menos do que o teu p,
+        // o mais provável é o erro estar no modelo (open de outra fonte, σ subestimado, spot atrasado).
+        const gap = pCapped - avgPrice;
+        if (gap > MAX_MODEL_DISAGREEMENT) {
+            this.logSkip(coin, 'divergencia_alta', { open, spot, secondsLeft, z, pTarget, avgPrice, gap });
+            return null;
+        }
+
         // 7. Edge (com a confiança limitada)
         const edge = pCapped - avgPrice - FEE;
         if (edge < MIN_EDGE) {
@@ -404,6 +422,8 @@ export class DirectTradingService {
             secondsLeft,
             sigma,
             pTarget,
+            z,
+            gap,
             edge,
             endDate
         };
@@ -451,6 +471,8 @@ export class DirectTradingService {
             secondsLeft: Number(c.secondsLeft.toFixed(1)),
             sigma: c.sigma,
             pTarget: Number(c.pTarget.toFixed(4)),
+            z: Number(c.z.toFixed(3)),
+            gap: Number(c.gap.toFixed(4)),
             avgPrice: Number(validation.averageExecutionPrice.toFixed(4)),
             maxPriceTouched: validation.maxPriceTouched,
             edge: Number(c.edge.toFixed(4)),
@@ -626,7 +648,7 @@ export class DirectTradingService {
         this.lastSkipLog.set(key, now);
 
         const details = Object.entries(data)
-            .map(([k, v]) => `${k}=${typeof v === 'number' ? Number(v.toFixed(4)) : v}`)
+            .map(([k, v]) => `${k}=${typeof v === 'number' ? Number(v.toPrecision(4)) : v}`)
             .join(' ');
         console.log('SKIP', `⏭️ [${coin}] ${reason} | ${details}`);
 

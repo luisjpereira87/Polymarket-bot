@@ -1193,28 +1193,10 @@ export class SmartMoneyService {
               const avgEntry = position.avgEntryPrice;
               const pnlPercent = ((freshPrice - avgEntry) / avgEntry) * 100;
 
-              if (freshPrice === 0.0) {
-                console.log(`💀 [Polling] Posição ${posKey} dada como perdida (0.0). A limpar do registo local...`);
-                
-                const lossTrade: SmartMoneyTrade = {
-                  traderAddress: position.traderAddress || 'SYSTEM_AUTO_EXIT',
-                  marketSlug: position.marketSlug,
-                  outcome: position.outcome,
-                  side: 'SELL',
-                  size: position.size,
-                  price: 0.0,
-                  timestamp: Date.now(),
-                  isSmartMoney: true,
-                  endDate: position.endDate
-                };
-                
-                options.onPositionClosed?.(lossTrade, { success: true, orderId: 'market_expired_zero' }, -100);
-                realPositions.delete(posKey);
-                lastActivityMap.delete(posKey);
-              } else {
-                await internalHandler(posKey, freshPrice, pnlPercent);
-              }
+              // 🎯 Deixa o internalHandler gerir o fecho de forma unificada (seja vitória a 1.0, derrota a 0.0 ou preço normal)
+              await internalHandler(posKey, freshPrice, pnlPercent);
 
+              // Atualiza o timestamp de atividade apenas se a consulta foi bem-sucedida
               lastActivityMap.set(posKey, Date.now());
             } else {
               console.warn(`[SmartMoneyService] ⚠️ Dados indisponíveis para ${posKey} (serviço devolveu null/vazio). A manter posição em aberto por segurança.`);
