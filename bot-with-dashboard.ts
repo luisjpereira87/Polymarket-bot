@@ -266,6 +266,10 @@ function log(level: LogLevel, message: string, data?: unknown) {
   dashboardEmitter.log(level, message, data);
 }
 
+function updateDashboard() {
+  dashboardEmitter.updateState(state);
+}
+
 function canTrade(): boolean {
   // 1. Verificação se o bot está permanentemente parado
   if (state.permanentlyHalted) {
