@@ -266,10 +266,6 @@ function log(level: LogLevel, message: string, data?: unknown) {
   dashboardEmitter.log(level, message, data);
 }
 
-function updateDashboard() {
-  dashboardEmitter.updateState(state);
-}
-
 function canTrade(): boolean {
   // 1. Verificação se o bot está permanentemente parado
   if (state.permanentlyHalted) {
@@ -281,9 +277,11 @@ function canTrade(): boolean {
     if (Date.now() < state.pauseUntil) {
       return false; // Ainda está dentro do tempo de penalização
     } else {
-      // A pausa expirou, limpa o estado de pausa
+      // A pausa expirou, limpa o estado de pausa e reseta o contador de perdas para evitar re-gatilho imediato
       state.isPaused = false;
-      log('INFO', '✅ Bot retomou a execução após período de pausa por perdas consecutivas');
+      state.consecutiveLosses = 0; // 👈 CRUCIAL: Limpa as perdas para o bot conseguir voltar a negociar!
+      state.pauseUntil = 0;
+      log('INFO', '✅ Bot retomou a execução após período de pausa por perdas consecutivas (Contador de perdas resetado).');
       updateDashboard();
     }
   }
@@ -294,9 +292,10 @@ function canTrade(): boolean {
   }
 
   // 4. Verificação de Perdas Consecutivas (Gatilho da Pausa de 2h)
-  const maxConsecutiveLossesAllowed = CONFIG.risk.maxConsecutiveLosses ?? 3; // Exemplo: padrão de 3 perdas seguidas
+  const maxConsecutiveLossesAllowed = CONFIG.risk.maxConsecutiveLosses ?? 3;
 
-  if (state.consecutiveLosses >= maxConsecutiveLossesAllowed) {
+  // Só dispara a pausa se NÃO estivermos já a sair de uma pausa agora mesmo
+  if (!state.isPaused && state.consecutiveLosses >= maxConsecutiveLossesAllowed) {
     state.isPaused = true;
     const pauseDurationMs = 2 * 60 * 60 * 1000; // 2 Horas em milissegundos
     state.pauseUntil = Date.now() + pauseDurationMs;
