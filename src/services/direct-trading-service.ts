@@ -68,16 +68,16 @@ const WINDOW_MS = 15 * 60 * 1000;
 
 // Janela de entrada (segundos que faltam para fechar a vela de 15m)
 const MIN_SECONDS_LEFT = 45;
-//const MAX_SECONDS_LEFT = 300;
-const MAX_SECONDS_LEFT = 600;
+const MAX_SECONDS_LEFT = 300;
+//const MAX_SECONDS_LEFT = 600;
 
 // Modelo
 const SIGMA_INFLATE = 1.2;     // caudas gordas / incerteza do modelo
 const MAX_P_TARGET = 0.95;     // limita a confiança do modelo
-//const MIN_ABS_Z = 1.0;         // |spot - open| tem de ser >= 1 desvio (p >= ~0.84) antes de ir ao book
-const MIN_ABS_Z = 0.5;
-//const MAX_MODEL_DISAGREEMENT = 0.20; // se p - preço > isto, desconfia do modelo e não entra
-const MAX_MODEL_DISAGREEMENT = 0.15;
+const MIN_ABS_Z = 1.0;         // |spot - open| tem de ser >= 1 desvio (p >= ~0.84) antes de ir ao book
+//const MIN_ABS_Z = 0.5;
+const MAX_MODEL_DISAGREEMENT = 0.20; // se p - preço > isto, desconfia do modelo e não entra
+//const MAX_MODEL_DISAGREEMENT = 0.15;
 
 // Preço / edge
 const MAX_ENTRY_PRICE = 0.85;  // acima disto: mercado praticamente resolvido
