@@ -74,10 +74,10 @@ const MAX_SECONDS_LEFT = 600;
 // Modelo
 const SIGMA_INFLATE = 1.2;     // caudas gordas / incerteza do modelo
 const MAX_P_TARGET = 0.95;     // limita a confiança do modelo
-const MIN_ABS_Z = 1.0;         // |spot - open| tem de ser >= 1 desvio (p >= ~0.84) antes de ir ao book
-//const MIN_ABS_Z = 0.5;
-const MAX_MODEL_DISAGREEMENT = 0.20; // se p - preço > isto, desconfia do modelo e não entra
-//const MAX_MODEL_DISAGREEMENT = 0.15;
+//const MIN_ABS_Z = 1.0;         // |spot - open| tem de ser >= 1 desvio (p >= ~0.84) antes de ir ao book
+const MIN_ABS_Z = 0.5;
+//const MAX_MODEL_DISAGREEMENT = 0.20; // se p - preço > isto, desconfia do modelo e não entra
+const MAX_MODEL_DISAGREEMENT = 0.15;
 
 // Preço / edge
 const MAX_ENTRY_PRICE = 0.85;  // acima disto: mercado praticamente resolvido
@@ -88,8 +88,10 @@ const MIN_EDGE = 0.06;         // edge mínimo depois de fees
 
 // Parâmetros que já passavas ao validateOrderBookSlippage.
 // CONFIRMA o significado (assumi: preço máximo e preço mínimo aceitáveis).
-const BOOK_PARAM_A = 0.75;
-const BOOK_PARAM_B = 0.25;
+//const BOOK_PARAM_A = 0.75;
+//const BOOK_PARAM_B = 0.25;
+const BOOK_PARAM_A = 0.90;
+const BOOK_PARAM_B = 0.45;
 
 // Risco
 const MAX_POSITIONS_PER_WINDOW = 1; // BTC/ETH/SOL estão muito correlacionados
