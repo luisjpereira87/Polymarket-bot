@@ -32,3 +32,5 @@ coverage/
 .cache/
 *.tsbuildinfo
 .mcp.json
+
+logs/

@@ -1028,7 +1028,7 @@ export class SmartMoneyService {
 
       //const shouldExit = effectiveTakeProfit || effectiveFloor || effectiveStopLoss || isTimeout || isMarketClosed;
       //const shouldExit =  effectiveStopLoss || isTimeout || isMarketClosed;
-      const shouldExit =  effectiveStopLoss || isTimeout || isMarketClosed;
+      const shouldExit =  isTimeout || isMarketClosed;
 
       if (shouldExit) {
         let actionType = '🎯 Take-Profit';

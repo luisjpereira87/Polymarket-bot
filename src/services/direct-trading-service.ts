@@ -4,6 +4,8 @@ import { BinanceService, BinanceSymbol } from './binance-service.js';
 import { MarketService } from './market-service.js';
 import { OrderbookService } from './orderbook-service.js';
 import { TradingService } from './trading-service.js';
+// Ajusta o caminho à localização da pasta observers/ no teu projeto
+import { startObservers } from '../observers/observers.js';
 
 export interface DirectTradingServiceConfig {
     enabled: boolean;
@@ -61,23 +63,33 @@ interface Candidate {
     gap: number;      // pTarget - preço pago (divergência modelo vs mercado)
     edge: number;
     endDate: Date;
+    // Origem dos preços usados no modelo + valores de ambas as fontes (para comparação)
+    priceSource: 'rest' | 'ws' | 'mixed';
+    restOpen: number;
+    restSpot: number;
+    wsOpen: number | null;
+    wsSpot: number | null;
 }
 
 // ───────────────────────── Parâmetros do modelo ─────────────────────────
 const WINDOW_MS = 15 * 60 * 1000;
 
+// Origem dos preços do modelo (variável de ambiente WS_PRICES_MODE):
+//   'compare' (default): decide com REST (como antes) e REGISTA também o websocket, para comparares.
+//   'ws': decide com o websocket da Binance; cai para REST se o tick estiver velho ou o open não for fiável.
+const WS_PRICES_MODE: 'compare' | 'ws' = process.env.WS_PRICES_MODE === 'ws' ? 'ws' : 'compare';
+const WS_MAX_AGE_MS = 2000;               // tick do websocket mais velho do que isto é ignorado
+const COMPARE_LOG_THROTTLE_MS = 30_000;   // 1 linha 'price_compare' por moeda neste intervalo
+
 // Janela de entrada (segundos que faltam para fechar a vela de 15m)
 const MIN_SECONDS_LEFT = 45;
-//const MAX_SECONDS_LEFT = 300;
-const MAX_SECONDS_LEFT = 600;
+const MAX_SECONDS_LEFT = 300;
 
 // Modelo
 const SIGMA_INFLATE = 1.2;     // caudas gordas / incerteza do modelo
 const MAX_P_TARGET = 0.95;     // limita a confiança do modelo
-//const MIN_ABS_Z = 1.0;         // |spot - open| tem de ser >= 1 desvio (p >= ~0.84) antes de ir ao book
-const MIN_ABS_Z = 0.5;
-//const MAX_MODEL_DISAGREEMENT = 0.20; // se p - preço > isto, desconfia do modelo e não entra
-const MAX_MODEL_DISAGREEMENT = 0.15;
+const MIN_ABS_Z = 1.0;         // |spot - open| tem de ser >= 1 desvio (p >= ~0.84) antes de ir ao book
+const MAX_MODEL_DISAGREEMENT = 0.20; // se p - preço > isto, desconfia do modelo e não entra
 
 // Preço / edge
 const MAX_ENTRY_PRICE = 0.85;  // acima disto: mercado praticamente resolvido
@@ -88,16 +100,15 @@ const MIN_EDGE = 0.06;         // edge mínimo depois de fees
 
 // Parâmetros que já passavas ao validateOrderBookSlippage.
 // CONFIRMA o significado (assumi: preço máximo e preço mínimo aceitáveis).
-//const BOOK_PARAM_A = 0.75;
-//const BOOK_PARAM_B = 0.25;
-const BOOK_PARAM_A = 0.90;
-const BOOK_PARAM_B = 0.45;
+const BOOK_PARAM_A = 0.75;
+const BOOK_PARAM_B = 0.25;
 
 // Risco
 const MAX_POSITIONS_PER_WINDOW = 1; // BTC/ETH/SOL estão muito correlacionados
 
 // Logs para calibração
-const EDGE_LOG_DIR = 'logs';
+// Em Railway, monta um Volume (ex.: /data) e define LOG_DIR=/data/logs. Sem volume, o disco é efémero.
+const EDGE_LOG_DIR = process.env.LOG_DIR || 'logs';
 const EDGE_LOG_FILE = `${EDGE_LOG_DIR}/edge-log.jsonl`;
 const SKIP_LOG_THROTTLE_MS = 15_000;
 
@@ -122,7 +133,11 @@ export class DirectTradingService {
     private tradedWindows = new Set<number>();            // endMs das janelas onde já entrámos
     private tradesInWindow = new Map<number, number>();   // endMs -> nº de trades
     private lastSkipLog = new Map<string, number>();
+    private lastCompareLog = new Map<Coin, number>();
     private logDirReady = false;
+
+    // Observadores (só leitura) + feed websocket da Binance
+    private observers: ReturnType<typeof startObservers> | null = null;
 
     // Observabilidade
     private stats = new Map<string, number>();   // motivo -> nº de rejeições desde o último heartbeat
@@ -157,6 +172,12 @@ export class DirectTradingService {
         }
 
         console.log('TREND', '🚀 A iniciar Direct Trading Service (modelo de probabilidade + edge, Binance + Polymarket)...');
+
+        // Arranca os observadores (e o feed websocket) uma única vez
+        if (!this.observers && process.env.OBSERVERS_ENABLED !== 'false') {
+            this.observers = startObservers(this.marketService);
+        }
+        console.log('TREND', `📡 Preços do modelo: modo=${WS_PRICES_MODE} | websocket ${this.observers ? 'ligado' : 'DESLIGADO (só REST)'}`);
 
         this.stopped = false;
         const intervalMs = config.checkIntervalMs || 5000;
@@ -198,6 +219,8 @@ export class DirectTradingService {
             clearTimeout(this.timer);
             this.timer = null;
         }
+        this.observers?.stop();
+        this.observers = null;
         console.log('TREND', '🛑 Direct Trading Service parado.');
     }
 
@@ -297,9 +320,45 @@ export class DirectTradingService {
             return null;
         }
 
-        const open = Number(cur.open);
-        const spot = Number(cur.close);
-        if (!isFinite(open) || !isFinite(spot) || open <= 0 || spot <= 0) return null;
+        const restOpen = Number(cur.open);
+        const restSpot = Number(cur.close);
+        if (!isFinite(restOpen) || !isFinite(restSpot) || restOpen <= 0 || restSpot <= 0) return null;
+
+        // Preços do websocket da Binance (null se o feed não estiver ligado, estiver velho ou o open não for fiável)
+        const feed = this.observers?.feed;
+        const wsAgeMs = feed ? feed.getAgeMs(coin) : Infinity;
+        const wsSpot = feed && wsAgeMs < WS_MAX_AGE_MS ? feed.getPrice(coin) : null;
+        const wsOpen = feed ? feed.getWindowOpen(coin, windowStartMs) : null;
+
+        const useWs = WS_PRICES_MODE === 'ws';
+        const spotFromWs = useWs && wsSpot !== null;
+        const openFromWs = useWs && wsOpen !== null;
+        const spot = spotFromWs ? (wsSpot as number) : restSpot;
+        const open = openFromWs ? (wsOpen as number) : restOpen;
+        const priceSource: 'rest' | 'ws' | 'mixed' =
+            spotFromWs && openFromWs ? 'ws' : spotFromWs || openFromWs ? 'mixed' : 'rest';
+
+        // Registo de comparação REST vs websocket (1 linha por moeda a cada 30 s)
+        if (feed) {
+            const nowMs = Date.now();
+            if (nowMs - (this.lastCompareLog.get(coin) ?? 0) >= COMPARE_LOG_THROTTLE_MS) {
+                this.lastCompareLog.set(coin, nowMs);
+                void this.writeLog({
+                    ts: new Date(nowMs).toISOString(),
+                    type: 'price_compare',
+                    coin,
+                    mode: WS_PRICES_MODE,
+                    secondsLeft: Number(secondsLeft.toFixed(1)),
+                    restOpen,
+                    wsOpen,
+                    openDiff: wsOpen !== null ? Number((wsOpen - restOpen).toPrecision(6)) : null,
+                    restSpot,
+                    wsSpot,
+                    spotDiff: wsSpot !== null ? Number((wsSpot - restSpot).toPrecision(6)) : null,
+                    wsAgeMs: isFinite(wsAgeMs) ? Math.round(wsAgeMs) : null
+                });
+            }
+        }
 
         // 2. Probabilidade de fechar verde
         const sigma = await this.getSigmaPerSec(symbol);
@@ -375,13 +434,7 @@ export class DirectTradingService {
         );
 
         if (!validation.isValid) {
-            //this.logSkip(coin, 'book_invalido', { open, spot, secondsLeft, sigma, pTarget, reason: validation.reason });
-            this.logSkip(coin, 'book_invalido', {
-                open, spot, secondsLeft, sigma, z, pTarget,
-                bookReason: validation.reason,
-                avgPrice: validation.averageExecutionPrice,
-                maxPriceTouched: validation.maxPriceTouched
-            });
+            this.logSkip(coin, 'book_invalido', { open, spot, secondsLeft, sigma, pTarget, reason: validation.reason });
             return null;
         }
 
@@ -436,7 +489,12 @@ export class DirectTradingService {
             z,
             gap,
             edge,
-            endDate
+            endDate,
+            priceSource,
+            restOpen,
+            restSpot,
+            wsOpen,
+            wsSpot
         };
     }
 
@@ -479,6 +537,11 @@ export class DirectTradingService {
             direction,
             open: c.open,
             spot: c.spot,
+            priceSource: c.priceSource,
+            restOpen: c.restOpen,
+            restSpot: c.restSpot,
+            wsOpen: c.wsOpen,
+            wsSpot: c.wsSpot,
             secondsLeft: Number(c.secondsLeft.toFixed(1)),
             sigma: c.sigma,
             pTarget: Number(c.pTarget.toFixed(4)),
@@ -690,6 +753,12 @@ export class DirectTradingService {
     }
 
     private async writeLog(entry: Record<string, any>) {
+        // Cópia das ENTRADAS para o stdout: serve de backup se o disco for efémero.
+        // Recupera com `railway logs` filtrando por "EDGELOG".
+        if (entry.type === 'entry') {
+            console.log('EDGELOG ' + JSON.stringify(entry));
+        }
+
         try {
             if (!this.logDirReady) {
                 await mkdir(EDGE_LOG_DIR, { recursive: true });
