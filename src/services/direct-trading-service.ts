@@ -64,10 +64,6 @@ export class DirectTradingService {
             onTrade: DirectTradingCallback;
         }
     ) {
-        if (config.isCanTrade && !config.isCanTrade()) {
-            console.warn(`[SmartMoneyService] ⚠️ Sinal ignorado: canTrade() retornou falso.`);
-            return;
-        }
 
         if (!config.enabled) {
             console.log('TREND', 'Serviço de Direct Trading está desativado na configuração.');
@@ -82,7 +78,7 @@ export class DirectTradingService {
             const minuteInBlock = currentMinute % 15;
 
             // Proteção extra: se o ciclo disparar dentro dos primeiros 1 minutos, salta fora!
-            if (minuteInBlock < 1) {
+            if (minuteInBlock < 5) {
                 console.log('TREND', `⏳ [Safety] Minuto ${currentMinute} (${minuteInBlock}m do bloco). Demasiado cedo, a ignorar ciclo para evitar abertura...`);
                 return;
             }
@@ -105,7 +101,7 @@ export class DirectTradingService {
             const currentMinute = now.getMinutes();
             const minuteInBlock = currentMinute % 15;
 
-            if (minuteInBlock < 1) {
+            if (minuteInBlock < 5) {
                 const targetMinute = (Math.floor(currentMinute / 15) * 15) + 3;
                 const targetDate = new Date(now);
                 targetDate.setMinutes(targetMinute, 0, 0);
@@ -163,6 +159,12 @@ export class DirectTradingService {
         config: DirectTradingServiceConfig,
         onTrade: DirectTradingCallback
     ) {
+
+        if (config.isCanTrade && !config.isCanTrade()) {
+            console.warn(`[SmartMoneyService] ⚠️ Sinal ignorado: canTrade() retornou falso.`);
+            return;
+        }
+
         const symbolMap: Record<'BTC' | 'ETH' | 'SOL', any> = {
             BTC: 'BTCUSDT',
             ETH: 'ETHUSDT',
@@ -207,7 +209,7 @@ export class DirectTradingService {
         else if (changePercent < -threshold) trend = 'down';
 
         console.log('KLINE', `📊 [${symbol}] Variação: ${changePercent.toFixed(4)}% | RSI: ${currentRsi.toFixed(1)} (EMA: ${rsiEma.toFixed(1)}) | Tendência: ${trend.toUpperCase()}`);
-
+        if (trend === 'neutral') return;
         /**
         if (trend === 'neutral') return;
 
@@ -299,7 +301,7 @@ export class DirectTradingService {
 
         // 🛡️ VALIDAR LIVRO DE ORDENS REAL (Anti-Slippage)
         const amountUsdc = config.amount() || 5;
-        const validation = await this.orderbookService.validateOrderBookSlippage(targetToken.tokenId, amountUsdc, 0.75, 0.25);
+        const validation = await this.orderbookService.validateOrderBookSlippage(targetToken.tokenId, amountUsdc, 0.85, 0.45);
 
         if (!validation.isValid) {
             console.log('WARN', `⏳ [${coin}] Sinal ignorado (Slippage/Livro): ${validation.reason}`);
