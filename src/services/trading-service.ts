@@ -811,7 +811,7 @@ export class TradingService {
     // 1. Buscar saldo livre, posições ativas, estatísticas globais e atividade recente em paralelo
     const [balanceResponse, positionsRes, statsRes, activityRes] = await Promise.all([
       this.getBalanceAllowance('COLLATERAL'),
-      fetch(`https://data-api.polymarket.com/positions?user=${proxyWallet}`),
+      fetch(`https://data-api.polymarket.com/v2/positions?user=${proxyWallet}`),
       fetch(`https://data-api.polymarket.com/v2/user-stats?user=${proxyWallet}`),
       fetch(`https://data-api.polymarket.com/v2/activity?user=${proxyWallet}&limit=500&exclude_deposits_withdrawals=true`)
     ]);

@@ -1257,7 +1257,7 @@ export class RealtimeServiceV2 extends EventEmitter {
 
         for (const address of addressesToPoll) {
           try {
-            const url = `https://data-api.polymarket.com/trades?user=${address.toLowerCase()}&limit=5`;
+            const url = `https://data-api.polymarket.com/v2/trades?user=${address.toLowerCase()}&limit=5`;
             const response = await fetch(url);
             if (!response.ok) continue;
 
@@ -1333,73 +1333,6 @@ export class RealtimeServiceV2 extends EventEmitter {
           clearInterval(this.pollingInterval);
           this.pollingInterval = null;
           console.log('[RealtimeServiceV2] 🛑 Polling REST parado.');
-        }
-      },
-    };
-  }
-
-  subscribePositionPricePolling__(
-    realPositions: Map<string, TradePositions>,
-    handlers: { onPriceUpdate?: (posKey: string, currentPrice: number, pnlPercent: number) => void } = {},
-    funderAddress: String
-  ): Subscription {
-    console.log('[RealtimeServiceV2] 🔄 A iniciar polling REST na Data API para PnL das posições...');
-
-    if (this.pricePollingInterval) {
-      clearInterval(this.pricePollingInterval);
-    }
-
-    // O endereço da tua Proxy Wallet configurada
-    //const targetWalletAddress = process.env.FUNDER_ADDRESS || '0xA54565850546fA81E11880F493749c7a07Aa7eDF';
-
-    this.pricePollingInterval = setInterval(async () => {
-      console.log(`[DEBUG_POLL] Posições no mapa local: ${realPositions.size}`, Array.from(realPositions.keys()));
-      if (realPositions.size === 0) return;
-
-      try {
-        const url = `https://data-api.polymarket.com/positions?user=${funderAddress}`;
-        const response = await fetch(url);
-        if (!response.ok) return;
-
-        const apiPositions = await response.json();
-        if (!Array.isArray(apiPositions)) return;
-
-        // Mapear as posições que vêm diretamente da Data API
-        for (const apiPos of apiPositions) {
-          const marketSlug = apiPos.slug || apiPos.eventSlug;
-          const outcome = apiPos.outcome;
-          const outcomeSuffix = outcome ? `-${outcome}` : '';
-          const posKey = `${marketSlug}${outcomeSuffix}`;
-
-          // Verificar se esta posição ativa existe no nosso mapa local
-          if (realPositions.has(posKey)) {
-            const currentPrice = Number(apiPos.curPrice) || 0;
-            const pnlPercent = Number(apiPos.percentPnl) || 0;
-
-            // Atualiza também os dados locais da posição se necessário (como o tokenId/asset)
-            const localPos = realPositions.get(posKey);
-            if (localPos && apiPos.asset) {
-              (localPos as any).tokenId = apiPos.asset;
-            }
-
-            // Disparar o handler com os valores exatos da Polymarket
-            handlers.onPriceUpdate?.(posKey, currentPrice, pnlPercent);
-          }
-        }
-      } catch (error) {
-        console.error('[RealtimeServiceV2] Erro no polling REST da Data API:', error);
-      }
-    }, 15000); // Roda a cada 15 segundos
-
-    return {
-      id: `rtds_price_polling_${Date.now()}`,
-      topic: 'positions-price',
-      type: '*',
-      unsubscribe: () => {
-        if (this.pricePollingInterval) {
-          clearInterval(this.pricePollingInterval);
-          this.pricePollingInterval = null;
-          console.log('[RealtimeServiceV2] 🛑 Polling REST de preços parado.');
         }
       },
     };
