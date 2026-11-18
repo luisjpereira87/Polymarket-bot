@@ -1439,7 +1439,7 @@ export class RealtimeServiceV2 extends EventEmitter {
           // ==========================================
           // LÓGICA REAL: Data API (Usa a wallet/proxy)
           // ==========================================
-          const url = `https://data-api.polymarket.com/positions?user=${funderAddress}`;
+          const url = `https://data-api.polymarket.com/v2/positions?user=${funderAddress}`;
           const response = await fetch(url);
           if (!response.ok) return;
 

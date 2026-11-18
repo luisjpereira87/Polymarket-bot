@@ -1,12 +1,12 @@
 import {
     Coin,
     COINS,
-    fetchBook,
     JsonlLogger,
     LOG_DIR,
     MarketResolver,
+    fetchBook,
     vwapForShares
-} from "./polymarket-helpers";
+} from './polymarket-helpers.js';
 
 export interface DutchBookConfig {
     pollMs?: number;          // intervalo entre ciclos (default 3000)
@@ -16,6 +16,8 @@ export interface DutchBookConfig {
     minSecondsLeft?: number;  // ignora os últimos segundos da janela (default 10)
     oppThrottleMs?: number;   // máx. 1 linha de "opportunity" por moeda neste intervalo (default 5 s)
     spot?: (coin: Coin) => number | null; // opcional: preço spot atual (Binance) para contexto
+    /** opcional: preço de abertura da janela (Binance). Permite registar o deslocamento da vela em bps. */
+    open?: (coin: Coin, startMs: number) => number | null | Promise<number | null>;
 }
 
 interface SizeResult {
@@ -162,6 +164,15 @@ export class DutchBookObserver {
             this.stats.netPositive.set(r.shares, (this.stats.netPositive.get(r.shares) ?? 0) + 1);
         }
 
+        const spotNow = this.cfg.spot ? this.cfg.spot(coin) : null;
+        let openPx: number | null = null;
+        try {
+            openPx = this.cfg.open ? await this.cfg.open(coin, m.startMs) : null;
+        } catch {
+            openPx = null;
+        }
+        const dispBps = spotNow !== null && openPx ? ((spotNow - openPx) / openPx) * 1e4 : null;
+
         const bidUp = up.bids[0]?.price ?? null;
         const bidDown = down.bids[0]?.price ?? null;
 
@@ -180,7 +191,9 @@ export class DutchBookObserver {
             bidDown,
             sumBids: bidUp !== null && bidDown !== null ? Number((bidUp + bidDown).toFixed(4)) : null,
             sizes: results,
-            spot: this.cfg.spot ? this.cfg.spot(coin) : null,
+            spot: spotNow,
+            open: openPx,
+            dispBps: dispBps !== null ? Number(dispBps.toFixed(3)) : null,
             bookLatencyMs: Math.max(up.latencyMs, down.latencyMs)
         };
 

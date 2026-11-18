@@ -202,6 +202,53 @@ export class MarketResolver {
     }
 }
 
+// ───────────── Open da janela de 15m na Binance (fallback REST) ─────────────
+
+const BINANCE_SYMBOL: Record<Coin, string> = { BTC: 'BTCUSDT', ETH: 'ETHUSDT', SOL: 'SOLUSDT' };
+// Se a Binance bloquear a tua região: BINANCE_REST_URL=https://data-api.binance.vision
+const BINANCE_REST = process.env.BINANCE_REST_URL || 'https://api.binance.com';
+
+/**
+ * Obtém o preço de abertura da vela de 15m que começou em `startMs` (UTC), via REST público.
+ * Serve de fallback quando o websocket não viu o início da janela (ex.: o bot arrancou a meio).
+ * Guarda os valores em cache e, após uma falha, só volta a tentar passados 15 s.
+ */
+export class BinanceOpenCache {
+    private cache = new Map<string, number>();
+    private failedUntil = new Map<string, number>();
+
+    async get(coin: Coin, startMs: number): Promise<number | null> {
+        const key = `${coin}:${startMs}`;
+        const hit = this.cache.get(key);
+        if (hit !== undefined) return hit;
+        if (Date.now() < (this.failedUntil.get(key) ?? 0)) return null;
+
+        try {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 4000);
+            const res = await fetch(
+                `${BINANCE_REST}/api/v3/klines?symbol=${BINANCE_SYMBOL[coin]}&interval=15m&startTime=${startMs}&limit=1`,
+                { signal: ctrl.signal }
+            ).finally(() => clearTimeout(timer));
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const k: any = await res.json();
+            if (!Array.isArray(k) || !k[0] || Number(k[0][0]) !== startMs) throw new Error('kline inesperada');
+            const open = Number(k[0][1]);
+            if (!isFinite(open) || open <= 0) throw new Error('open inválido');
+
+            this.cache.set(key, open);
+            if (this.cache.size > 200) {
+                // limpeza simples: remove as entradas mais antigas
+                for (const kk of [...this.cache.keys()].slice(0, 100)) this.cache.delete(kk);
+            }
+            return open;
+        } catch {
+            this.failedUntil.set(key, Date.now() + 15_000);
+            return null;
+        }
+    }
+}
+
 // ───────────────────────── Logger JSONL ─────────────────────────
 
 export class JsonlLogger {
