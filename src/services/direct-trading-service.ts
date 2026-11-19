@@ -1,21 +1,18 @@
-import { appendFile, mkdir } from 'fs/promises';
 import { SmartMoneyTrade, TradePositions } from '../index.js';
-import { BinanceService, BinanceSymbol } from './binance-service.js';
+import { BinanceService } from './binance-service.js';
 import { MarketService } from './market-service.js';
 import { OrderbookService } from './orderbook-service.js';
 import { TradingService } from './trading-service.js';
-// Ajusta o caminho à localização da pasta observers/ no teu projeto
-import { startObservers } from '../observers/observers.js';
 
 export interface DirectTradingServiceConfig {
     enabled: boolean;
-    interval: string;         // ex: '15m' (mantido por compatibilidade, o modelo usa sempre 15m)
-    trendThreshold: number;   // já não é usado (mantido por compatibilidade)
-    amount: () => number;     // ex: 5 (USDC)
-    dryRun?: boolean;
-    checkIntervalMs?: number; // ex: 5000 (agora corre a cada ~5 s dentro da janela de entrada)
+    interval: string;         // ex: '15m'
+    trendThreshold: number;   // ex: 0.3
+    amount:  () => number;           // ex: 5 (USDC)
+    dryRun?: boolean;         // Flag para saber se simula ou executa a sério
+    checkIntervalMs?: number; // ex: 5 * 60 * 1000
     isCanTrade: () => boolean;
-    positions: () => Map<string, TradePositions>;
+    positions: () => Map<string, TradePositions>
 }
 
 export interface OrderBookValidationResult {
@@ -39,114 +36,12 @@ interface ClobOrderBookResponse {
 
 export type DirectTradingCallback = (trade: any, result: any) => Promise<void> | void;
 
-type Coin = 'BTC' | 'ETH' | 'SOL';
-
-interface CachedMarket {
-    market: any;
-    fullMarket: any;
-    startMs: number;
-    endMs: number;
-}
-
-interface Candidate {
-    coin: Coin;
-    market: any;
-    targetToken: any;
-    direction: 'up' | 'down';
-    validation: OrderBookValidationResult;
-    open: number;
-    spot: number;
-    secondsLeft: number;
-    sigma: number;
-    pTarget: number;
-    z: number;
-    gap: number;      // pTarget - preço pago (divergência modelo vs mercado)
-    edge: number;
-    endDate: Date;
-    // Origem dos preços usados no modelo + valores de ambas as fontes (para comparação)
-    priceSource: 'rest' | 'ws' | 'mixed';
-    restOpen: number;
-    restSpot: number;
-    wsOpen: number | null;
-    wsSpot: number | null;
-}
-
-// ───────────────────────── Parâmetros do modelo ─────────────────────────
-const WINDOW_MS = 15 * 60 * 1000;
-
-// Origem dos preços do modelo (variável de ambiente WS_PRICES_MODE):
-//   'compare' (default): decide com REST (como antes) e REGISTA também o websocket, para comparares.
-//   'ws': decide com o websocket da Binance; cai para REST se o tick estiver velho ou o open não for fiável.
-const WS_PRICES_MODE: 'compare' | 'ws' = process.env.WS_PRICES_MODE === 'ws' ? 'ws' : 'compare';
-const WS_MAX_AGE_MS = 2000;               // tick do websocket mais velho do que isto é ignorado
-const COMPARE_LOG_THROTTLE_MS = 30_000;   // 1 linha 'price_compare' por moeda neste intervalo
-
-// Janela de entrada (segundos que faltam para fechar a vela de 15m)
-const MIN_SECONDS_LEFT = 45;
-const MAX_SECONDS_LEFT = 300;
-
-// Modelo
-// Backtest (90 dias de BTC, klines de 1 min): com σ = RMS dos últimos 60 retornos de 1 min, P(Up) real bate com Φ(z)
-// no corpo da distribuição, por isso não é preciso inflacionar o σ. Nas caudas (|z|>2) a normal exagera, daí o teto abaixo.
-const SIGMA_INFLATE = 1.0;
-const MAX_P_TARGET = 0.97;     // teto de probabilidade (backtest: com z>=2 a P(Up) real fica ~0.975, não 0.995)
-const MIN_ABS_Z = 1.0;         // |spot - open| tem de ser >= 1 desvio (p >= ~0.84) antes de ir ao book
-const MAX_MODEL_DISAGREEMENT = 0.20; // se p - preço > isto, desconfia do modelo e não entra
-
-// Preço / edge
-const MAX_ENTRY_PRICE = 0.85;  // acima disto: mercado praticamente resolvido
-const MIN_ENTRY_PRICE = 0.15;  // abaixo disto: lotaria
-const MIN_PAYOFF_RATIO = 0.15; // (1 - preço) / preço
-const FEE = 0.01;              // CONFIRMA as fees reais do mercado
-const MIN_EDGE = 0.06;         // edge mínimo depois de fees
-
-// Parâmetros que já passavas ao validateOrderBookSlippage.
-// CONFIRMA o significado (assumi: preço máximo e preço mínimo aceitáveis).
-const BOOK_PARAM_A = 0.85;
-const BOOK_PARAM_B = 0.45;
-
-// Risco
-const MAX_POSITIONS_PER_WINDOW = 1; // BTC/ETH/SOL estão muito correlacionados
-
-// Logs para calibração
-// Em Railway, monta um Volume (ex.: /data) e define LOG_DIR=/data/logs. Sem volume, o disco é efémero.
-const EDGE_LOG_DIR = process.env.LOG_DIR || 'logs';
-const EDGE_LOG_FILE = `${EDGE_LOG_DIR}/edge-log.jsonl`;
-const SKIP_LOG_THROTTLE_MS = 15_000;
-
-const SYMBOL_MAP: Record<'BTC' | 'ETH' | 'SOL', any> = {
-    BTC: 'BTCUSDT',
-    ETH: 'ETHUSDT',
-    SOL: 'SOLUSDT'
-};
-
 export class DirectTradingService {
     private marketService: MarketService;
     private tradingService: TradingService;
     private binanceService: BinanceService;
     private orderbookService: OrderbookService;
-
     private timer: NodeJS.Timeout | null = null;
-    private running = false;   // evita sobreposição de ciclos
-    private stopped = true;
-
-    private marketCache = new Map<Coin, CachedMarket>();
-    private sigmaCache = new Map<string, { minute: number; value: number }>();
-    private tradedWindows = new Set<number>();            // endMs das janelas onde já entrámos
-    private tradesInWindow = new Map<number, number>();   // endMs -> nº de trades
-    private lastSkipLog = new Map<string, number>();
-    private lastCompareLog = new Map<Coin, number>();
-    private logDirReady = false;
-
-    // Observadores (só leitura) + feed websocket da Binance
-    private observers: ReturnType<typeof startObservers> | null = null;
-
-    // Observabilidade
-    private stats = new Map<string, number>();   // motivo -> nº de rejeições desde o último heartbeat
-    private evaluations = 0;                     // nº de avaliações desde o último heartbeat
-    private lastHeartbeat = 0;
-    private lastIdleLog = 0;
-    private lastEvalLog = new Map<string, number>();
 
     constructor(
         tradingService: TradingService,
@@ -161,613 +56,484 @@ export class DirectTradingService {
     }
 
     /**
-     * Inicia o serviço. Corre a cada ~5 s, mas só faz trabalho pesado
-     * quando faltam entre MIN_SECONDS_LEFT e MAX_SECONDS_LEFT para fechar a vela de 15m.
+     * Inicia o serviço de Direct Trading aceitando parâmetros de execução e o callback de sinal
      */
     public async startTradingLoop(
         config: DirectTradingServiceConfig,
-        options: { onTrade: DirectTradingCallback }
+        options: {
+            onTrade: DirectTradingCallback;
+        }
     ) {
+
         if (!config.enabled) {
             console.log('TREND', 'Serviço de Direct Trading está desativado na configuração.');
             return;
         }
 
-        console.log('TREND', '🚀 A iniciar Direct Trading Service (modelo de probabilidade + edge, Binance + Polymarket)...');
+        console.log('TREND', '🚀 A iniciar Direct Trading Service (Binance + Polymarket)...');
 
-        // Arranca os observadores (e o feed websocket) uma única vez
-        if (!this.observers && process.env.OBSERVERS_ENABLED !== 'false') {
-            this.observers = startObservers(this.marketService);
-        }
-        console.log('TREND', `📡 Preços do modelo: modo=${WS_PRICES_MODE} | websocket ${this.observers ? 'ligado' : 'DESLIGADO (só REST)'}`);
+        const executeCheck = async () => {
+            const now = new Date();
+            const currentMinute = now.getMinutes();
+            const minuteInBlock = currentMinute % 15;
 
-        this.stopped = false;
-        const intervalMs = config.checkIntervalMs || 5000;
-
-        console.log(
-            'TREND',
-            `⚙️ Parâmetros: janela ${MIN_SECONDS_LEFT}-${MAX_SECONDS_LEFT}s | preço ${MIN_ENTRY_PRICE}-${MAX_ENTRY_PRICE} | edge mín ${MIN_EDGE} | fee ${FEE} | p máx ${MAX_P_TARGET} | ciclo ${intervalMs}ms | dryRun=${config.dryRun ?? false}`
-        );
-
-        const tick = async () => {
-            if (this.stopped) return;
-
-            if (!this.running) {
-                this.running = true;
-                try {
-                    await this.executeCycle(config, options.onTrade);
-                } catch (err) {
-                    console.log('ERROR', `❌ Erro no ciclo: ${(err as Error).message}`);
-                } finally {
-                    this.running = false;
-                }
+            // Proteção extra: se o ciclo disparar dentro dos primeiros 1 minutos, salta fora!
+            if (minuteInBlock < 5) {
+                console.log('TREND', `⏳ [Safety] Minuto ${currentMinute} (${minuteInBlock}m do bloco). Demasiado cedo, a ignorar ciclo para evitar abertura...`);
+                return;
             }
 
-            if (!this.stopped) {
-                this.timer = setTimeout(tick, intervalMs);
+            const coins: Array<'BTC' | 'ETH' | 'SOL'> = ['BTC', 'ETH', 'SOL'];
+
+            for (const coin of coins) {
+                try {
+                    await this.analyzeAndExecuteCoin(coin, config, options.onTrade);
+                } catch (err) {
+                    console.log('ERROR', `❌ Erro no ciclo de tendência para ${coin}: ${(err as Error).message}`);
+                }
             }
         };
 
-        this.timer = setTimeout(tick, 0);
+        const intervalMs = config.checkIntervalMs || 2 * 60 * 1000;
+
+        const getDelayToSafeMinute = () => {
+            const now = new Date();
+            const currentMinute = now.getMinutes();
+            const minuteInBlock = currentMinute % 15;
+
+            if (minuteInBlock < 5) {
+                const targetMinute = (Math.floor(currentMinute / 15) * 15) + 3;
+                const targetDate = new Date(now);
+                targetDate.setMinutes(targetMinute, 0, 0);
+                const delay = targetDate.getTime() - now.getTime();
+                return delay > 0 ? delay : 0;
+            }
+            return 0;
+        };
+
+        const startInterval = () => {
+            // Garante que limpa qualquer timer anterior antes de criar um novo
+            if (this.timer) {
+                clearTimeout(this.timer);
+                clearInterval(this.timer);
+            }
+            this.timer = setInterval(executeCheck, intervalMs);
+        };
+
+        const initialDelay = getDelayToSafeMinute();
+
+        if (initialDelay > 0) {
+            console.log('TREND', `⏳ [Loop] A aguardar ${(initialDelay / 1000).toFixed(0)}s para escapar à zona de viragem de 15m...`);
+            this.timer = setTimeout(async () => {
+                await executeCheck();
+                startInterval(); // Arranca o intervalo regular após o delay inicial
+            }, initialDelay);
+        } else {
+            // Executa já e arranca o intervalo regular
+            await executeCheck();
+            startInterval();
+        }
 
         return {
-            unsubscribe: () => this.stop()
+            unsubscribe: () => {
+                if (this.timer) {
+                    clearTimeout(this.timer);
+                    clearInterval(this.timer);
+                    this.timer = null;
+                    console.log('TREND', '🛑 Direct Trading Service cancelado via unsubscribe.');
+                }
+            }
         };
     }
 
     public stop() {
-        this.stopped = true;
         if (this.timer) {
-            clearTimeout(this.timer);
+            clearInterval(this.timer);
             this.timer = null;
         }
-        this.observers?.stop();
-        this.observers = null;
         console.log('TREND', '🛑 Direct Trading Service parado.');
     }
 
-    // ───────────────────────── Ciclo principal ─────────────────────────
-
-    private async executeCycle(config: DirectTradingServiceConfig, onTrade: DirectTradingCallback) {
-        const now = Date.now();
-
-        // isCanTrade passa a ser avaliado em cada ciclo
-        if (config.isCanTrade && !config.isCanTrade()) {
-            if (now - this.lastIdleLog > 30_000) {
-                this.lastIdleLog = now;
-                console.log('TREND', '⏸️ isCanTrade() = false. Sem avaliações.');
-            }
-            return;
-        }
-
-        // Filtro barato pelo relógio: sem chamadas à rede fora da janela de entrada
-        const windowStartMs = Math.floor(now / WINDOW_MS) * WINDOW_MS;
-        const windowEndMs = windowStartMs + WINDOW_MS;
-        const secondsLeft = (windowEndMs - now) / 1000;
-
-        if (secondsLeft < MIN_SECONDS_LEFT || secondsLeft > MAX_SECONDS_LEFT) {
-            if (now - this.lastIdleLog > 60_000) {
-                this.lastIdleLog = now;
-                const untilEntry = secondsLeft > MAX_SECONDS_LEFT
-                    ? secondsLeft - MAX_SECONDS_LEFT
-                    : secondsLeft + WINDOW_MS / 1000 - MAX_SECONDS_LEFT;
-                console.log('TREND', `💤 Fora da janela de entrada (faltam ${secondsLeft.toFixed(0)}s para fechar a vela). Próxima janela de avaliação em ~${untilEntry.toFixed(0)}s.`);
-            }
-            return;
-        }
-
-        this.heartbeat(secondsLeft);
-
-        // Limpeza de estado de janelas antigas
-        for (const end of this.tradedWindows) {
-            if (end < now - WINDOW_MS) this.tradedWindows.delete(end);
-        }
-        for (const end of this.tradesInWindow.keys()) {
-            if (end < now - WINDOW_MS) this.tradesInWindow.delete(end);
-        }
-
-        if ((this.tradesInWindow.get(windowEndMs) ?? 0) >= MAX_POSITIONS_PER_WINDOW) {
-            if (now - this.lastIdleLog > 30_000) {
-                this.lastIdleLog = now;
-                console.log('TREND', `✋ Janela já tem ${MAX_POSITIONS_PER_WINDOW} posição(ões). A aguardar a próxima.`);
-            }
-            return;
-        }
-
-        const coins: Coin[] = ['BTC', 'ETH', 'SOL'];
-
-        // Avalia as 3 moedas e escolhe a de maior edge (1 posição por janela)
-        const candidates: Candidate[] = [];
-        for (const coin of coins) {
-            try {
-                const c = await this.evaluateCoin(coin, config, windowStartMs, windowEndMs);
-                if (c) candidates.push(c);
-            } catch (err) {
-                console.log('ERROR', `❌ Erro a avaliar ${coin}: ${(err as Error).message}`);
-            }
-        }
-
-        if (candidates.length === 0) return;
-
-        candidates.sort((a, b) => b.edge - a.edge);
-        const best = candidates[0];
-
-        await this.executeCandidate(best, config, onTrade, windowEndMs);
-    }
-
-    // ───────────────────────── Avaliação por moeda ─────────────────────────
-
-    private async evaluateCoin(
-        coin: Coin,
+    private async analyzeAndExecuteCoin(
+        coin: 'BTC' | 'ETH' | 'SOL',
         config: DirectTradingServiceConfig,
-        windowStartMs: number,
-        windowEndMs: number
-    ): Promise<Candidate | null> {
-        const symbol = SYMBOL_MAP[coin];
-        const secondsLeft = (windowEndMs - Date.now()) / 1000;
-        if (secondsLeft < MIN_SECONDS_LEFT || secondsLeft > MAX_SECONDS_LEFT) return null;
-
-        // 1. Open da vela de 15m e preço atual (vela em curso)
-        const klines = await this.binanceService.getKLines(symbol, '15m' as any, { limit: 2 });
-        if (!klines || klines.length < 1) {
-            console.log('WARN', `⚠️ Klines em falta para ${symbol}`);
-            return null;
-        }
-        const cur: any = klines[klines.length - 1];
-
-        // Sanidade: a última vela tem de ser a da janela atual (se o campo existir)
-        const kOpenTime = Number(cur.openTime ?? cur.time ?? cur.openTimeMs ?? 0);
-        if (kOpenTime > 0 && Math.abs(kOpenTime - windowStartMs) > 5000) {
-            console.log('WARN', `⚠️ [${coin}] Última vela (${new Date(kOpenTime).toISOString()}) não corresponde à janela atual. A ignorar.`);
-            return null;
-        }
-
-        const restOpen = Number(cur.open);
-        const restSpot = Number(cur.close);
-        if (!isFinite(restOpen) || !isFinite(restSpot) || restOpen <= 0 || restSpot <= 0) return null;
-
-        // Preços do websocket da Binance (null se o feed não estiver ligado, estiver velho ou o open não for fiável)
-        const feed = this.observers?.feed;
-        const wsAgeMs = feed ? feed.getAgeMs(coin) : Infinity;
-        const wsSpot = feed && wsAgeMs < WS_MAX_AGE_MS ? feed.getPrice(coin) : null;
-        const wsOpen = feed ? feed.getWindowOpen(coin, windowStartMs) : null;
-
-        const useWs = WS_PRICES_MODE === 'ws';
-        const spotFromWs = useWs && wsSpot !== null;
-        const openFromWs = useWs && wsOpen !== null;
-        const spot = spotFromWs ? (wsSpot as number) : restSpot;
-        const open = openFromWs ? (wsOpen as number) : restOpen;
-        const priceSource: 'rest' | 'ws' | 'mixed' =
-            spotFromWs && openFromWs ? 'ws' : spotFromWs || openFromWs ? 'mixed' : 'rest';
-
-        // Registo de comparação REST vs websocket (1 linha por moeda a cada 30 s)
-        if (feed) {
-            const nowMs = Date.now();
-            if (nowMs - (this.lastCompareLog.get(coin) ?? 0) >= COMPARE_LOG_THROTTLE_MS) {
-                this.lastCompareLog.set(coin, nowMs);
-                void this.writeLog({
-                    ts: new Date(nowMs).toISOString(),
-                    type: 'price_compare',
-                    coin,
-                    mode: WS_PRICES_MODE,
-                    secondsLeft: Number(secondsLeft.toFixed(1)),
-                    restOpen,
-                    wsOpen,
-                    openDiff: wsOpen !== null ? Number((wsOpen - restOpen).toPrecision(6)) : null,
-                    restSpot,
-                    wsSpot,
-                    spotDiff: wsSpot !== null ? Number((wsSpot - restSpot).toPrecision(6)) : null,
-                    wsAgeMs: isFinite(wsAgeMs) ? Math.round(wsAgeMs) : null
-                });
-            }
-        }
-
-        // 2. Probabilidade de fechar verde
-        const sigma = await this.getSigmaPerSec(symbol);
-        if (!isFinite(sigma) || sigma <= 0) {
-            this.logSkip(coin, 'sigma_invalido', { open, spot, secondsLeft, sigma });
-            return null;
-        }
-
-        this.evaluations++;
-
-        const pUp = this.computePUp(open, spot, secondsLeft, sigma);
-        const direction: 'up' | 'down' = pUp >= 0.5 ? 'up' : 'down';
-        const pTarget = direction === 'up' ? pUp : 1 - pUp;
-        const pCapped = Math.min(pTarget, MAX_P_TARGET);
-
-        // z = distância à abertura em desvios-padrão (com o σ inflacionado)
-        const sdPrice = sigma * SIGMA_INFLATE * Math.sqrt(secondsLeft) * spot;
-        const z = sdPrice > 0 ? Math.abs(spot - open) / sdPrice : 0;
-
-        // Linha de avaliação (uma a cada 10 s por moeda), para veres que o bot está a trabalhar
-        {
-            const now = Date.now();
-            if (now - (this.lastEvalLog.get(coin) ?? 0) >= 10_000) {
-                this.lastEvalLog.set(coin, now);
-                const movePct = ((spot - open) / open) * 100;
-                console.log(
-                    'EVAL',
-                    `🔎 [${coin}] open=${open} spot=${spot} (${movePct >= 0 ? '+' : ''}${movePct.toFixed(3)}%) | σ/s=${sigma.toExponential(2)} | faltam ${secondsLeft.toFixed(0)}s | z=${z.toFixed(2)} | p(${direction})=${pTarget.toFixed(3)}`
-                );
-            }
-        }
-
-        // Filtro principal: só avança se o preço já se afastou bem da abertura.
-        // Com z < 1 o resultado é praticamente moeda ao ar e pequenas diferenças
-        // no open (fonte de resolução) invalidam o sinal.
-        if (z < MIN_ABS_Z) {
-            this.logSkip(coin, 'z_baixo', { open, spot, secondsLeft, sigma, z, pTarget });
-            return null;
-        }
-
-        // 3. Mercado da Polymarket (em cache por janela)
-        const cached = await this.getMarketForWindow(coin, windowStartMs, windowEndMs);
-        if (!cached) return null;
-        const { market, fullMarket } = cached;
-
-        const yesToken = fullMarket.tokens.find((t: any) => t.outcome === 'Up' || t.outcome === 'Yes');
-        const noToken = fullMarket.tokens.find((t: any) => t.outcome === 'Down' || t.outcome === 'No');
-        const targetToken = direction === 'up' ? yesToken : noToken;
-
-        if (!targetToken) {
-            console.log('WARN', `⚠️ Token de destino ('${direction === 'up' ? 'Up/Yes' : 'Down/No'}') não encontrado para ${coin}`);
-            return null;
-        }
-
-        // 4. Anti-duplicação: UMA posição por mercado (qualquer outcome)
-        const currentPositions = typeof config.positions === 'function' ? config.positions() : null;
-        if (currentPositions) {
-            for (const key of currentPositions.keys()) {
-                if (key.startsWith(market.slug)) {
-                    this.logSkip(coin, 'posicao_duplicada', { slug: market.slug, key });
-                    return null;
-                }
-            }
-        }
-
-        // 5. Validar o book real
-        const amountUsdc = config.amount() || 5;
-        const validation: OrderBookValidationResult = await this.orderbookService.validateOrderBookSlippage(
-            targetToken.tokenId,
-            amountUsdc,
-            BOOK_PARAM_A,
-            BOOK_PARAM_B
-        );
-
-        if (!validation.isValid) {
-            this.logSkip(coin, 'book_invalido', { open, spot, secondsLeft, sigma, pTarget, reason: validation.reason });
-            return null;
-        }
-
-        const avgPrice = validation.averageExecutionPrice;
-
-        // 6. Filtros de "mercado praticamente resolvido"
-        if (avgPrice > MAX_ENTRY_PRICE || avgPrice < MIN_ENTRY_PRICE) {
-            this.logSkip(coin, 'quase_resolvido', { open, spot, secondsLeft, sigma, pTarget, avgPrice });
-            return null;
-        }
-
-        const payoffRatio = (1 - avgPrice) / avgPrice;
-        if (payoffRatio < MIN_PAYOFF_RATIO) {
-            this.logSkip(coin, 'payoff_baixo', { open, spot, secondsLeft, sigma, pTarget, avgPrice, payoffRatio });
-            return null;
-        }
-
-        // 6b. Divergência modelo vs mercado: se o mercado paga muito menos do que o teu p,
-        // o mais provável é o erro estar no modelo (open de outra fonte, σ subestimado, spot atrasado).
-        const gap = pCapped - avgPrice;
-        if (gap > MAX_MODEL_DISAGREEMENT) {
-            this.logSkip(coin, 'divergencia_alta', { open, spot, secondsLeft, z, pTarget, avgPrice, gap });
-            return null;
-        }
-
-        // 7. Edge (com a confiança limitada)
-        const edge = pCapped - avgPrice - FEE;
-        if (edge < MIN_EDGE) {
-            this.logSkip(coin, 'edge_baixo', { open, spot, secondsLeft, sigma, pTarget, avgPrice, edge });
-            return null;
-        }
-
-        const rawEndDate = market.endDate || fullMarket.endDate;
-        const endDate = rawEndDate ? new Date(rawEndDate) : new Date(windowEndMs);
-
-        console.log(
-            'SIGNAL',
-            `🎯 [${coin}] ${direction.toUpperCase()} | p=${pTarget.toFixed(3)} | preço=${avgPrice.toFixed(3)} | edge=${edge.toFixed(3)} | faltam ${secondsLeft.toFixed(0)}s`
-        );
-
-        return {
-            coin,
-            market,
-            targetToken,
-            direction,
-            validation,
-            open,
-            spot,
-            secondsLeft,
-            sigma,
-            pTarget,
-            z,
-            gap,
-            edge,
-            endDate,
-            priceSource,
-            restOpen,
-            restSpot,
-            wsOpen,
-            wsSpot
-        };
-    }
-
-    // ───────────────────────── Execução ─────────────────────────
-
-    private async executeCandidate(
-        c: Candidate,
-        config: DirectTradingServiceConfig,
-        onTrade: DirectTradingCallback,
-        windowEndMs: number
+        onTrade: DirectTradingCallback
     ) {
-        const { coin, market, targetToken, direction, validation } = c;
-        const amountUsdc = config.amount() || 5;
 
-        const syntheticTrade: SmartMoneyTrade = {
-            traderAddress: `ProbEdge-${coin}`,
-            marketSlug: market.slug,
-            side: 'BUY',
-            size: validation.totalShares,
-            price: validation.averageExecutionPrice,
-            tokenId: targetToken.tokenId,
-            conditionId: market.conditionId,
-            traderName: `Edge Bot (${coin})`,
-            timestamp: Date.now(),
-            isSmartMoney: false,
-            endDate: c.endDate,
-            outcome: targetToken.outcome
-        };
-
-        const isDryRun = config.dryRun ?? false;
-
-        // Marca a janela como usada antes de submeter, para nunca duplicar
-        this.tradesInWindow.set(windowEndMs, (this.tradesInWindow.get(windowEndMs) ?? 0) + 1);
-
-        const logBase = {
-            ts: new Date().toISOString(),
-            type: 'entry',
-            coin,
-            slug: market.slug,
-            direction,
-            open: c.open,
-            spot: c.spot,
-            priceSource: c.priceSource,
-            restOpen: c.restOpen,
-            restSpot: c.restSpot,
-            wsOpen: c.wsOpen,
-            wsSpot: c.wsSpot,
-            secondsLeft: Number(c.secondsLeft.toFixed(1)),
-            sigma: c.sigma,
-            pTarget: Number(c.pTarget.toFixed(4)),
-            z: Number(c.z.toFixed(3)),
-            gap: Number(c.gap.toFixed(4)),
-            avgPrice: Number(validation.averageExecutionPrice.toFixed(4)),
-            maxPriceTouched: validation.maxPriceTouched,
-            edge: Number(c.edge.toFixed(4)),
-            shares: validation.totalShares,
-            amountUsdc,
-            dryRun: isDryRun
-        };
-
-        if (isDryRun) {
-            console.log('SIGNAL', `🧪 [DRY RUN] Trade (${coin}): ${direction.toUpperCase()} em ${market.question?.slice(0, 30)}...`);
-            await this.writeLog(logBase);
-            await onTrade(syntheticTrade, { success: true });
+        if (config.isCanTrade && !config.isCanTrade()) {
+            console.warn(`[SmartMoneyService] ⚠️ Sinal ignorado: canTrade() retornou falso.`);
             return;
         }
 
-        console.log('SIGNAL', `🔴 Executando Trade Real (${coin}): ${direction.toUpperCase()} em ${market.question?.slice(0, 30)}...`);
-
-        try {
-            const res = await this.tradingService.createMarketOrder({
-                tokenId: targetToken.tokenId,
-                side: 'BUY',
-                amount: amountUsdc
-            });
-
-            await this.writeLog({ ...logBase, success: !!res?.success, error: res?.errorMsg });
-            await onTrade(syntheticTrade, res);
-
-            if (res && res.success) {
-                console.log('TRADE', `✅ Trade Executado (${coin}): Compra de $${amountUsdc} em ${targetToken.outcome}`);
-            } else {
-                console.log('WARN', `❌ Trade falhou: ${res?.errorMsg || 'Erro desconhecido'}`);
-                // Falhou: liberta a janela para nova tentativa
-                this.tradesInWindow.set(windowEndMs, Math.max(0, (this.tradesInWindow.get(windowEndMs) ?? 1) - 1));
-            }
-        } catch (orderErr) {
-            console.log('ERROR', `❌ Erro crítico ao submeter ordem: ${(orderErr as Error).message}`);
-            this.tradesInWindow.set(windowEndMs, Math.max(0, (this.tradesInWindow.get(windowEndMs) ?? 1) - 1));
-        }
-    }
-
-    // ───────────────────────── Modelo ─────────────────────────
-
-    private normCdf(x: number): number {
-        const t = 1 / (1 + 0.2316419 * Math.abs(x));
-        const d = 0.3989423 * Math.exp((-x * x) / 2);
-        const p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
-        return x > 0 ? 1 - p : p;
-    }
-
-    /**
-     * Probabilidade de a vela fechar com close >= open.
-     * Movimento browniano sem drift, com σ inflacionado.
-     */
-    private computePUp(open: number, spot: number, secondsLeft: number, sigmaPerSec: number): number {
-        const sd = sigmaPerSec * SIGMA_INFLATE * Math.sqrt(secondsLeft) * spot;
-        if (sd === 0) return spot >= open ? 1 : 0;
-        return this.normCdf((spot - open) / sd);
-    }
-
-    /**
-     * σ por segundo a partir de klines de 1m (ignora a vela em curso).
-     * Usa o RMS dos últimos 60 retornos de 1 min, que é a definição validada no backtest (backtest-klines.mjs).
-     * Em cache por minuto.
-     */
-    private async getSigmaPerSec(symbol: BinanceSymbol): Promise<number> {
-        const minute = Math.floor(Date.now() / 60000);
-        const cached = this.sigmaCache.get(symbol);
-        if (cached && cached.minute === minute) return cached.value;
-
-        const k = await this.binanceService.getKLines(symbol, '1m' as any, { limit: 121 });
-        if (!k || k.length < 30) return cached?.value ?? NaN;
-
-        const closed = k.slice(0, -1);
-        const rets: number[] = [];
-        for (let i = 1; i < closed.length; i++) {
-            const r = Math.log(Number((closed[i] as any).close) / Number((closed[i - 1] as any).close));
-            if (isFinite(r)) rets.push(r);
-        }
-        if (rets.length < 20) return cached?.value ?? NaN;
-
-        const sigmaOf = (arr: number[]) => {
-            const v = arr.reduce((s, r) => s + r * r, 0) / arr.length; // variância por minuto
-            return Math.sqrt(v / 60);                                  // por segundo
+        const symbolMap: Record<'BTC' | 'ETH' | 'SOL', any> = {
+            BTC: 'BTCUSDT',
+            ETH: 'ETHUSDT',
+            SOL: 'SOLUSDT'
         };
+        const symbol = symbolMap[coin];
 
-        const value = sigmaOf(rets.slice(-60));
+        // 1. Obter klines da Binance (pedimos um histórico ligeiramente maior para o RSI)
+        const klines = await this.binanceService.getKLines(symbol, config.interval as any, { limit: 30 });
+        if (!klines || klines.length < 20) {
+            console.log('WARN', `⚠️ Klines insuficientes para ${symbol}: ${klines?.length ?? 0}`);
+            return;
+        }
 
-        this.sigmaCache.set(symbol, { minute, value });
-        return value;
-    }
+        const closePrices = klines.map((k: any) => Number(k.close));
 
-    // ───────────────────────── Mercado Polymarket ─────────────────────────
+        // Cálculo do RSI (14 períodos) e EMA do RSI (9 períodos)
+        const currentRsi = this.calculateRSI(closePrices, 14);
 
-    private async getMarketForWindow(
-        coin: Coin,
-        windowStartMs: number,
-        windowEndMs: number
-    ): Promise<CachedMarket | null> {
-        const cached = this.marketCache.get(coin);
-        if (cached && cached.endMs === windowEndMs) return cached;
+        // Gerar histórico recente de RSI para calcular a EMA do RSI
+        const rsiHistory: number[] = [];
+        for (let i = 8; i >= 0; i--) {
+            if (closePrices.length > 14 + i) {
+                const sliceCloses = closePrices.slice(0, closePrices.length - i);
+                rsiHistory.push(this.calculateRSI(sliceCloses, 14));
+            }
+        }
+        const rsiEma = this.calculateEMA(rsiHistory, 9);
+        const isRsiBullish = currentRsi > rsiEma;
+        const isRsiBearish = currentRsi < rsiEma;
 
+        const recent = klines.slice(-5);
+        const older = klines.slice(-10, -5);
+        const recentAvg = recent.reduce((s, k) => s + k.close, 0) / recent.length;
+        const olderAvg = older.reduce((s, k) => s + k.close, 0) / older.length;
+
+        const changePercent = ((recentAvg - olderAvg) / olderAvg) * 100;
+        const threshold = config.trendThreshold;
+            
+        let trend: 'up' | 'down' | 'neutral' = 'neutral';
+        if (changePercent > threshold) trend = 'up';
+        else if (changePercent < -threshold) trend = 'down';
+
+        console.log('KLINE', `📊 [${symbol}] Variação: ${changePercent.toFixed(4)}% | RSI: ${currentRsi.toFixed(1)} (EMA: ${rsiEma.toFixed(1)}) | Tendência: ${trend.toUpperCase()}`);
+        if (trend === 'neutral') return;
+        /**
+        if (trend === 'neutral') return;
+
+        // 🛡️ FILTRO DE RSI: Validar se o momento técnico apoia a tendência indicada pela variação
+        if (trend === 'up' && !isRsiBullish) {
+            console.log('WARN', `⏳ [${coin}] Sinal UP ignorado: Variação positiva mas RSI (${currentRsi.toFixed(1)}) abaixo da EMA (${rsiEma.toFixed(1)}) - Falta de momentum comprador.`);
+            return;
+        }
+        if (trend === 'down' && !isRsiBearish) {
+            console.log('WARN', `⏳ [${coin}] Sinal DOWN ignorado: Variação negativa mas RSI (${currentRsi.toFixed(1)}) acima da EMA (${rsiEma.toFixed(1)}) - Falta de momentum vendedor.`);
+            return;
+        }
+        **/
+
+        // 🕯️ FILTRO DE ANÁLISE DO CORPO E DIREÇÃO DO CANDLE CORRENTE
+        const currentKline = klines[klines.length - 1];
+        const candleOpen = Number(currentKline.open);
+        const candleClose = Number(currentKline.close);
+        const candleHigh = Number(currentKline.high);
+        const candleLow = Number(currentKline.low);
+
+        const bodySize = Math.abs(candleClose - candleOpen);
+        const totalRange = candleHigh - candleLow;
+
+        // 1. Evitar velas de indecisão (Dojis / corpos muito esmagados face ao pavio)
+        // O corpo deve ocupar pelo menos 25% do movimento total daquela vela para ter força
+        const minBodyRatio = 0.25;
+        if (totalRange > 0 && (bodySize / totalRange) < minBodyRatio) {
+            console.log('WARN', `⏳ [${coin}] Ignorado: Candle atual sem corpo expressivo (Doji/Indecisão). A aguardar força real.`);
+            return;
+        }
+
+        // 2. Validar se o corpo do candle está na direção correta do sinal
+        if (trend === 'up' && candleClose <= candleOpen) {
+            console.log('WARN', `⏳ [${coin}] Sinal UP ignorado: Candle atual está vermelho (Open: $${candleOpen} > Close: $${candleClose}).`);
+            return;
+        }
+        if (trend === 'down' && candleClose >= candleOpen) {
+            console.log('WARN', `⏳ [${coin}] Sinal DOWN ignorado: Candle atual está verde (Open: $${candleOpen} < Close: $${candleClose}).`);
+            return;
+        }
+
+        // 2. Encontrar mercado de curto prazo na Polymarket
         const markets = await this.marketService.scanCryptoShortTermMarkets({
-            coin,
+            coin: coin,
             duration: '15m',
-            minMinutesUntilEnd: 0,   // antes era 2: bloqueava os últimos 2 min
-            maxMinutesUntilEnd: 20,
+            minMinutesUntilEnd: 2,
+            maxMinutesUntilEnd: 60,
             limit: 1,
             sortBy: 'endDate'
         });
 
         if (!markets || markets.length === 0) {
             console.log('WARN', `⚠️ Nenhum mercado de curto prazo encontrado na Polymarket para ${coin}`);
-            return null;
+            return;
         }
 
         const market = markets[0];
-        if (!market.conditionId) return null;
+        if (!market.conditionId) return;
 
-        const win = this.getMarketWindow(market);
-        if (!win) {
-            console.log('WARN', `⚠️ [${coin}] Impossível determinar a janela do mercado (${market.slug}).`);
-            return null;
-        }
-
-        // O mercado tem de ser o da janela atual
-        if (Math.abs(win.endMs - windowEndMs) > 5000) {
-            console.log('WARN', `⏳ [${coin}] Mercado ${market.slug} não corresponde à janela atual. A ignorar.`);
-            return null;
+        if (!this.isMarketInValidWindow(market, coin)) {
+            return;
         }
 
         const fullMarket = await this.marketService.getMarket(market.conditionId);
-        if (!fullMarket?.tokens) return null;
+        const yesToken = fullMarket.tokens.find((t: any) => t.outcome === 'Up' || t.outcome === 'Yes');
+        const noToken = fullMarket.tokens.find((t: any) => t.outcome === 'Down' || t.outcome === 'No');
+        const targetToken = trend === 'up' ? yesToken : noToken;
 
-        const entry: CachedMarket = { market, fullMarket, startMs: win.startMs, endMs: windowEndMs };
-        this.marketCache.set(coin, entry);
-        return entry;
-    }
+        if (!targetToken) {
+            console.log('WARN', `⚠️ Token de destino ('${trend === 'up' ? 'Up/Yes' : 'Down/No'}') não encontrado para ${coin}`);
+            return;
+        }
 
-    private getMarketWindow(market: any): { startMs: number; endMs: number } | null {
-        let startMs = 0;
-        let endMs = 0;
+        // 🛡️ Obter o preço real diretamente do outcomePrices do market
+        const tokenIndex = fullMarket.tokens ? fullMarket.tokens.findIndex((t: any) => t.tokenId === targetToken.tokenId) : -1;
 
-        // Slug tipo 'eth-updown-15m-1790708400' -> timestamp = INÍCIO
-        if (market.slug) {
-            const parts = String(market.slug).split('-');
-            const ts = Number(parts[parts.length - 1]);
-            if (!isNaN(ts) && ts > 1700000000) {
-                startMs = ts * 1000;
-                endMs = startMs + WINDOW_MS;
+        // 🛡️ FILTRO ANTI-DUPLICAÇÃO (Igual ao Smart Money)
+        const outcomeName = targetToken.outcome || 'Yes';
+        const posKey = `${market.slug}-${outcomeName}`;
+
+        // Invocar a função para obter o Map de posições
+        const currentPositions = typeof config.positions === 'function' ? config.positions() : null;
+
+        if (currentPositions && currentPositions.has(posKey)) {
+            console.log('WARN', `⏳ [${coin}] Sinal ignorado (Anti-Duplicação): Já tens posição ativa em ${posKey}`);
+            return;
+        }
+
+        // 🛡️ VALIDAR LIVRO DE ORDENS REAL (Anti-Slippage)
+        const amountUsdc = config.amount() || 5;
+        const validation = await this.orderbookService.validateOrderBookSlippage(targetToken.tokenId, amountUsdc, 0.85, 0.45);
+
+        if (!validation.isValid) {
+            console.log('WARN', `⏳ [${coin}] Sinal ignorado (Slippage/Livro): ${validation.reason}`);
+            return;
+        }
+
+        console.log(`✅ [${coin}] Livro validado com sucesso! Preço Médio Estimado: ${validation.averageExecutionPrice.toFixed(2)} (Máx tocado: ${validation.maxPriceTouched})`);
+
+        // O execShares passa a ser o calculado de forma precisa pelo livro de ordens
+        const execShares = validation.totalShares;
+        const tokenPrice = validation.averageExecutionPrice;
+
+
+        const rawEndDate = market.endDate || fullMarket.endDate;
+        const validEndDate = rawEndDate ? new Date(rawEndDate) : new Date(Date.now() + 15 * 60 * 1000);
+
+        const syntheticTrade: SmartMoneyTrade = {
+            traderAddress: `TrendFollowing-${coin}`,
+            marketSlug: market.slug,
+            side: 'BUY',
+            size: execShares,
+            price: tokenPrice,
+            tokenId: targetToken.tokenId,
+            conditionId: market.conditionId,
+            traderName: `Trend Bot (${coin})`,
+            timestamp: Date.now(),
+            isSmartMoney: false,
+            endDate: validEndDate,
+            outcome: targetToken.outcome
+        };
+
+        const isDryRun = config.dryRun ?? false;
+
+        if (isDryRun) {
+            console.log('SIGNAL', `🧪 [DRY RUN] Direct Trade (${coin}): ${trend.toUpperCase()} em ${market.question?.slice(0, 30)}...`);
+            await onTrade(syntheticTrade, { success: true });
+        } else {
+            console.log('SIGNAL', `🔴 Executando Direct Trade Real (${coin}): ${trend.toUpperCase()} em ${market.question?.slice(0, 30)}...`);
+
+            try {
+                const res = await this.tradingService.createMarketOrder({
+                    tokenId: targetToken.tokenId,
+                    side: 'BUY',
+                    amount: amountUsdc
+                });
+
+                await onTrade(syntheticTrade, res);
+
+                if (res && res.success) {
+                    console.log('TRADE', `✅ Direct Trade Executado (${coin}): Compra de $${amountUsdc} em ${targetToken.outcome}`);
+                } else {
+                    console.log('WARN', `❌ Direct Trade falhou: ${res?.errorMsg || 'Erro desconhecido'}`);
+                }
+            } catch (orderErr) {
+                console.log('ERROR', `❌ Erro crítico ao submeter ordem de Direct Trade: ${(orderErr as Error).message}`);
             }
         }
-
-        if (!endMs && market.endDate) {
-            endMs = new Date(market.endDate).getTime();
-            startMs = endMs - WINDOW_MS;
-        }
-
-        if (!endMs || isNaN(endMs)) return null;
-        return { startMs, endMs };
-    }
-
-    // ───────────────────────── Logs ─────────────────────────
-
-    private logSkip(coin: Coin, reason: string, data: Record<string, any>) {
-        // Conta sempre, mesmo quando o log está limitado
-        this.stats.set(reason, (this.stats.get(reason) ?? 0) + 1);
-
-        const key = `${coin}:${reason}`;
-        const now = Date.now();
-        const last = this.lastSkipLog.get(key) ?? 0;
-        if (now - last < SKIP_LOG_THROTTLE_MS) return;
-        this.lastSkipLog.set(key, now);
-
-        const details = Object.entries(data)
-            .map(([k, v]) => `${k}=${typeof v === 'number' ? Number(v.toPrecision(4)) : v}`)
-            .join(' ');
-        console.log('SKIP', `⏭️ [${coin}] ${reason} | ${details}`);
-
-        void this.writeLog({ ts: new Date().toISOString(), type: 'skip', coin, reason, ...data });
     }
 
     /**
-     * Resumo a cada 30 s: quantas avaliações houve e porque foram rejeitadas.
-     * Se vires "avaliações=0" o problema está antes do modelo (dados, mercado, janela).
+     * Calcula o RSI (Relative Strength Index)
      */
-    private heartbeat(secondsLeft: number) {
-        const now = Date.now();
-        if (now - this.lastHeartbeat < 30_000) return;
-        this.lastHeartbeat = now;
+    private calculateRSI(closes: number[], period: number = 14): number {
+        if (closes.length < period + 1) return 50;
 
-        const reasons = [...this.stats.entries()]
-            .sort((a, b) => b[1] - a[1])
-            .map(([r, n]) => `${r}=${n}`)
-            .join(', ') || 'nenhuma';
+        let gains = 0;
+        let losses = 0;
 
-        console.log(
-            'TREND',
-            `💓 Heartbeat | faltam ${secondsLeft.toFixed(0)}s | avaliações=${this.evaluations} | rejeições: ${reasons}`
-        );
-
-        this.stats.clear();
-        this.evaluations = 0;
-    }
-
-    private async writeLog(entry: Record<string, any>) {
-        // Cópia das ENTRADAS para o stdout: serve de backup se o disco for efémero.
-        // Recupera com `railway logs` filtrando por "EDGELOG".
-        if (entry.type === 'entry') {
-            console.log('EDGELOG ' + JSON.stringify(entry));
+        for (let i = 1; i <= period; i++) {
+            const change = closes[i] - closes[i - 1];
+            if (change > 0) gains += change;
+            else losses -= change;
         }
 
-        try {
-            if (!this.logDirReady) {
-                await mkdir(EDGE_LOG_DIR, { recursive: true });
-                this.logDirReady = true;
+        let avgGain = gains / period;
+        let avgLoss = losses / period;
+
+        for (let i = period + 1; i < closes.length; i++) {
+            const change = closes[i] - closes[i - 1];
+            const gain = change > 0 ? change : 0;
+            const loss = change < 0 ? -change : 0;
+
+            avgGain = (avgGain * (period - 1) + gain) / period;
+            avgLoss = (avgLoss * (period - 1) + loss) / period;
+        }
+
+        if (avgLoss === 0) return 100;
+        const rs = avgGain / avgLoss;
+        return Number((100 - (100 / (1 + rs))).toFixed(2));
+    }
+
+    /**
+     * Calcula a EMA (Exponential Moving Average) para um histórico de valores
+     */
+    private calculateEMA(values: number[], period: number = 9): number {
+        if (values.length === 0) return 50;
+        if (values.length < period) {
+            const sum = values.reduce((acc, val) => acc + val, 0);
+            return Number((sum / values.length).toFixed(2));
+        }
+
+        const k = 2 / (period + 1);
+        let ema = values.slice(0, period).reduce((acc, val) => acc + val, 0) / period;
+
+        for (let i = period; i < values.length; i++) {
+            ema = (values[i] * k) + (ema * (1 - k));
+        }
+
+        return Number(ema.toFixed(2));
+    }
+
+
+    private isMarketInValidWindow(market: any, coin: string): boolean {
+        let startTimeMs = 0;
+        let endTimeMs = 0;
+
+        // 1. Tentar extrair o timestamp do slug (ex: 'eth-updown-15m-1790708400' -> isto é o INÍCIO)
+        if (market.slug) {
+            const parts = market.slug.split('-');
+            const potentialTimestamp = Number(parts[parts.length - 1]);
+            if (!isNaN(potentialTimestamp) && potentialTimestamp > 1700000000) {
+                startTimeMs = potentialTimestamp * 1000;
+                endTimeMs = startTimeMs + (15 * 60 * 1000); // 15 minutos depois = FIM correto!
             }
-            await appendFile(EDGE_LOG_FILE, JSON.stringify(entry) + '\n');
-        } catch (err) {
-            console.log('WARN', `⚠️ Falha a escrever log: ${(err as Error).message}`);
         }
+
+        // 2. Fallback para o endDate da API se o slug falhar
+        if (!endTimeMs && market.endDate) {
+            endTimeMs = new Date(market.endDate).getTime();
+            startTimeMs = endTimeMs - (15 * 60 * 1000);
+        }
+
+        if (!endTimeMs || isNaN(endTimeMs)) {
+            console.log('WARN', `⚠️ [${coin}] Impossível determinar a data de fecho do mercado (${market.slug}).`);
+            return false;
+        }
+
+        const nowMs = Date.now();
+
+        // Validação 1: O mercado ainda não começou
+        if (nowMs < startTimeMs) {
+            console.log('WARN', `⏳ [${coin}] Ignorado: O mercado ainda não começou (Início estimado em ${new Date(startTimeMs).toLocaleTimeString()}).`);
+            return false;
+        }
+
+        // Validação 2: O mercado já terminou
+        if (nowMs >= endTimeMs) {
+            console.log('WARN', `⏳ [${coin}] Ignorado: O mercado já terminou (Encerrou às ${new Date(endTimeMs).toLocaleTimeString()}).`);
+            return false;
+        }
+
+        // Validação 3: Menos de 5 minutos para fechar (Zona de pânico)
+        const minutesRemaining = (endTimeMs - nowMs) / (1000 * 60);
+        if (minutesRemaining < 5) {
+            console.log('WARN', `⏳ [${coin}] Ignorado: Faltam apenas ${minutesRemaining.toFixed(1)}m para o mercado fechar.`);
+            return false;
+        }
+
+        return true;
     }
+
+    /**
+ * Simula o consumo do livro de ordens (Order Book) para um determinado montante em USDC,
+ * validando se a ordem respeita os limites de preço (teto e piso).
+ */
+    /**private async validateOrderBookSlippage(
+        tokenId: string,
+        amountUsdc: number,
+        maxAllowedPrice: number = 0.75,
+        minAllowedPrice: number = 0.25
+    ): Promise<OrderBookValidationResult> {
+        try {
+            const response = await fetch(`https://clob.polymarket.com/book?token_id=${tokenId}`);
+            if (!response.ok) {
+                return { isValid: false, averageExecutionPrice: 0, maxPriceTouched: 0, totalShares: 0, reason: 'Erro ao contactar a API do CLOB' };
+            }
+
+            // Fazemos o cast explícito para a interface ClobOrderBookResponse
+            const bookData = (await response.json()) as ClobOrderBookResponse;
+
+            if (!bookData || !bookData.asks || bookData.asks.length === 0) {
+                return { isValid: false, averageExecutionPrice: 0, maxPriceTouched: 0, totalShares: 0, reason: 'Livro de ordens sem asks disponíveis' };
+            }
+
+            let remainingUsdc = amountUsdc;
+            let totalShares = 0;
+            let maxPriceTouched = 0;
+
+            // Ordenar os asks por preço ascendente
+            const sortedAsks = [...bookData.asks].sort((a, b) => Number(a.price) - Number(b.price));
+
+            for (const ask of sortedAsks) {
+                const askPrice = Number(ask.price);
+                const askSize = Number(ask.size);
+                const costAtThisLevel = askPrice * askSize;
+
+                if (remainingUsdc <= costAtThisLevel) {
+                    const sharesNeeded = remainingUsdc / askPrice;
+                    totalShares += sharesNeeded;
+                    maxPriceTouched = Math.max(maxPriceTouched, askPrice);
+                    remainingUsdc = 0;
+                    break;
+                } else {
+                    remainingUsdc -= costAtThisLevel;
+                    totalShares += askSize;
+                    maxPriceTouched = Math.max(maxPriceTouched, askPrice);
+                }
+            }
+
+            if (remainingUsdc > 0) {
+                return { isValid: false, averageExecutionPrice: 0, maxPriceTouched, totalShares, reason: `Liquidez insuficiente no livro para preencher os $${amountUsdc}` };
+            }
+
+            const averageExecutionPrice = amountUsdc / totalShares;
+
+            if (maxPriceTouched > maxAllowedPrice) {
+                return { isValid: false, averageExecutionPrice, maxPriceTouched, totalShares, reason: `Pior preço necessário no livro (${maxPriceTouched.toFixed(2)}) excede o teto de ${maxAllowedPrice}` };
+            }
+
+            if (averageExecutionPrice < minAllowedPrice) {
+                return { isValid: false, averageExecutionPrice, maxPriceTouched, totalShares, reason: `Preço médio (${averageExecutionPrice.toFixed(2)}) abaixo do piso de ${minAllowedPrice}` };
+            }
+
+            return {
+                isValid: true,
+                averageExecutionPrice,
+                maxPriceTouched,
+                totalShares
+            };
+
+        } catch (error) {
+            return { isValid: false, averageExecutionPrice: 0, maxPriceTouched: 0, totalShares: 0, reason: `Exceção ao validar order book: ${(error as Error).message}` };
+        }
+    }**/
 }

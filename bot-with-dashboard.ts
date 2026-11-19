@@ -573,82 +573,6 @@ async function agressiveQualifiedWallets(sdk: PolymarketSDK) {
   }
 }
 
-async function whalesQualifiedWallets__(sdk: PolymarketSDK): Promise<string[]> {
-  try {
-    const qualified: string[] = [];
-
-    // 1. Adicionar carteiras personalizadas definidas nas configurações (se existirem)
-    if (CONFIG.smartMoney.customWallets && CONFIG.smartMoney.customWallets.length > 0) {
-      for (const wallet of CONFIG.smartMoney.customWallets) {
-        qualified.push(wallet);
-        log('WALLET', `⭐ Carteira personalizada adicionada: ${wallet.slice(0, 10)}...`);
-      }
-    }
-
-    // 2. Obter o leaderboard focado em lucro (PnL)
-    const leaderboard = await sdk.wallets.getLeaderboardByPeriod('week', CONFIG.smartMoney.topN, 'pnl');
-    //console.log("AQUIII", leaderboard)
-    log('WALLET', `📊 Leaderboard obtido: ${leaderboard.length} carteiras para analisar.`);
-
-    for (const entry of leaderboard) {
-      if (!CONFIG.smartMoney.enabled && qualified.length === 0) break;
-      if (qualified.length >= 15) break;
-      if (qualified.includes(entry.address)) continue;
-
-      const profile: WalletProfile | null = await sdk.wallets.getWalletProfile(entry.address);
-      if (!profile) {
-        log('INFO', `⚠️ Perfil não encontrado para ${entry.address.slice(0, 10)}...`);
-        continue;
-      }
-
-      // 🔍 Captura flexível de propriedades (protege contra diferenças de nomenclatura na SDK)
-      const winRate = profile.winRate ?? (profile as any).win_rate ?? 0;
-      const totalPnL = profile.totalPnL ?? (profile as any).pnl ?? (profile as any).profit ?? 0;
-      const smartScore = profile.smartScore ?? (profile as any).smart_score ?? 0;
-      const trades = profile.tradeCount ?? (profile as any).trades_count ?? (profile as any).trades ?? 0;
-
-      const lastActiveRaw = profile.lastActiveAt ?? (profile as any).last_active_at ?? Date.now();
-      const lastActive = new Date(lastActiveRaw).getTime();
-      const hoursSinceLastActive = (Date.now() - lastActive) / (1000 * 60 * 60);
-
-      // 🪵 Log de diagnóstico para sabermos porque é que foi aceite ou rejeitado
-      log('INFO', `Wallet ${entry.address.slice(0, 8)} -> PnL: $${totalPnL} | WR: ${(winRate * 100).toFixed(1)}% | Score: ${smartScore} | Trades: ${trades} | Horas inativo: ${hoursSinceLastActive.toFixed(0)}h`);
-
-      // 🛡️ Filtros flexíveis: Mega Baleias ou Traders Altamente Eficazes (Menor Capital)
-      const minRequiredPnL = 2500;            // Baixado para $2,5k para apanhar quem está a crescer
-      const eliteWinRate = 0.65;              // Se tiver um win rate muito alto, exigimos menos PnL absoluto
-      const standardWinRate = 0.45;
-      const minTrades = 30;                   // Garante que tem histórico suficiente (evita sorte de 1 ou 2 trades)
-      const minSmartScore = 20;
-      const isRecentlyActive = hoursSinceLastActive <= 168; // 7 dias
-
-      // Critério A: É uma baleia consolidada (PnL alto + Win Rate decente)
-      const isClassicWhale = totalPnL >= minRequiredPnL && winRate >= standardWinRate;
-
-      // Critério B: É um trader de alta precisão/eficácia (Win Rate de elite + histórico consistente, mesmo com PnL mais modesto)
-      const isHighPrecisionTrader = totalPnL > 0 && winRate >= eliteWinRate && trades >= minTrades;
-
-      const isProfitableOrEfficient = isClassicWhale || isHighPrecisionTrader;
-      const hasEnoughTrades = trades >= minTrades;
-
-      if (isProfitableOrEfficient && hasEnoughTrades && isRecentlyActive) {
-        qualified.push(entry.address);
-        log('WALLET', `🐋 Trader Qualificado: ${entry.address.slice(0, 10)}... (PnL: $${Number(totalPnL).toLocaleString()} | WR: ${(winRate * 100).toFixed(0)}% | Trades: ${trades})`);
-      } else {
-        log('INFO', `❌ Rejeitada: Proficient=${isProfitableOrEfficient}, TradesOK=${hasEnoughTrades}, ActiveOK=${isRecentlyActive}`);
-      }
-
-      await new Promise(r => setTimeout(r, 250)); // Respeitar rate limits da SDK
-    }
-
-    log('WALLET', `✅ Total de carteiras qualificadas encontradas: ${qualified.length}`);
-    return qualified;
-  } catch (err) {
-    log('WARN', `Erro ao carregar Leaderboard Híbrido: ${(err as Error).message}`);
-    return [];
-  }
-}
-
 async function whalesQualifiedWallets(sdk: PolymarketSDK): Promise<string[]> {
   try {
     const qualified: string[] = [];
@@ -743,43 +667,6 @@ async function whalesQualifiedWallets(sdk: PolymarketSDK): Promise<string[]> {
   }
 }
 
-async function refreshWalletCache__(sdk: PolymarketSDK) {
-  try {
-    log('WALLET', '🔄 A procurar novas carteiras...');
-
-    const qualified: string[] | undefined = await whalesQualifiedWallets(sdk);
-
-    if (!qualified || qualified.length === 0) {
-      log('WARN', '⚠️ A busca de carteiras não retornou resultados. A manter a cache atual.');
-      return;
-    }
-
-    // 1. Adicionar apenas as que ainda não existem (evita duplicados)
-    for (const wallet of qualified) {
-      if (!followedWalletsCache.includes(wallet)) {
-        followedWalletsCache.push(wallet);
-      }
-    }
-
-    // 2. Se ultrapassar o limite, remove as mais antigas do início da lista
-    if (followedWalletsCache.length > MAX_WALLETS_LIMIT) {
-      const excessCount = followedWalletsCache.length - MAX_WALLETS_LIMIT;
-      log('WALLET', `🧹 Limite excedido. A remover as ${excessCount} carteiras mais antigas...`);
-
-      // Remove do início (as mais antigas)
-      followedWalletsCache.splice(0, excessCount);
-    }
-
-    // 3. Atualiza o estado global
-    state.followedWallets = followedWalletsCache;
-    log('WALLET', `✅ Cache sincronizada. A seguir ${followedWalletsCache.length} carteiras.`);
-    updateDashboard();
-
-  } catch (err) {
-    log('WARN', `⚠️ Erro ao atualizar cache de carteiras: ${(err as Error).message}`);
-  }
-}
-
 async function refreshWalletCache(sdk: PolymarketSDK) {
   try {
     log('WALLET', '🔄 A recarregar e revalidar carteiras de elite em tempo real...');
@@ -859,22 +746,6 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
   }
 }
 
-
-async function updatePricesCache(sdk: PolymarketSDK, marketSlug: string) {
-  try {
-    const gammaMarket = await sdk.smartMoney.getMarketBySlug(marketSlug);
-    if (gammaMarket?.outcomePrices && gammaMarket?.outcomes) {
-      gammaMarket.outcomes.forEach((outcome: string, index: number) => {
-        const key = `${marketSlug}-${outcome}`;
-        liveMarketPrices.set(key, Number(gammaMarket.outcomePrices[index]));
-      });
-      log('INFO', `📊 [CACHE] Preços atualizados para: ${marketSlug}`);
-    }
-  } catch (err) {
-    log('WARN', `❌ [CACHE_ERR] Falha ao atualizar preços para ${marketSlug}: ${err}`);
-  }
-}
-
 function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, result: OrderResult) {
   const isDryRun = CONFIG.dryRun ?? false;
   const modeTag = isDryRun ? '🧪 [DRY_RUN]' : '🔴 [LIVE]';
@@ -900,32 +771,7 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
       execPrice = cachedPrice;
     }
   }
-
-  //let copySize = trade.size;
-  //let tradeCost = 0;
-
-  /** 
-  if (trade.isSmartMoney) {
-    const sizeScale = CONFIG.smartMoney.sizeScale || 0.1;
-    const maxSizePerTrade = CONFIG.smartMoney.maxSizePerTrade || 3.0;
-
-    copySize = trade.size * sizeScale;
-    tradeCost = copySize * execPrice;
-
-    if (tradeCost > maxSizePerTrade) {
-      tradeCost = maxSizePerTrade;
-      copySize = tradeCost / execPrice;
-    }
-  } else {
-    tradeCost = trade.size;
-    copySize = tradeCost / execPrice;
-  }
-  **/
-  //tradeCost = trade.size;
-  //copySize = tradeCost / execPrice;
-  //const execShares = copySize;
-
-
+  
   const execShares = trade.size; // As shares vindas do trade
   const tradeCost = execShares * execPrice; // O custo real em USDC
 
@@ -1339,155 +1185,6 @@ async function setupDipArb(sdk: PolymarketSDK) {
       await startDipArbService(sdk, nextCoin);
     }
   }, 10000);
-}
-
-async function setupDipArb__(sdk: PolymarketSDK) {
-  log('ARB', 'Configurando Serviço DipArb...');
-
-  sdk.dipArb.updateConfig({
-    shares: CONFIG.dipArb.shares,
-    sumTarget: CONFIG.dipArb.sumTarget,
-    autoExecute: !CONFIG.dryRun,
-    debug: true,
-  });
-
-  sdk.dipArb.on('orderbookUpdate', (update: { upPrice: number; downPrice: number; sum: number }) => {
-    state.dipArb.upPrice = update.upPrice;
-    state.dipArb.downPrice = update.downPrice;
-    state.dipArb.sum = update.sum;
-    updateDashboard();
-  });
-
-  sdk.dipArb.on('started', (market: any) => {
-    log('ARB', `DipArb Ativo no mercado: ${market.name}`);
-    state.activeDipArbMarket = market.name;
-    state.dipArb.marketName = market.name;
-    state.dipArb.underlying = market.underlying || 'ETH';
-    state.dipArb.duration = `${market.durationMinutes}m`;
-    state.dipArb.endTime = market.endTime ? new Date(market.endTime).getTime() : null;
-    state.dipArb.status = 'active';
-    updateDashboard();
-
-    dashboardEmitter.updateStrategyStatus('dipArb', 'active', market.name);
-  });
-
-  sdk.dipArb.on('newRound', (round: { roundId: string; priceToBeat: number }) => {
-    log('ARB', `Nova ronda DipArb: ${round.roundId}, Preço Alvo: ${round.priceToBeat}`);
-    updateDashboard();
-  });
-
-  sdk.dipArb.on('signal', (s: {
-    type: 'leg1' | 'leg2';
-    dipSide?: string;
-    hedgeSide?: string;
-    currentPrice: number;
-    source?: string;
-    dropPercent?: number;
-  }) => {
-    const side = s.dipSide || s.hedgeSide || 'UP';
-    const signal: DipArbSignal = {
-      id: `da-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-      timestamp: new Date().toISOString(),
-      type: s.type as DipArbSignal['type'],
-      side: side as 'UP' | 'DOWN',
-      price: s.currentPrice || 0,
-      change: s.dropPercent ? -s.dropPercent * 100 : 0,
-    };
-    state.dipArb.lastSignal = signal;
-    state.dipArb.signals.unshift(signal);
-    if (state.dipArb.signals.length > 20) {
-      state.dipArb.signals = state.dipArb.signals.slice(0, 20);
-    }
-    log('SIGNAL', `Sinal DipArb: ${s.type} ${side} @ ${s.currentPrice?.toFixed(3)}`);
-    updateDashboard();
-  });
-
-  sdk.dipArb.on('execution', (r: any) => {
-    if (r.success) {
-      const price = r.price ? r.price.toFixed(3) : '??';
-      const shares = r.shares ? r.shares.toFixed(1) : '??';
-      const market = state.activeDipArbMarket || 'unknown-market';
-
-      switch (r.leg) {
-        case 'leg1':
-          log('TRADE', `ABERTURA ${r.side} | ${shares} shares @ $${price} | ${market}`);
-          break;
-        case 'leg2':
-          log('TRADE', `COBERTURA ${r.side} | ${shares} shares @ $${price} | Lucro Travado`);
-          break;
-        case 'exit':
-          log('TRADE', `FECHO ${r.side} (Timeout Exit) | ${shares} shares @ $${price}`);
-          break;
-        case 'merge':
-          log('TRADE', `RESGATE | Posições combinadas por payout de $1.00 | ${market}`);
-          break;
-        default:
-          log('TRADE', `DipArb ${r.leg}: ${r.side} @ ${price}`);
-      }
-      recordTrade(0, 'dipArb');
-    } else {
-      log('WARN', `Execução DipArb Falhou (${r.leg}): ${r.error || 'Erro desconhecido'}`);
-    }
-  });
-
-  /** 
-  sdk.dipArb.on('rotate', (e: { previousMarket: string; newMarket: string; marketDetails?: any }) => {
-    console.log("AQUIII ROTATE", e)
-    state.activeDipArbMarket = e.newMarket;
-    state.dipArb.marketName = e.newMarket;
-    log('ARB', `DipArb rodou para o mercado: ${e.newMarket}`);
-    updateDashboard();
-  });
-  **/
-
-  sdk.dipArb.on('rotate', (e: { previousMarket: string; newMarket: string; marketDetails?: any }) => {
-    // Usa diretamente o nome e a slug que vieram no objeto de mercado!
-    const marketName = e.marketDetails?.name || 'Novo Mercado';
-    const marketSlug = e.marketDetails?.slug;
-
-    state.activeDipArbMarket = marketName;
-    state.dipArb.marketName = marketName;
-
-    // Recalcula o endTime exato pela slug instantaneamente
-    if (marketSlug) {
-      const slugParts = marketSlug.split('-');
-      const timestampSec = parseInt(slugParts[slugParts.length - 1], 10);
-      state.dipArb.endTime = !isNaN(timestampSec) ? timestampSec * 1000 : null;
-    }
-
-    log('ARB', `DipArb rodou para o mercado: ${marketName}`);
-    updateDashboard();
-  });
-
-  if (CONFIG.dipArb.autoRotate) {
-    sdk.dipArb.enableAutoRotate({
-      enabled: true,
-      underlyings: ['ETH', 'BTC', 'SOL'],
-      duration: '15m',
-      settleStrategy: 'redeem',
-      redeemWaitMinutes: 5,
-    });
-  }
-
-  if (CONFIG.dipArb.enabled) {
-    try {
-      const market = await sdk.dipArb.findAndStart({ coin: 'ETH', preferDuration: '15m' });
-      if (market) {
-        state.activeDipArbMarket = market.name;
-        state.dipArb.marketName = market.name;
-        state.dipArb.underlying = market.underlying || 'ETH';
-        state.dipArb.duration = `${market.durationMinutes}m`;
-        state.dipArb.endTime = market.endTime ? new Date(market.endTime).getTime() : null;
-        state.dipArb.status = 'active';
-        log('ARB', `DipArb iniciado: ${market.name}`);
-      } else {
-        log('WARN', 'Nenhum mercado DipArb encontrado no momento');
-      }
-      updateDashboard();
-    } catch (err) {
-      log('WARN', `Erro na configuração do DipArb: ${(err as Error).message}`);
-    }
-  }
 }
 
 let swapService: SwapService | null = null;

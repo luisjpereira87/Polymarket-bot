@@ -327,6 +327,47 @@ interface PendingTokenItem {
   retryCount: number;
 }
 
+interface DataApiV2Position {
+  proxy_wallet?: string;
+  token_id: string;
+  slug?: string;
+  event_slug?: string;
+  outcome: string;
+  current_price: number;
+  percent_pnl?: number;
+  status?: string;
+  end_date?: string;
+}
+
+interface DataApiV2Response {
+  data?: DataApiV2Position[];
+  error?: string;
+}
+
+interface DataApiV2Trade {
+  proxy_wallet?: string;
+  side: 'BUY' | 'SELL' | string;
+  token_id: string;
+  condition_id?: string;
+  size: number | string;
+  price: number | string;
+  timestamp: number | string;
+  title?: string;
+  slug?: string;
+  event_slug?: string;
+  outcome?: string;
+  outcome_index?: number;
+  name?: string;
+  pseudonym?: string;
+  transaction_hash: string;
+  end_date?: string;
+}
+
+interface DataApiV2TradesResponse {
+  data?: DataApiV2Trade[];
+  error?: string;
+}
+
 // ============================================================================
 // RealtimeServiceV2 Implementation
 // ============================================================================
@@ -1241,16 +1282,14 @@ export class RealtimeServiceV2 extends EventEmitter {
    * substituindo o canal WebSocket global de atividade que não existe na V2.
    */
   subscribeAllActivity(handlers: ActivityHandlers = {}, targetAddresses: string[] = []): Subscription {
-    console.log('[RealtimeServiceV2] 🔄 Usando Polling REST alternativo para Smart Money Activity...');
+    console.log('[RealtimeServiceV2] 🔄 Usando Polling REST (Data API v2) para Smart Money Activity...');
 
-    // Se não passares endereços específicos, podemos tentar ir buscar a lista geral
     const addressesToPoll = targetAddresses.length > 0 ? targetAddresses : [];
 
     if (addressesToPoll.length === 0) {
       console.warn('[RealtimeServiceV2] ⚠️ Nenhum endereço fornecido para o polling de atividade.');
     }
 
-    // Iniciar o ciclo de polling periódico (ex: a cada 10 segundos)
     if (!this.pollingInterval) {
       this.pollingInterval = setInterval(async () => {
         if (addressesToPoll.length === 0) return;
@@ -1259,14 +1298,56 @@ export class RealtimeServiceV2 extends EventEmitter {
           try {
             const url = `https://data-api.polymarket.com/v2/trades?user=${address.toLowerCase()}&limit=5`;
             const response = await fetch(url);
-            if (!response.ok) continue;
 
-            const trades = await response.json();
-            if (!Array.isArray(trades)) continue;
+            if (!response.ok) {
+              if (response.status === 429) {
+                console.warn(`[RealtimeServiceV2] ⚠️ Rate limit (429) ao consultar trades de ${address}. A abortar este ciclo para arrefecer.`);
+                break; // Para o loop deste ciclo para não agravar o rate limit
+              }
+              const errText = await response.text().catch(() => '');
+              console.error(`[RealtimeServiceV2] ❌ Erro HTTP ${response.status} em /v2/trades para ${address}: ${errText.slice(0, 150)}`);
+              continue;
+            }
 
-            // Processar do mais antigo para o mais recente
-            for (const trade of trades.reverse()) {
-              const txHash = trade.transactionHash;
+            const payload = (await response.json()) as DataApiV2TradesResponse | DataApiV2Trade[];
+
+            // 1. Validação de erro explícito no JSON
+            if (payload && !Array.isArray(payload) && 'error' in payload && payload.error) {
+              console.error(`[RealtimeServiceV2] ❌ Erro retornado pela Data API v2 (/trades):`, payload);
+              continue;
+            }
+
+            // 2. Extração segura do array
+            const trades = Array.isArray(payload) ? payload : payload?.data;
+
+            if (!Array.isArray(trades)) {
+              console.error(`[RealtimeServiceV2] ⚠️ [SchemaMismatch] Formato inesperado em /v2/trades. Esperado array em 'data', recebido:`, typeof payload);
+              continue;
+            }
+
+            // 3. Validação de Schema do primeiro elemento (se existirem trades)
+            if (trades.length > 0) {
+              const sample = trades[0];
+              const hasRequiredProps =
+                'transaction_hash' in sample &&
+                'token_id' in sample &&
+                'side' in sample &&
+                'size' in sample &&
+                'price' in sample &&
+                'timestamp' in sample;
+
+              if (!hasRequiredProps) {
+                console.error(
+                  `[RealtimeServiceV2] 🚨 [SchemaMismatch] As propriedades de /v2/trades mudaram! Chaves recebidas:`,
+                  Object.keys(sample)
+                );
+                continue;
+              }
+            }
+
+            // Processar do mais antigo para o mais recente sem mutar o array original
+            for (const trade of [...trades].reverse()) {
+              const txHash = trade.transaction_hash;
               if (!txHash || this.processedHashes.has(txHash)) continue;
 
               // 🚨 Filtro de Segurança: Ignorar trades com mais de 60 segundos (evita cópia no arranque)
@@ -1274,8 +1355,7 @@ export class RealtimeServiceV2 extends EventEmitter {
               const currentTimestamp = Math.floor(Date.now() / 1000);
               const tradeTimestamp = Number(trade.timestamp);
 
-              if (currentTimestamp - tradeTimestamp > MAX_TRADE_AGE_SECONDS) {
-                // Marcar como processado para nunca mais tentar avaliá-lo
+              if (isNaN(tradeTimestamp) || currentTimestamp - tradeTimestamp > MAX_TRADE_AGE_SECONDS) {
                 this.processedHashes.add(txHash);
                 continue;
               }
@@ -1287,25 +1367,28 @@ export class RealtimeServiceV2 extends EventEmitter {
                 if (first) this.processedHashes.delete(first);
               }
 
+              const marketSlug = trade.slug || trade.event_slug || '';
+              const tokenId = String(trade.token_id || '');
+
               // Mapear para o formato de ActivityTrade esperado pelo bot
               const activityTrade: ActivityTrade = {
                 trader: {
-                  address: trade.proxyWallet || address,
+                  address: trade.proxy_wallet || address,
                   name: trade.name,
-                  //pseudonym: trade.pseudonym,
+                  // pseudonym: trade.pseudonym,
                 },
-                conditionId: trade.conditionId,
-                eventSlug: trade.slug,
-                marketSlug: trade.slug,
-                side: trade.side,
+                conditionId: trade.condition_id || '',
+                eventSlug: trade.event_slug || marketSlug,
+                marketSlug: marketSlug,
+                side: trade.side as 'BUY' | 'SELL',
                 size: Number(trade.size),
                 price: Number(trade.price),
-                asset: trade.asset,
-                outcome: trade.outcome,
-                transactionHash: trade.transactionHash,
-                timestamp: Number(trade.timestamp),
-                tokenId: trade.asset || trade.tokenId || '',
-                endDate: trade.endDate
+                asset: tokenId,
+                outcome: trade.outcome || '',
+                transactionHash: txHash,
+                timestamp: tradeTimestamp,
+                tokenId: tokenId,
+                endDate: trade.end_date ? new Date(trade.end_date) : new Date(0),
               };
 
               if (!activityTrade.marketSlug || activityTrade.marketSlug === 'unknown-market') {
@@ -1313,8 +1396,18 @@ export class RealtimeServiceV2 extends EventEmitter {
                 continue;
               }
 
+              if (!activityTrade.tokenId || isNaN(activityTrade.price) || isNaN(activityTrade.size)) {
+                console.warn(`[RealtimeServiceV2] ⚠️ Trade ignorado por dados numéricos/token inválidos no tx: ${txHash}`);
+                continue;
+              }
+
               // Disparar o handler de trade registado
               handlers.onTrade?.(activityTrade);
+            }
+
+            // Pequena pausa entre carteiras para evitar rajadas de pedidos (Rate Limit)
+            if (addressesToPoll.length > 1) {
+              await new Promise((r) => setTimeout(r, 150));
             }
           } catch (error) {
             console.error(`[RealtimeServiceV2] Erro no polling REST para ${address}:`, error);
@@ -1323,7 +1416,6 @@ export class RealtimeServiceV2 extends EventEmitter {
       }, 10000);
     }
 
-    // Retorna o objeto de subscrição compatível com o bot
     return {
       id: `rtds_polling_${Date.now()}`,
       topic: 'activity',
@@ -1344,7 +1436,7 @@ export class RealtimeServiceV2 extends EventEmitter {
     funderAddress?: string,
     dryRun: boolean = false
   ): Subscription {
-    console.log(`[RealtimeServiceV2] 🔄 A iniciar polling REST para monitorização de PnL (${dryRun ? 'MODO SIMULAÇÃO/GAMMA' : 'MODO REAL/DATA API'})...`);
+    console.log(`[RealtimeServiceV2] 🔄 A iniciar polling REST para monitorização de PnL (${dryRun ? 'MODO SIMULAÇÃO/GAMMA' : 'MODO REAL/DATA API v2'})...`);
 
     if (this.pricePollingInterval) {
       clearInterval(this.pricePollingInterval);
@@ -1370,31 +1462,82 @@ export class RealtimeServiceV2 extends EventEmitter {
       try {
         if (!dryRun && funderAddress) {
           // ==========================================
-          // LÓGICA REAL: Data API (Usa a wallet/proxy)
+          // LÓGICA REAL: Data API v2 (Usa a wallet/proxy)
           // ==========================================
           const url = `https://data-api.polymarket.com/v2/positions?user=${funderAddress}`;
           const response = await fetch(url);
-          if (!response.ok) return;
 
-          const apiPositions = await response.json();
-          if (!Array.isArray(apiPositions)) return;
+          if (!response.ok) {
+            const errorBody = await response.text().catch(() => '');
+            console.error(`[RealtimeServiceV2] ❌ Erro HTTP ${response.status} ao consultar Data API v2 (${url}): ${errorBody.slice(0, 200)}`);
+            return;
+          }
+
+          const payload = (await response.json()) as DataApiV2Response | DataApiV2Position[];
+
+          // 1. Validação de erro explícito no payload
+          if (payload && typeof payload === 'object' && 'error' in payload) {
+            console.error(`[RealtimeServiceV2] ❌ Erro retornado pela Data API v2:`, payload);
+            return;
+          }
+
+          // 2. Extração segura do array (v2 usa { data: [...] }, mas mantém fallback caso venha array direto)
+          const apiPositions = Array.isArray(payload) ? payload : payload?.data;
+
+          if (!Array.isArray(apiPositions)) {
+            console.error(`[RealtimeServiceV2] ⚠️ [SchemaMismatch] Formato inesperado na Data API v2. Esperado array em 'data', recebido:`, typeof payload);
+            return;
+          }
+
+          // 3. Validação de Schema do primeiro elemento (se houver posições abertas)
+          if (apiPositions.length > 0) {
+            const sample = apiPositions[0];
+            const hasRequiredProps =
+              ('slug' in sample || 'event_slug' in sample) &&
+              'outcome' in sample &&
+              'current_price' in sample &&
+              'token_id' in sample;
+
+            if (!hasRequiredProps) {
+              console.error(
+                `[RealtimeServiceV2] 🚨 [SchemaMismatch] As propriedades da Data API v2 mudaram! Chaves recebidas:`,
+                Object.keys(sample)
+              );
+              return;
+            }
+          }
 
           for (const apiPos of apiPositions) {
-            const marketSlug = apiPos.slug || apiPos.eventSlug;
+            // Ignora posições já encerradas na API caso o endpoint devolva histórico
+            if (apiPos.status && apiPos.status !== 'OPEN') continue;
+
+            const marketSlug = apiPos.slug || apiPos.event_slug;
             const outcome = apiPos.outcome;
             const outcomeSuffix = outcome ? `-${outcome}` : '';
             const posKey = `${marketSlug}${outcomeSuffix}`;
 
             if (realPositions.has(posKey)) {
-              const currentPrice = Number(apiPos.curPrice) || 0;
-              const pnlPercent = Number(apiPos.percentPnl) || 0;
-
-              const localPos = realPositions.get(posKey);
-              if (localPos && apiPos.asset) {
-                (localPos as any).tokenId = apiPos.asset;
+              const rawCurrentPrice = Number(apiPos.current_price);
+              if (isNaN(rawCurrentPrice)) {
+                console.warn(`[RealtimeServiceV2] ⚠️ current_price inválido para ${posKey}:`, apiPos.current_price);
+                continue;
               }
 
-              handlers.onPriceUpdate?.(posKey, currentPrice, pnlPercent);
+              const localPos = realPositions.get(posKey);
+              if (localPos && apiPos.token_id) {
+                (localPos as any).tokenId = String(apiPos.token_id);
+              }
+              if (localPos && apiPos.end_date && !(localPos as any).endDate) {
+                (localPos as any).endDate = apiPos.end_date;
+              }
+
+              // Usa percent_pnl da API se vier válido, ou calcula pelo avgEntryPrice local como fallback seguro
+              let pnlPercent = Number(apiPos.percent_pnl);
+              if (isNaN(pnlPercent) && localPos && localPos.avgEntryPrice > 0) {
+                pnlPercent = ((rawCurrentPrice - localPos.avgEntryPrice) / localPos.avgEntryPrice) * 100;
+              }
+
+              handlers.onPriceUpdate?.(posKey, rawCurrentPrice, pnlPercent || 0);
             }
           }
         } else {
@@ -1405,8 +1548,6 @@ export class RealtimeServiceV2 extends EventEmitter {
             Array.from(realPositions.values()).map(pos => pos.marketSlug)
           ));
 
-          //console.log(`[DEBUG_DRY_RUN] Slugs ativos a consultar na Gamma API:`, activeMarketSlugs);
-
           const chunkSize = 25;
 
           for (let i = 0; i < activeMarketSlugs.length; i += chunkSize) {
@@ -1416,13 +1557,15 @@ export class RealtimeServiceV2 extends EventEmitter {
             const url = `https://gamma-api.polymarket.com/markets?${queryParams}`;
             const response = await fetch(url);
             if (!response.ok) {
-              console.warn(`[DEBUG_DRY_RUN] Erro ao contactar Gamma API: ${response.statusText}`);
+              console.warn(`[DEBUG_DRY_RUN] Erro HTTP ${response.status} ao contactar Gamma API: ${response.statusText}`);
               continue;
             }
 
             const markets = await response.json();
-            //console.log(`[DEBUG_DRY_RUN] Mercados devolvidos pela Gamma API:`, Array.isArray(markets) ? markets.length : 0);
-            if (!Array.isArray(markets)) continue;
+            if (!Array.isArray(markets)) {
+              console.warn(`[DEBUG_DRY_RUN] ⚠️ [SchemaMismatch] Resposta inesperada da Gamma API:`, typeof markets);
+              continue;
+            }
 
             for (const market of markets) {
               const slug = market.slug;
@@ -1449,12 +1592,10 @@ export class RealtimeServiceV2 extends EventEmitter {
                 if ((currentPrice === null || isNaN(currentPrice)) && outcomes.length > 0 && prices.length > 0) {
                   const targetOutcome = position.outcome?.toString().trim().toLowerCase() || '';
 
-                  // 1. Match direto e exato pelo texto do outcome da posição (ex: "Yes", "No", "Team A")
                   let outcomeIndex = outcomes.findIndex((o: string) =>
                     o?.toString().trim().toLowerCase() === targetOutcome
                   );
 
-                  // 2. Se falhar no match exato, tenta match parcial (caso venha ligeiramente diferente)
                   if (outcomeIndex === -1) {
                     outcomeIndex = outcomes.findIndex((o: string) => {
                       const opt = o.toString().trim().toLowerCase();
@@ -1479,7 +1620,6 @@ export class RealtimeServiceV2 extends EventEmitter {
                 }
 
                 if (currentPrice === null || isNaN(currentPrice)) {
-                  //console.warn(`[DEBUG_DRY_RUN] ⚠️ Preço não encontrado para ${posKey} (Outcome: ${position.outcome})`);
                   continue;
                 }
 
