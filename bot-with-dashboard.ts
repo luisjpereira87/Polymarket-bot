@@ -731,6 +731,7 @@ function simulateTrade(profit: number, strategy: string, description: string) {
 // ============================================================================
 
 let arbService: ArbitrageService | null = null;
+let arbStartedAt = 0;
 let autoCopyTradingSubscription: { id: string; stop: () => void } | null = null;
 const liveMarketPrices = new Map<string, number>();
 const MAX_WALLETS_LIMIT = 15;
@@ -744,6 +745,13 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
   if (CONFIG.smartMoney.enabled) {
     initializeSmartMoney(sdk);
   }
+}
+
+// Fee simulada no PnL do dry run (PLACEHOLDER: confirma a fee real) e estratégia de origem do trade
+const DRY_RUN_FEE_PCT = Number(process.env.DRY_RUN_FEE_PCT ?? '0.0156');
+function strategyOf(trade: SmartMoneyTrade): 'smartMoney' | 'direct' {
+  const a = String(trade.traderAddress || '');
+  return a.startsWith('TrendFollowing-') || a.startsWith('ProbEdge-') ? 'direct' : 'smartMoney';
 }
 
 function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, result: OrderResult) {
@@ -771,7 +779,7 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
       execPrice = cachedPrice;
     }
   }
-  
+
   const execShares = trade.size; // As shares vindas do trade
   const tradeCost = execShares * execPrice; // O custo real em USDC
 
@@ -802,7 +810,8 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
     state.smartMoneySignals = state.smartMoneySignals.slice(0, 50);
   }
 
-  state.smartMoneyTrades++;
+  const strat = strategyOf(trade);
+  if (strat === 'smartMoney') state.smartMoneyTrades++;
 
   // 3. Gestão de Posições e Balanços
   if (isDryRun) {
@@ -848,7 +857,9 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
 
       if (existingPos && existingPos.size > 0) {
         const closedShares = existingPos.size;
-        const profit = (execPrice - existingPos.avgEntryPrice) * closedShares;
+        const grossProfit = (execPrice - existingPos.avgEntryPrice) * closedShares;
+        const feeTotal = DRY_RUN_FEE_PCT * (existingPos.avgEntryPrice + execPrice) * closedShares;
+        const profit = grossProfit - feeTotal;
         const tradeProceeds = closedShares * execPrice;
         const costBasis = closedShares * existingPos.avgEntryPrice;
 
@@ -864,7 +875,7 @@ function processTradeExecution(sdk: PolymarketSDK, trade: SmartMoneyTrade, resul
         }
 
         log('TRADE', `✅ [DRY_RUN] SELL: ${closedShares.toFixed(1)} shares | PnL: $${profit.toFixed(2)} | Novo Caixa: $${financialState.availableCash.toFixed(2)}`);
-        recordTrade(profit, 'smartMoney');
+        recordTrade(profit, strat);
       }
     }
   } else {
@@ -916,7 +927,7 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
       positions: () => realPositions,
       dryRun: isDryRun,
       minWhaleOrderValueUSD: CONFIG.smartMoney.minWhaleOrderValueUSD || 1000,
-      amount: () => calculateDynamicTradeAmount(state.usdcBalance, CONFIG.smartMoney),
+      amount: () => calculateDynamicTradeAmount(state.usdcBalance, state.consecutiveLosses, CONFIG.smartMoney),
       onTrade: async (trade, result) => {
         try {
           /** 
@@ -982,7 +993,7 @@ async function setupArbitrage(_sdk: PolymarketSDK) {
     if (CONFIG.dryRun && opp.profitPercent > 0) {
       const size = Math.max(CONFIG.arbitrage.minTradeSize, 10);
       const estimatedProfit = size * (opp.profitPercent / 100);
-      simulateTrade(estimatedProfit, 'arbitrage', `Arb ${opp.market}`);
+      simulateTrade(estimatedProfit, 'arbitrage', `Arb ${opp.description}`);
     }
 
     updateDashboard();
@@ -1000,12 +1011,18 @@ async function setupArbitrage(_sdk: PolymarketSDK) {
     state.arbitrage.status = 'scanning';
     const runArbScanLoop = async () => {
       if (!arbService) return;
+      // enquanto monitoriza um mercado não o relança; passados 10 min volta a analisar o mercado
+      if (arbService.isActive()) {
+        if (Date.now() - arbStartedAt < 10 * 60 * 1000) return;
+        await arbService.stop();
+      }
       try {
         const results = await arbService.scanMarkets(
           { minVolume24h: CONFIG.arbitrage.minVolume24h },
           CONFIG.arbitrage.profitThreshold
         );
         state.arbitrage.marketsScanned = results.length;
+        log('ARB', `Scan: ${results.length} mercados analisados | melhor lucro ${(Math.max(0, ...results.map((r) => r.profitRate)) * 100).toFixed(2)}% | com oportunidade: ${results.filter((r) => r.arbType !== 'none').length}`);
         const opps = results.filter(r => r.arbType !== 'none');
 
         if (opps.length > 0) {
@@ -1013,6 +1030,7 @@ async function setupArbitrage(_sdk: PolymarketSDK) {
           state.arbitrage.currentMarket = opps[0].market.name;
           state.arbitrage.status = 'monitoring';
           await arbService.start(opps[0].market);
+          arbStartedAt = Date.now();
           log('ARB', `A monitorizar mercado: ${opps[0].market.name}`);
         } else {
           state.arbitrage.status = 'idle';
@@ -1057,6 +1075,7 @@ async function startDipArbService(sdk: PolymarketSDK, coin: 'ETH' | 'BTC' | 'SOL
   sdk.dipArb.updateConfig({
     shares: CONFIG.dipArb.shares,
     sumTarget: CONFIG.dipArb.sumTarget,
+    enableSurge: false,
     autoExecute: !CONFIG.dryRun,
     debug: true,
   });
@@ -1163,6 +1182,8 @@ async function setupDipArb(sdk: PolymarketSDK) {
 
   const coinsToRotate: ('ETH' | 'BTC' | 'SOL')[] = ['ETH', 'BTC', 'SOL'];
   let coinIndex = 0;
+  let rotating = false;
+  let lastRotationAt = 0;
 
   // 1. Arranque inicial da primeira moeda
   if (CONFIG.dipArb.enabled) {
@@ -1174,15 +1195,21 @@ async function setupDipArb(sdk: PolymarketSDK) {
     const now = Date.now();
     const endTime = state.dipArb.endTime;
 
-    if (endTime && now >= endTime - 5000) {
+    if (!rotating && now - lastRotationAt > 20000 && endTime && now >= endTime - 5000) {
+      rotating = true;
       log('ARB', 'Mercado atual expirou. A executar reset total e a mudar de ativo...');
 
-      // Avança para a próxima moeda da lista
       coinIndex = (coinIndex + 1) % coinsToRotate.length;
       const nextCoin = coinsToRotate[coinIndex];
 
-      // Destrói tudo o que é antigo e arranca uma nova instância limpa
-      await startDipArbService(sdk, nextCoin);
+      try {
+        await startDipArbService(sdk, nextCoin);
+      } catch (e) {
+        log('WARN', `Rotação do DipArb falhou: ${(e as Error).message}`);
+      } finally {
+        lastRotationAt = Date.now();
+        rotating = false;
+      }
     }
   }, 10000);
 }
@@ -1321,7 +1348,7 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
       enabled: CONFIG.directTrading.enabled,
       interval: CONFIG.binance.interval,
       trendThreshold: CONFIG.binance.trendThreshold,
-      amount: () => calculateDynamicTradeAmount(state.usdcBalance, CONFIG.directTrading),
+      amount: () => calculateDynamicTradeAmount(state.usdcBalance, state.consecutiveLosses, CONFIG.directTrading),
       dryRun: CONFIG.dryRun,
       //checkIntervalMs: 3 * 60 * 1000,
       isCanTrade: () => canTrade(),
@@ -1586,7 +1613,7 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
   setTimeout(runSyncCycle, SYNC_INTERVAL_MS);
 }
 
-function calculateDynamicTradeAmount(
+function calculateDynamicTradeAmount__(
   availableBalance: number,
   config: {
     capitalPercentage?: number; // Ex: 0.05 para 5% do capital
@@ -1615,6 +1642,45 @@ function calculateDynamicTradeAmount(
   }
 
   // Retorna arredondado a 2 casas decimais para evitar problemas de precisão com moedas fiat/USDC
+  return Math.round(calculatedAmount * 100) / 100;
+}
+
+function calculateDynamicTradeAmount(
+  availableBalance: number,
+  consecutiveLosses: number,
+  options: {
+    capitalPercentage?: number; // Ex: 0.05 para 5% do capital
+    minTradeSize?: number;      // Ex: 5 USDC (piso operacional)
+    maxTradeSize?: number;      // Ex: 50 USDC (teto máximo)
+  } = {}
+): number {
+  if (!availableBalance || availableBalance <= 0) {
+    return 0;
+  }
+
+  const percentage = options.capitalPercentage ?? 0.05;
+  const minSize = options.minTradeSize ?? 5;
+  const maxSize = options.maxTradeSize ?? 50;
+  const losses = Math.max(0, consecutiveLosses);
+
+  // 1. Base proporcional ao saldo disponível
+  let calculatedAmount = availableBalance * percentage;
+
+  // 2. Redução gradual antes da 3.ª perda (1.0x -> 0.7x -> 0.45x)
+  if (losses === 1) {
+    calculatedAmount *= 0.7;
+  } else if (losses >= 2) {
+    calculatedAmount *= 0.45;
+  }
+
+  // 3. Clamp entre piso e teto
+  calculatedAmount = Math.max(minSize, Math.min(calculatedAmount, maxSize));
+
+  // 4. Nunca exceder o saldo real disponível
+  if (calculatedAmount > availableBalance) {
+    calculatedAmount = availableBalance;
+  }
+
   return Math.round(calculatedAmount * 100) / 100;
 }
 

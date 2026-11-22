@@ -20,19 +20,19 @@
  */
 
 import { EventEmitter } from 'events';
+import { CTFClient, type TokenIds } from '../clients/ctf-client.js';
+import { GammaApiClient } from '../clients/gamma-api.js';
+import { RateLimiter } from '../core/rate-limiter.js';
+import type { BookUpdate } from '../core/types.js';
+import { createUnifiedCache } from '../core/unified-cache.js';
+import { getEffectivePrices } from '../utils/price-utils.js';
+import { MarketService } from './market-service.js';
 import {
   RealtimeServiceV2,
   type MarketSubscription,
   type OrderbookSnapshot,
 } from './realtime-service-v2.js';
 import { TradingService } from './trading-service.js';
-import { MarketService } from './market-service.js';
-import { CTFClient, type TokenIds } from '../clients/ctf-client.js';
-import { GammaApiClient } from '../clients/gamma-api.js';
-import { RateLimiter } from '../core/rate-limiter.js';
-import { createUnifiedCache } from '../core/unified-cache.js';
-import { getEffectivePrices } from '../utils/price-utils.js';
-import type { BookUpdate } from '../core/types.js';
 
 // ===== Types =====
 
@@ -393,6 +393,8 @@ export class ArbitrageService extends EventEmitter {
       }
     } else {
       this.log('No wallet configured - monitoring only');
+      // sem carteira não há saldo que limite o tamanho: usa um saldo virtual (só deteta long arb)
+      this.balance = { usdc: 1000, yesTokens: 0, noTokens: 0, lastUpdate: Date.now() };
     }
 
     // Connect and subscribe to WebSocket

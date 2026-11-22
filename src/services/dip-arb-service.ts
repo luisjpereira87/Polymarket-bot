@@ -75,6 +75,8 @@ import { TradingService, type MarketOrderParams } from './trading-service.js';
 
 // ===== DipArbService =====
 
+// O padrão Mispricing usa um modelo de probabilidade sem suporte nos dados. Desligado por defeito.
+const ENABLE_MISPRICING_PATTERN = process.env.DIPARB_MISPRICING === 'true';
 export class DipArbService extends EventEmitter {
   // Dependencies
   private realtimeService: RealtimeServiceV2;
@@ -100,6 +102,8 @@ export class DipArbService extends EventEmitter {
 
   // Auto-rotate state
   private rotateCheckInterval: ReturnType<typeof setInterval> | null = null;
+  private lastDiagLog = 0;
+  private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
   private nextMarket: DipArbMarketConfig | null = null;
 
   // Pending redemption state (for background redemption after market resolution)
@@ -387,7 +391,8 @@ export class DipArbService extends EventEmitter {
     );
 
     // Heartbeat to reassure user
-    setInterval(() => {
+    if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
+    this.heartbeatInterval = setInterval(() => {
       if (this.isRunning) {
         const lastPrice = this.currentUnderlyingPrice > 0 ? this.currentUnderlyingPrice.toFixed(2) : 'Waiting';
         const timeSinceUpdate = this.lastPriceUpdate > 0 ? Math.round((Date.now() - this.lastPriceUpdate) / 1000) + 's ago' : 'Never';
@@ -521,6 +526,7 @@ export class DipArbService extends EventEmitter {
 
     // Stop rotate check
     this.stopRotateCheck();
+    if (this.heartbeatInterval) { clearInterval(this.heartbeatInterval); this.heartbeatInterval = null; }
 
     // Unsubscribe
     if (this.marketSubscription) {
@@ -1006,6 +1012,7 @@ export class DipArbService extends EventEmitter {
 
     // Record price history for sliding window detection
     this.recordPriceHistory();
+    this.diag();
 
     // Emit orderbookUpdate event for dashboard
     const upPrice = this.upAsks[0]?.price ?? 0;
@@ -1383,7 +1390,7 @@ export class DipArbService extends EventEmitter {
     // Pattern 3: Mispricing Detection
     // ========================================
     // 定价偏差：基于底层资产价格估计胜率，检测错误定价
-    if (this.currentRound.priceToBeat > 0 && this.currentUnderlyingPrice > 0) {
+    if (ENABLE_MISPRICING_PATTERN && this.currentRound.priceToBeat > 0 && this.currentUnderlyingPrice > 0) {
       const estimatedWinRate = estimateUpWinRate(this.currentUnderlyingPrice, this.currentRound.priceToBeat);
       const upMispricing = detectMispricing(upPrice, estimatedWinRate);
       const downMispricing = detectMispricing(downPrice, 1 - estimatedWinRate);
@@ -2332,6 +2339,21 @@ export class DipArbService extends EventEmitter {
     const upChange = ((last.upAsk - first.upAsk) / first.upAsk * 100).toFixed(2);
     const downChange = ((last.downAsk - first.downAsk) / first.downAsk * 100).toFixed(2);
     this.log(`   Change: UP ${upChange}% | DOWN ${downChange}%`);
+  }
+
+    /** Diagnóstico a cada 30 s: mostra porque a estratégia está ou não a avaliar. */
+  private diag(): void {
+    const now = Date.now();
+    if (now - this.lastDiagLog < 30_000 || !this.market) return;
+    this.lastDiagLog = now;
+    const r = this.currentRound;
+    const elapsedMin = r ? ((now - r.startTime) / 60000).toFixed(1) : '-';
+    const leftSec = ((this.market.endTime.getTime() - now) / 1000).toFixed(0);
+    const up = this.upAsks[0]?.price ?? 0;
+    const down = this.downAsks[0]?.price ?? 0;
+    console.log(
+      `[DipArb][DIAG] ${this.market.slug} | faltam ${leftSec}s (fim ${this.market.endTime.toISOString()}) | ronda=${r?.phase ?? 'null'} decorridos=${elapsedMin}min janela=${this.config.windowMinutes}min | up=${up || '-'} down=${down || '-'} soma=${(up + down).toFixed(3)} | hist=${this.priceHistory.length} | sinais=${this.stats.signalsDetected} leg1=${this.stats.leg1Filled} leg2=${this.stats.leg2Filled} | executing=${this.isExecuting} autoExec=${this.config.autoExecute}`
+    );
   }
 
   private log(message: string): void {
