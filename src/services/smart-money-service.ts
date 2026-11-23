@@ -1042,6 +1042,8 @@ export class SmartMoneyService {
         const exitShares = position.size;
         let result: OrderResult = { success: false, errorMsg: 'Not executed yet' };
 
+        const isSettledPrice = currentPrice >= 0.99 || currentPrice <= 0.01;
+
         if (dryRun) {
           result = { success: true, orderId: `dry_run_exit_${Date.now()}` };
           console.log('[DRY RUN EXIT]', {
@@ -1052,6 +1054,9 @@ export class SmartMoneyService {
             pnlPercent: pnlPercent.toFixed(2) + '%',
             reason: actionType,
           });
+        } else if (isSettledPrice) {
+          // Mercado já terminou/resolveu: não há liquidez útil no CLOB para vender
+          result = { success: true, orderId: `settled_${Date.now()}` };
         } else {
           const tokenId = (position as any).tokenId;
           if (!tokenId) {
@@ -1146,7 +1151,9 @@ export class SmartMoneyService {
             // 2. Fallback para a API Gamma ou verificação de expiração de tempo
             if (!fetchSuccess && marketSlug) {
               try {
-                const marketInfo: GammaMarket | null = await (this as any).sdk?.markets?.getMarket(marketSlug);
+                
+                
+                const marketInfo: GammaMarket | null = await this.gammaApiClient.getMarketBySlug(marketSlug);
 
                 const isMarketClosedGamma = marketInfo && marketInfo.closed;
                 const marketEndDate = position.endDate ? new Date(position.endDate).getTime() : 0;
