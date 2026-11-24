@@ -270,42 +270,57 @@ function updateDashboard() {
   dashboardEmitter.updateState(state);
 }
 
-function canTrade(): boolean {
+function canTrade(isCryptoMarket: boolean = false): boolean {
+  const now = Date.now();
+
   // 1. Verificação se o bot está permanentemente parado
   if (state.permanentlyHalted) {
     return false;
   }
 
-  // 2. Verificação de Pausa Ativa (ex: a pausa de 2h por perdas consecutivas)
+  // 2. Verificação de Pausa Ativa (pausa de 2h por perdas consecutivas)
   if (state.isPaused) {
-    if (Date.now() < state.pauseUntil) {
-      return false; // Ainda está dentro do tempo de penalização
-    } else {
-      // A pausa expirou, limpa o estado de pausa e reseta o contador de perdas para evitar re-gatilho imediato
-      state.isPaused = false;
-      state.consecutiveLosses = 0; // 👈 CRUCIAL: Limpa as perdas para o bot conseguir voltar a negociar!
-      state.pauseUntil = 0;
-      log('INFO', '✅ Bot retomou a execução após período de pausa por perdas consecutivas (Contador de perdas resetado).');
-      updateDashboard();
+    if (now < state.pauseUntil) {
+      return false; // Ainda dentro do período de pausa
     }
+
+    // Pausa expirada: limpa estado e reseta perdas consecutivas para evitar re-gatilho imediato
+    state.isPaused = false;
+    state.consecutiveLosses = 0;
+    state.pauseUntil = 0;
+    log('INFO', '✅ Bot retomou a execução após pausa por perdas consecutivas (contador resetado).');
+    updateDashboard();
   }
 
-  // 3. Verificação de Posições Abertas Máximas
-  if (realPositions.size >= CONFIG.risk.maxOpenPositions) {
+  // 3. Verificação de Perdas Consecutivas (Gatilho da Pausa de 2h)
+  const maxConsecutiveLossesAllowed = CONFIG.risk.maxConsecutiveLosses ?? 3;
+  const currentLosses = Math.max(0, state.consecutiveLosses);
+
+  if (currentLosses >= maxConsecutiveLossesAllowed) {
+    state.isPaused = true;
+    const pauseDurationMs = 2 * 60 * 60 * 1000; // 2 horas
+    state.pauseUntil = now + pauseDurationMs;
+
+    log(
+      'WARN',
+      `🛑 Detetadas ${currentLosses} perdas consecutivas. Bot pausado por 2 horas até ${new Date(state.pauseUntil).toLocaleTimeString()}.`
+    );
+    updateDashboard();
     return false;
   }
 
-  // 4. Verificação de Perdas Consecutivas (Gatilho da Pausa de 2h)
-  const maxConsecutiveLossesAllowed = CONFIG.risk.maxConsecutiveLosses ?? 3;
+  // 4. Cálculo base de slots: maxOpenPositions - consecutiveLosses
+  const baseMaxPositions = Math.max(1, CONFIG.risk.maxOpenPositions);
+  let availableSlots = Math.max(1, baseMaxPositions - currentLosses);
 
-  // Só dispara a pausa se NÃO estivermos já a sair de uma pausa agora mesmo
-  if (!state.isPaused && state.consecutiveLosses >= maxConsecutiveLossesAllowed) {
-    state.isPaused = true;
-    const pauseDurationMs = 2 * 60 * 60 * 1000; // 2 Horas em milissegundos
-    state.pauseUntil = Date.now() + pauseDurationMs;
+  // 5. Se for entrada cripto e o PnL estiver negativo, limita a 1 posição de cada vez
+  const currentPnl = state.totalPnL ?? 0; // Ajusta se o campo no teu state tiver outro nome (ex: sessionPnl / totalPnl)
+  if (isCryptoMarket && currentPnl < 0) {
+    availableSlots = 1;
+  }
 
-    log('WARN', `🛑 Detetadas ${state.consecutiveLosses} perdas consecutivas. Bot pausado por 2 horas até ${new Date(state.pauseUntil).toLocaleTimeString()}`);
-    updateDashboard();
+  // 6. Verificação do limite de posições abertas
+  if (realPositions.size >= availableSlots) {
     return false;
   }
 
@@ -923,7 +938,7 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
       maxSlippage: CONFIG.smartMoney.maxSlippage || 0.05,
       minTradeSize: CONFIG.smartMoney.minTradeSize || 10,
       delay: CONFIG.smartMoney.delay || 0,
-      isCanTrade: () => canTrade(),
+      isCanTrade: () => canTrade(false),
       positions: () => realPositions,
       dryRun: isDryRun,
       minWhaleOrderValueUSD: CONFIG.smartMoney.minWhaleOrderValueUSD || 1000,
@@ -1351,7 +1366,7 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
       amount: () => calculateDynamicTradeAmount(state.usdcBalance, state.consecutiveLosses, CONFIG.directTrading),
       dryRun: CONFIG.dryRun,
       //checkIntervalMs: 3 * 60 * 1000,
-      isCanTrade: () => canTrade(),
+      isCanTrade: () => canTrade(true),
       positions: () => realPositions,
     },
     {
