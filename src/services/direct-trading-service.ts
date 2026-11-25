@@ -78,7 +78,7 @@ export class DirectTradingService {
             const minuteInBlock = currentMinute % 15;
 
             // Proteção extra: se o ciclo disparar dentro dos primeiros 1 minutos, salta fora!
-            if (minuteInBlock < 5) {
+            if (minuteInBlock < 10) {
                 console.log('TREND', `⏳ [Safety] Minuto ${currentMinute} (${minuteInBlock}m do bloco). Demasiado cedo, a ignorar ciclo para evitar abertura...`);
                 return;
             }
@@ -101,7 +101,7 @@ export class DirectTradingService {
             const currentMinute = now.getMinutes();
             const minuteInBlock = currentMinute % 15;
 
-            if (minuteInBlock < 5) {
+            if (minuteInBlock < 10) {
                 const targetMinute = (Math.floor(currentMinute / 15) * 15) + 3;
                 const targetDate = new Date(now);
                 targetDate.setMinutes(targetMinute, 0, 0);
