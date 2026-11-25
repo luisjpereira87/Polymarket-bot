@@ -94,7 +94,8 @@ export class DirectTradingService {
             }
         };
 
-        const intervalMs = config.checkIntervalMs || 2 * 60 * 1000;
+        //const intervalMs = config.checkIntervalMs || 2 * 60 * 1000;
+        const intervalMs = config.checkIntervalMs || 15000;
 
         const getDelayToSafeMinute = () => {
             const now = new Date();
