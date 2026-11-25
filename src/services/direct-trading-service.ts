@@ -455,11 +455,12 @@ export class DirectTradingService {
         }
 
         // Validação 3: Menos de 5 minutos para fechar (Zona de pânico)
+        /**
         const minutesRemaining = (endTimeMs - nowMs) / (1000 * 60);
         if (minutesRemaining < 5) {
             console.log('WARN', `⏳ [${coin}] Ignorado: Faltam apenas ${minutesRemaining.toFixed(1)}m para o mercado fechar.`);
             return false;
-        }
+        }**/
 
         return true;
     }
