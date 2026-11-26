@@ -908,6 +908,367 @@ export class SmartMoneyService {
   ): Promise<{ id: string; unsubscribe: () => void }> {
     const takeProfit = options.takeProfitPercent ?? 100.0;
     const stopLoss = options.stopLossPercent ?? -50.0;
+    const maxDurationMs = options.maxTradeDurationMinutes ? options.maxTradeDurationMinutes * 60 * 1000 : null;
+    const gracePeriodMs = (options.stopLossGracePeriodSeconds ?? 30) * 1000;
+    const dryRun = options.dryRun ?? false;
+
+    const MARKET_DURATION_MS = 15 * 60 * 1000;
+    const SL_START_REMAINING_MS = 5 * 60 * 1000; // Últimos 5 minutos antes do fecho
+    const SL_STOP_REMAINING_MS = 45 * 1000;      // Evita ordens de SL sem liquidez nos últimos 45s
+
+    const getMarketEndTimeFromSlug = (
+      slug: string | undefined,
+      fallbackEndDate: string | number | Date | undefined
+    ): number | null => {
+      if (slug) {
+        const match = slug.match(/-(\d{10})$/);
+        if (match) {
+          return Number(match[1]) * 1000 + MARKET_DURATION_MS;
+        }
+      }
+      if (fallbackEndDate) {
+        const parsed = new Date(fallbackEndDate).getTime();
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+      }
+      return null;
+    };
+
+    const lastActivityMap = new Map<string, number>();
+
+    const internalHandler = async (posKey: string, currentPrice: number, pnlPercent: number) => {
+      lastActivityMap.set(posKey, Date.now());
+
+      const position = realPositions.get(posKey);
+      if (!position) return;
+
+      // 🛡️ DEFESA 1: Ignorar se o preço de entrada for inválido ou zero
+      if (!position.avgEntryPrice || position.avgEntryPrice <= 0) {
+        return;
+      }
+
+      console.log(
+        `[SmartMoneyService] 📈 [WS Preço Unificado] ${posKey} | Entrada: $${position.avgEntryPrice.toFixed(4)} | Atual: $${currentPrice.toFixed(4)} | PnL: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%`
+      );
+
+      options.onPriceUpdate?.(posKey, currentPrice, pnlPercent);
+
+      const now = Date.now();
+      const posTimestamp = position.timestamp || now;
+      const age = now - posTimestamp;
+
+      // 🛡️ DEFESA 2: Avaliação do Período de Graça
+      const isWithinGracePeriod = age < gracePeriodMs;
+
+      // 1. Timeout por duração máxima do trade
+      const isTimeout = maxDurationMs !== null && age >= maxDurationMs;
+
+      // 2. Data de termo do mercado (prioriza timestamp do slug para mercados de 15m)
+      const marketSlug = position.marketSlug;
+      const marketEndTimeMs = getMarketEndTimeFromSlug(marketSlug, position.endDate);
+      const remainingMs = marketEndTimeMs !== null ? marketEndTimeMs - now : null;
+      const isTimeExpired = marketEndTimeMs !== null && now >= marketEndTimeMs;
+
+      // 3. Validação estrita de preço resolvido nos extremos (fora do período de graça)
+      const isPriceResolved = currentPrice >= 0.999 || (currentPrice <= 0.001 && !isWithinGracePeriod);
+
+      // 4. Mercado fecha por resolução de preço ou expiração do tempo com preço extremo
+      const isMarketClosed =
+        isPriceResolved || (isTimeExpired && (currentPrice >= 0.90 || currentPrice <= 0.10));
+
+      // 📈 GESTÃO DE PATAMARES EM ESCADA (TRAILING FLOOR DINÂMICO CRIPTO)
+      const posWithFloor = position as TradePositions & { lockedFloor?: number };
+      if (posWithFloor.lockedFloor === undefined) {
+        posWithFloor.lockedFloor = -1;
+      }
+
+      const entryPrice = position.avgEntryPrice;
+      const maxPossiblePrice = 1.0;
+      const maxPossibleGainPct = ((maxPossiblePrice - entryPrice) / entryPrice) * 100;
+
+      // Degraus alargados para absorver a volatilidade agressiva de cripto
+      const thresholdHigh = Math.min(100, maxPossibleGainPct * 0.7);
+      const thresholdMid = Math.min(50, maxPossibleGainPct * 0.45);
+      const lockedMidFloor = Math.floor(thresholdMid);
+
+      if (pnlPercent >= thresholdHigh && posWithFloor.lockedFloor < lockedMidFloor) {
+        posWithFloor.lockedFloor = lockedMidFloor;
+        console.log(
+          `🚀 [Escada Cripto] ${posKey} pumpou forte (${pnlPercent.toFixed(1)}%). Piso de lucro trancado em +${posWithFloor.lockedFloor}%.`
+        );
+      } else if (pnlPercent >= thresholdMid && pnlPercent >= 20 && posWithFloor.lockedFloor < 0) {
+        // Só tranca no breakeven (0%) se o ativo já tiver dado margem confortável (>= +20%)
+        posWithFloor.lockedFloor = 0;
+        console.log(
+          `🛡️ [Escada Cripto] ${posKey} consolidou ganhos (${pnlPercent.toFixed(1)}%). Piso trancado no Breakeven.`
+        );
+      }
+
+      const floorValue = posWithFloor.lockedFloor ?? -1;
+
+      // Regras de saída
+      const isTakeProfitTarget = pnlPercent >= takeProfit;
+      const isFloorTriggered = floorValue >= 0 && pnlPercent <= floorValue;
+      const isStopLoss = pnlPercent <= -Math.abs(stopLoss);
+
+      // Janela tardia: apenas nos últimos 5 minutos (até aos 45s finais) em mercados cripto
+      const isCryptoMarket = position.isCrypto;
+      const isInLateStopLossWindow =
+        remainingMs !== null &&
+        remainingMs <= SL_START_REMAINING_MS &&
+        remainingMs > SL_STOP_REMAINING_MS;
+      const isActiveMarketPrice = currentPrice > 0.01 && currentPrice < 0.99;
+
+      const effectiveStopLoss = isWithinGracePeriod
+        ? false
+        : isCryptoMarket
+          ? isInLateStopLossWindow && isActiveMarketPrice && isStopLoss
+          : isStopLoss;
+
+      const effectiveFloor = isWithinGracePeriod ? false : isFloorTriggered;
+      const effectiveTakeProfit = isWithinGracePeriod ? false : isTakeProfitTarget;
+
+      const shouldExit =
+        effectiveTakeProfit ||
+        effectiveFloor ||
+        effectiveStopLoss ||
+        isTimeout ||
+        isMarketClosed;
+
+      if (shouldExit) {
+        let actionType = '🎯 Take-Profit';
+        if (effectiveFloor) {
+          actionType = `🛡️ Trailing Escada (Fecho no piso de +${posWithFloor.lockedFloor}%)`;
+        }
+        if (effectiveStopLoss) actionType = '🛑 Stop-Loss (Últimos 5m)';
+        if (isTimeout) actionType = '⏰ Timeout (Tempo Limite)';
+        if (isMarketClosed) actionType = '🏁 Mercado Fechado / Resolvido';
+
+        const remainingSec = remainingMs !== null ? Math.max(0, Math.round(remainingMs / 1000)) : null;
+        const remainingLabel = remainingSec !== null ? ` | Restam: ${remainingSec}s` : '';
+
+        console.log(
+          `💰 ${actionType} de ${pnlPercent.toFixed(1)}% (Idade: ${(age / 60000).toFixed(1)}m${remainingLabel}) atingido em ${posKey}! A fechar posição...`
+        );
+
+        const exitShares = position.size;
+        let result: OrderResult = { success: false, errorMsg: 'Not executed yet' };
+
+        const isSettledPrice = currentPrice >= 0.99 || currentPrice <= 0.01;
+
+        if (dryRun) {
+          result = { success: true, orderId: `dry_run_exit_${Date.now()}` };
+          console.log('[DRY RUN EXIT]', {
+            posKey,
+            side: 'SELL',
+            shares: exitShares.toFixed(2),
+            price: currentPrice.toFixed(3),
+            pnlPercent: pnlPercent.toFixed(2) + '%',
+            reason: actionType,
+          });
+        } else if (isSettledPrice) {
+          result = { success: true, orderId: `settled_${Date.now()}` };
+        } else {
+          const tokenId = position.tokenId;
+          if (!tokenId) {
+            console.warn(`[SmartMoneyService] ⚠️ Falha ao fechar ${posKey}: TokenId em falta.`);
+            return;
+          }
+
+          let attempts = 0;
+          const maxAttempts = 3;
+
+          while (attempts < maxAttempts) {
+            attempts++;
+            const livePrice = currentPrice;
+            let slippageMultiplier = 0.98;
+            if (attempts === 2) slippageMultiplier = 0.93;
+            if (attempts === 3) slippageMultiplier = 0.85;
+
+            const rawTargetPrice = livePrice * slippageMultiplier;
+            const adjustedPrice = Math.max(0.01, Number(rawTargetPrice.toFixed(2)));
+            const cleanShares = Number(exitShares.toFixed(2));
+            result = await this.tradingService.createMarketOrder({
+              tokenId,
+              side: 'SELL',
+              amount: cleanShares,
+              price: adjustedPrice,
+              orderType: 'FAK',
+            });
+
+            if (result && result.success) break;
+            await new Promise((resolve) => setTimeout(resolve, 600));
+          }
+        }
+
+        if (result && result.success) {
+          const exitTrade: SmartMoneyTrade = {
+            traderAddress: position.traderAddress || 'SYSTEM_AUTO_EXIT',
+            marketSlug: position.marketSlug,
+            outcome: position.outcome,
+            side: 'SELL',
+            size: position.size,
+            price: currentPrice,
+            timestamp: Date.now(),
+            isSmartMoney: true,
+            endDate: position.endDate,
+          };
+
+          if (options.executeTradeHandler) {
+            options.executeTradeHandler(exitTrade, result);
+          }
+
+          options.onPositionClosed?.(exitTrade, result, pnlPercent);
+          realPositions.delete(posKey);
+          lastActivityMap.delete(posKey);
+        }
+      }
+    };
+
+    this.priceHandlers.add(internalHandler);
+
+    // 🛡️ INTERVALO DE REFORÇO REST (Polling de Segurança para WebSockets mudos)
+    const STALE_THRESHOLD_MS = 60 * 1000;
+    const POLLING_INTERVAL_MS = 15 * 1000;
+
+    const safetyPollingTimer = setInterval(async () => {
+      const now = Date.now();
+      for (const [posKey, position] of realPositions.entries()) {
+        const lastActivity = lastActivityMap.get(posKey) || position.timestamp || now;
+        const timeSinceLastSignal = now - lastActivity;
+
+        if (timeSinceLastSignal > STALE_THRESHOLD_MS) {
+          console.warn(
+            `[SmartMoneyService] ⚠️ Alerta: Sem sinais para ${posKey} há >60s. A forçar verificação REST / SDK...`
+          );
+
+          let freshPrice: number | null = null;
+          let fetchSuccess = false;
+
+          try {
+            const tokenId = position.tokenId;
+            const marketSlug = position.marketSlug;
+
+            // 1. Tenta obter o preço pelo Orderbook (Best Bid)
+            if (tokenId) {
+              try {
+                freshPrice = await this.orderbookService.getBestBidPrice(tokenId);
+                if (freshPrice !== null && freshPrice >= 0) {
+                  fetchSuccess = true;
+                }
+              } catch (obErr) {
+                console.warn(`[SmartMoneyService] ⚠️ Falha ao obter bid do orderbook para ${posKey}:`, obErr);
+              }
+            }
+
+            // 2. Fallback para a API Gamma ou verificação de expiração de tempo
+            if (!fetchSuccess && marketSlug) {
+              try {
+                const marketInfo: GammaMarket | null = await this.gammaApiClient.getMarketBySlug(marketSlug);
+
+                const isMarketClosedGamma = Boolean(marketInfo && marketInfo.closed);
+                const resolvedEndTime = getMarketEndTimeFromSlug(marketSlug, position.endDate);
+                const isTimeExpired = resolvedEndTime !== null && Date.now() >= resolvedEndTime;
+
+                if (isMarketClosedGamma || isTimeExpired) {
+                  let winningOutcome: string | null = null;
+
+                  if (marketInfo && marketInfo.outcomes && marketInfo.outcomePrices) {
+                    const outcomes = marketInfo.outcomes;
+                    const prices = marketInfo.outcomePrices;
+                    for (let i = 0; i < outcomes.length; i++) {
+                      if (prices[i] >= 0.99) {
+                        winningOutcome = outcomes[i];
+                        break;
+                      }
+                    }
+                  }
+
+                  const userOutcome = position.outcome ? position.outcome.toLowerCase() : '';
+                  const isWinner = winningOutcome ? winningOutcome.toLowerCase() === userOutcome : false;
+
+                  freshPrice = isWinner ? 1.0 : 0.0;
+                  fetchSuccess = true;
+
+                  console.log(
+                    `🏁 [SDK Gamma / Timeout Fallback] Mercado ${marketSlug} fechado/expirado. Vencedor: ${winningOutcome || 'N/D'} | Nossa escolha: ${position.outcome} -> ${isWinner ? 'VITÓRIA (1.0)' : 'DERROTA (0.0)'}`
+                  );
+                }
+              } catch (gammaErr) {
+                console.warn(`[SmartMoneyService] ⚠️ Falha no fallback Gamma para ${posKey}:`, gammaErr);
+
+                const resolvedEndTime = getMarketEndTimeFromSlug(marketSlug, position.endDate);
+                if (resolvedEndTime !== null && Date.now() > resolvedEndTime + 5 * 60 * 1000) {
+                  console.warn(
+                    `[SmartMoneyService] 🚨 Forçando fecho por timeout de API para mercado zombie: ${posKey}`
+                  );
+                  freshPrice = 0.0;
+                  fetchSuccess = true;
+                }
+              }
+            }
+
+            // 3. Processamento seguro do preço obtido
+            if (fetchSuccess && freshPrice !== null && freshPrice >= 0) {
+              const avgEntry = position.avgEntryPrice;
+              const pnlPercent = ((freshPrice - avgEntry) / avgEntry) * 100;
+
+              await internalHandler(posKey, freshPrice, pnlPercent);
+              lastActivityMap.set(posKey, Date.now());
+            } else {
+              console.warn(
+                `[SmartMoneyService] ⚠️ Dados indisponíveis para ${posKey} (serviço devolveu null/vazio). A manter posição em aberto por segurança.`
+              );
+            }
+          } catch (err) {
+            console.error(`[SmartMoneyService] ❌ Erro crítico no bloco de segurança para ${posKey}:`, err);
+          }
+        }
+      }
+    }, POLLING_INTERVAL_MS);
+
+    if (!this.priceSubscription) {
+      this.priceSubscription = this.realtimeService.subscribePositionPriceWebSocket(
+        realPositions,
+        {
+          onPriceUpdate: (posKey, currentPrice, pnlPercent) => {
+            for (const handler of this.priceHandlers) {
+              handler(posKey, currentPrice, pnlPercent);
+            }
+          },
+        },
+        this.tradingService.getFunderAddress(),
+        dryRun
+      );
+    }
+
+    return {
+      id: `price_monitor_exec_${Date.now()}`,
+      unsubscribe: () => {
+        clearInterval(safetyPollingTimer);
+        this.priceHandlers.delete(internalHandler);
+        if (this.priceHandlers.size === 0 && this.priceSubscription) {
+          this.priceSubscription.unsubscribe();
+          this.priceSubscription = null;
+        }
+      },
+    };
+  }
+
+  async subscribePositionPricesWithExecution_(
+    realPositions: Map<string, TradePositions>,
+    options: {
+      takeProfitPercent?: number;
+      stopLossPercent?: number;
+      maxTradeDurationMinutes?: number;
+      stopLossGracePeriodSeconds?: number;
+      dryRun?: boolean;
+      onPositionClosed?: (trade: SmartMoneyTrade, result: OrderResult, pnlPercent: number) => void;
+      onPriceUpdate?: (posKey: string, currentPrice: number, pnlPercent: number) => void;
+      executeTradeHandler?: (trade: SmartMoneyTrade, result: OrderResult) => void;
+    } = {}
+  ): Promise<{ id: string; unsubscribe: () => void }> {
+    const takeProfit = options.takeProfitPercent ?? 100.0;
+    const stopLoss = options.stopLossPercent ?? -50.0;
     //const stopLoss = -40.0;
     const maxDurationMs = options.maxTradeDurationMinutes ? options.maxTradeDurationMinutes * 60 * 1000 : null;
     const gracePeriodMs = (options.stopLossGracePeriodSeconds ?? 30) * 1000;
@@ -977,7 +1338,7 @@ export class SmartMoneyService {
       // Definimos os degraus da escada de forma proporcional ao potencial do ativo:
       // - Se o potencial for grande (ex: entrou a $0.20 -> max gain +400%), os degraus normais funcionam bem.
       // - Se o potencial for curto (ex: entrou a $0.70 -> max gain +42%), a escada adapta-se.
-      
+
       /**
       const thresholdLevel4 = Math.min(100, maxPossibleGainPct * 0.80); // 80% do caminho para o topo
       const thresholdLevel3 = Math.min(75,  maxPossibleGainPct * 0.60); // 60% do caminho
@@ -1028,7 +1389,7 @@ export class SmartMoneyService {
 
       //const shouldExit = effectiveTakeProfit || effectiveFloor || effectiveStopLoss || isTimeout || isMarketClosed;
       //const shouldExit =  effectiveStopLoss || isTimeout || isMarketClosed;
-      const shouldExit =  isTimeout || isMarketClosed;
+      const shouldExit = isTimeout || isMarketClosed;
 
       if (shouldExit) {
         let actionType = '🎯 Take-Profit';
@@ -1151,8 +1512,8 @@ export class SmartMoneyService {
             // 2. Fallback para a API Gamma ou verificação de expiração de tempo
             if (!fetchSuccess && marketSlug) {
               try {
-                
-                
+
+
                 const marketInfo: GammaMarket | null = await this.gammaApiClient.getMarketBySlug(marketSlug);
 
                 const isMarketClosedGamma = marketInfo && marketInfo.closed;
@@ -1161,7 +1522,7 @@ export class SmartMoneyService {
 
                 if (isMarketClosedGamma || isTimeExpired) {
                   let winningOutcome: string | null = null;
-                  
+
                   if (marketInfo && marketInfo.outcomes && marketInfo.outcomePrices) {
                     const outcomes = marketInfo.outcomes;
                     const prices = marketInfo.outcomePrices;
@@ -1175,7 +1536,7 @@ export class SmartMoneyService {
 
                   const userOutcome = position.outcome ? position.outcome.toLowerCase() : '';
                   const isWinner = winningOutcome ? (winningOutcome.toLowerCase() === userOutcome) : false;
-                  
+
                   freshPrice = isWinner ? 1.0 : 0.0;
                   fetchSuccess = true;
 
@@ -1183,7 +1544,7 @@ export class SmartMoneyService {
                 }
               } catch (gammaErr) {
                 console.warn(`[SmartMoneyService] ⚠️ Falha no fallback Gamma para ${posKey}:`, gammaErr);
-                
+
                 // 🛡️ ÚLTIMA LINHA DE DEFESA: Se a API falhou E o mercado já terminou há mais de 5 minutos,
                 // forçamos o fecho a 0.0 para a posição nunca mais prender o bot num loop zombie.
                 const marketEndDate = position.endDate ? new Date(position.endDate).getTime() : 0;
