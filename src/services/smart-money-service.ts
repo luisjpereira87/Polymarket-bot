@@ -913,7 +913,7 @@ export class SmartMoneyService {
     const dryRun = options.dryRun ?? false;
 
     const MARKET_DURATION_MS = 15 * 60 * 1000;
-    const SL_START_REMAINING_MS = 5 * 60 * 1000; // Últimos 5 minutos antes do fecho
+    const SL_START_REMAINING_MS = 3 * 60 * 1000; // Últimos 5 minutos antes do fecho
     const SL_STOP_REMAINING_MS = 45 * 1000;      // Evita ordens de SL sem liquidez nos últimos 45s
 
     const getMarketEndTimeFromSlug = (
@@ -944,6 +944,10 @@ export class SmartMoneyService {
       // 🛡️ DEFESA 1: Ignorar se o preço de entrada for inválido ou zero
       if (!position.avgEntryPrice || position.avgEntryPrice <= 0) {
         return;
+      }
+
+      if (position.traderAddress?.includes('PASSIVE_MM')) {
+        return; // ou return no handler daquela posição
       }
 
       console.log(
@@ -985,6 +989,7 @@ export class SmartMoneyService {
       const maxPossiblePrice = 1.0;
       const maxPossibleGainPct = ((maxPossiblePrice - entryPrice) / entryPrice) * 100;
 
+      /**
       // Degraus alargados para absorver a volatilidade agressiva de cripto
       const thresholdHigh = Math.min(100, maxPossibleGainPct * 0.7);
       const thresholdMid = Math.min(50, maxPossibleGainPct * 0.45);
@@ -1002,12 +1007,14 @@ export class SmartMoneyService {
           `🛡️ [Escada Cripto] ${posKey} consolidou ganhos (${pnlPercent.toFixed(1)}%). Piso trancado no Breakeven.`
         );
       }
-
+      
       const floorValue = posWithFloor.lockedFloor ?? -1;
 
       // Regras de saída
       const isTakeProfitTarget = pnlPercent >= takeProfit;
       const isFloorTriggered = floorValue >= 0 && pnlPercent <= floorValue;
+      **/
+
       const isStopLoss = pnlPercent <= -Math.abs(stopLoss);
 
       // Janela tardia: apenas nos últimos 5 minutos (até aos 45s finais) em mercados cripto
@@ -1024,21 +1031,23 @@ export class SmartMoneyService {
           ? isInLateStopLossWindow && isActiveMarketPrice && isStopLoss
           : isStopLoss;
 
-      const effectiveFloor = isWithinGracePeriod ? false : isFloorTriggered;
-      const effectiveTakeProfit = isWithinGracePeriod ? false : isTakeProfitTarget;
+      //const effectiveFloor = isWithinGracePeriod ? false : isFloorTriggered;
+      //const effectiveTakeProfit = isWithinGracePeriod ? false : isTakeProfitTarget;
 
       const shouldExit =
-        effectiveTakeProfit ||
-        effectiveFloor ||
+        //effectiveTakeProfit ||
+        //effectiveFloor ||
         effectiveStopLoss ||
         isTimeout ||
         isMarketClosed;
 
       if (shouldExit) {
         let actionType = '🎯 Take-Profit';
+        /** 
         if (effectiveFloor) {
           actionType = `🛡️ Trailing Escada (Fecho no piso de +${posWithFloor.lockedFloor}%)`;
         }
+        **/
         if (effectiveStopLoss) actionType = '🛑 Stop-Loss (Últimos 5m)';
         if (isTimeout) actionType = '⏰ Timeout (Tempo Limite)';
         if (isMarketClosed) actionType = '🏁 Mercado Fechado / Resolvido';
